@@ -425,6 +425,57 @@ html[data-theme="light"] .seg button.active{background:var(--navy);box-shadow:0 
   .seg button .ic{display:none}
   .seg button{font-size:12.5px;padding:7px 6px}
 }
+
+/* ============ REDESIGN PIECE 2 — main chat area + AI input box ============ */
+/* Conversation column: centred, balanced, one readable measure for every message */
+.wrap{max-width:820px;padding:30px 20px 24px}
+.msg{margin:22px 0}
+.msg.userrow .bubble{box-shadow:var(--shadow-sm)}
+.bubble p{font-size:15.5px}
+/* Heading levels inside answers — a real hierarchy, not one size for all */
+.ai-body h2{font-size:19px;line-height:1.35;letter-spacing:-.01em;margin:22px 0 9px;color:var(--ink)}
+.ai-body h2:first-child{margin-top:2px}
+.ai-body h4{font-size:14.5px;line-height:1.45;margin:14px 0 6px;color:var(--ink)}
+.ai-body ol{line-height:1.75;margin:0 0 12px;padding-left:22px}
+.ai-body blockquote{margin:0 0 12px}
+/* Mathematical expressions — quiet serif chips inline, centred panel for display math */
+.math{font-family:Georgia,'Times New Roman',serif;font-style:italic;background:var(--accent-soft);border-radius:6px;padding:1px 6px;white-space:nowrap}
+.math sup,.math sub{font-size:.68em}
+.math-block{font-family:Georgia,'Times New Roman',serif;font-style:italic;font-size:17.5px;text-align:center;background:var(--surface2);border:1px solid var(--line);border-radius:12px;padding:13px 16px;margin:12px 0;overflow-x:auto}
+.math-block sup,.math-block sub{font-size:.68em}
+/* Typing indicator row — three soft dots while ENAO prepares the answer */
+#typingRow .bubble{padding-top:10px}
+#typingRow .typing i{width:9px;height:9px}
+/* Like / Dislike — the chosen rating stays visibly selected */
+.actionbtn.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.sources-toggle:hover{border-color:var(--accent)}
+/* Scroll-back button sits just above the composer, never over the text */
+.scrolldown{bottom:16px;right:16px}
+/* Composer — one elegant rounded shell, clear focus ring, calm resting state */
+.composer-box{border-radius:18px;box-shadow:var(--shadow-sm);transition:border-color .18s,box-shadow .18s}
+.composer-box:focus-within{border-color:var(--accent);box-shadow:var(--focus-ring)}
+.composer textarea{overflow-y:auto}
+.composer-inner{position:relative}
+.sendbtn{transition:background .18s,opacity .18s,transform .12s}
+.sendbtn.idle{opacity:.38}
+.sendbtn:disabled{cursor:not-allowed}
+.attachbtn{transition:border-color .18s,color .18s,background .18s}
+.attachbtn:hover{border-color:var(--accent);color:var(--accent)}
+/* Attachment chooser — small popover above the clip button: image or document */
+.attachmenu{position:absolute;left:0;top:-8px;transform:translateY(-100%);background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-md);padding:6px;z-index:26;min-width:248px}
+.attachmenu[hidden]{display:none}
+.attachmenu button{display:flex;gap:10px;align-items:center;width:100%;text-align:left;border:0;background:transparent;border-radius:10px;padding:9px 10px;min-height:44px}
+.attachmenu button:hover{background:var(--surface2)}
+.attachmenu button b{font-size:13.5px;display:block;color:var(--ink)}
+.attachmenu button small{font-size:11.5px;color:var(--muted);display:block;margin-top:1px;line-height:1.4}
+.attachchip .ac-x{display:grid;place-items:center;font-size:15px;line-height:1;color:var(--muted)}
+.attachchip .ac-x:hover{color:var(--danger)}
+@media(max-width:560px){
+  .wrap{padding:22px 14px 18px}
+  .msg{margin:18px 0}
+  .attachmenu{min-width:220px}
+  .composer-box{border-radius:16px}
+}
 </style>
 </head>
 <body>
@@ -576,6 +627,7 @@ html[data-theme="light"] .seg button.active{background:var(--navy);box-shadow:0 
       <!-- CHAT -->
       <section id="chatView" style="display:none">
         <div id="messages"></div>
+        <div id="typingRow" class="msg" style="display:none" aria-live="polite"><div class="avatar ai">E</div><div class="bubble"><span class="typing" role="status" aria-label="ENAO is typing"><i></i><i></i><i></i></span></div></div>
         <div id="progressBox"></div>
       </section>
 
@@ -587,16 +639,20 @@ html[data-theme="light"] .seg button.active{background:var(--navy);box-shadow:0 
   <footer class="composer">
     <div class="composer-inner">
       <div class="attachrow" id="attachRow" aria-live="polite"></div>
+      <div class="attachmenu" id="attachMenu" hidden>
+        <button type="button" id="amImage" title="Upload an image file"><svg class="ic ic-lg"><use href="#i-img"/></svg><span><b>Upload an image</b><small>PNG, JPG, GIF or WebP — shown right in the chat</small></span></button>
+        <button type="button" id="amDoc" title="Upload a document file"><svg class="ic ic-lg"><use href="#i-doc"/></svg><span><b>Upload a document</b><small>PDF, Word, Excel, CSV or text — max 10 MB per file</small></span></button>
+      </div>
       <div class="composer-box">
         <button class="micbtn" id="micBtn" aria-label="Turn the live microphone on or off" aria-pressed="false" title="Microphone: OFF — tap to go live"><span class="mic-live-dot" aria-hidden="true"></span><svg class="ic ic-lg"><use href="#i-mic" id="micIconUse"/></svg></button>
         <button class="attachbtn" id="attachBtn" title="Attach a file — image, PDF, Word, Excel, CSV or text (max 10 MB). ENAO reads it and answers about it." aria-label="Attach a file"><svg class="ic ic-lg"><use href="#i-clip"/></svg></button>
         <input type="file" id="fileInput" hidden multiple accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.md">
         <textarea id="input" rows="1" placeholder="What do you want to research? Write in English, Urdu or Roman Urdu…"></textarea>
-        <button class="sendbtn idle" id="sendBtn" aria-label="Send" title="Send (Enter)"><svg class="ic ic-lg"><use href="#i-send" id="sendIconUse"/></svg></button>
+        <button class="sendbtn idle" id="sendBtn" aria-label="Send" title="Send (Enter)" disabled><svg class="ic ic-lg"><use href="#i-send" id="sendIconUse"/></svg></button>
       </div>
       <div class="composer-meta">
         <div class="toggles">
-          <button class="toggle" id="deepToggle"><svg class="ic"><use href="#i-flask"/></svg> Deep Research</button>
+          <button class="toggle" id="deepToggle" title="Deep Research for the next question — more sources, a longer detailed report"><svg class="ic"><use href="#i-flask"/></svg> Deep Research</button>
         </div>
         <div class="alwaysdeep" id="alwaysDeepBar" title="Always Deep Research — when ON, every question gets deep research. Your choice is remembered.">
           <span class="ad-label"><svg class="ic"><use href="#i-flask"/></svg> Always Deep</span>
@@ -984,8 +1040,11 @@ function buildMessageEl(m){
   var rg=wrap.querySelector('[data-act="regen"]');
   if(rg) rg.onclick=function(){ if(state.isGenerating){ toast('Wait for the current answer to finish'); return; } askQuestion(m.question, false); };
   wrap.querySelector('[data-act="share"]').onclick=function(){ shareText('ENAO AI answer', m.plain||stripHtml(m.html)); };
-  wrap.querySelector('[data-act="like"]').onclick=function(){ toast('Thank you! Rating noted'); };
-  wrap.querySelector('[data-act="dislike"]').onclick=function(){ toast('Noted — the next answer will be better'); };
+  var likeBtn=wrap.querySelector('[data-act="like"]'); var disBtn=wrap.querySelector('[data-act="dislike"]');
+  if(m.rating==='like') likeBtn.classList.add('on');
+  if(m.rating==='dislike') disBtn.classList.add('on');
+  likeBtn.onclick=function(){ m.rating = m.rating==='like' ? '' : 'like'; likeBtn.classList.toggle('on', m.rating==='like'); disBtn.classList.remove('on'); saveChats(); toast(m.rating==='like'?'Thank you! Rating noted':'Rating removed'); };
+  disBtn.onclick=function(){ m.rating = m.rating==='dislike' ? '' : 'dislike'; disBtn.classList.toggle('on', m.rating==='dislike'); likeBtn.classList.remove('on'); saveChats(); toast(m.rating==='dislike'?'Noted — the next answer will be better':'Rating removed'); };
   var st=wrap.querySelector('[data-act="srcToggle"]');
   if(st) st.onclick=function(){ var lst=wrap.querySelector('.sources-list'); var open=lst.style.display!=='none'; lst.style.display=open?'none':'block'; st.setAttribute('aria-expanded', open?'false':'true'); st.textContent=open?st.textContent.replace('tap to hide','tap to view'):st.textContent.replace('tap to view','tap to hide'); };
   wrap.querySelectorAll('.codecopy').forEach(function(cb){ cb.onclick=function(){ var pre=cb.parentElement.querySelector('code'); copyText(pre?pre.textContent:''); }; });
@@ -1218,10 +1277,20 @@ function highlightCode(code){
   h=h.replace(/\b(\d+(?:\.\d+)?)\b/g,'<span class="tok-num">$1</span>');
   return h;
 }
+/* Math: input is already HTML-escaped text. Fractions, roots, powers, subscripts and common symbols become readable notation. */
+function formatMath(h){
+  h=h.replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g,'($1)/($2)');
+  h=h.replace(/\\sqrt\{([^{}]+)\}/g,'√($1)');
+  h=h.replace(/\^\{([^{}]+)\}/g,'<sup>$1</sup>').replace(/_\{([^{}]+)\}/g,'<sub>$1</sub>');
+  h=h.replace(/\^([A-Za-z0-9])/g,'<sup>$1</sup>').replace(/_([A-Za-z0-9])/g,'<sub>$1</sub>');
+  var sym={alpha:'α',beta:'β',gamma:'γ',delta:'δ',theta:'θ',lambda:'λ',mu:'μ',pi:'π',sigma:'σ',omega:'ω',Delta:'Δ',infty:'∞',times:'×',div:'÷',pm:'±',leq:'≤',geq:'≥',neq:'≠',approx:'≈',rightarrow:'→',leftarrow:'←'};
+  h=h.replace(/\\(alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|omega|Delta|infty|times|div|pm|leq|geq|neq|approx|rightarrow|leftarrow)\b/g,function(m,g){ return sym[g]||g; });
+  return h;
+}
 function mdToHtml(md){
   // markdown -> html: headings, bullets, numbered lists, tables, code blocks with copy, inline code, bold, citations
   var lines=(md||'').split('\n'); var html=''; var listType=null; var inCode=false; var codeBuf=[]; var tableBuf=[];
-  function inline(t){ return esc(t).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/\[(\d+)\]/g,'<span class="cite">[$1]</span>'); }
+  function inline(t){ return esc(t).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/\[(\d+)\]/g,'<span class="cite">[$1]</span>').replace(/\$([^$\n]+)\$/g,function(m,g){ return '<span class="math">'+formatMath(g)+'</span>'; }); }
   function closeList(){ if(listType){ html+='</'+listType+'>'; listType=null; } }
   function flushTable(){
     if(!tableBuf.length) return;
@@ -1245,7 +1314,8 @@ function mdToHtml(md){
     if(inCode){ codeBuf.push(line); return; }
     if(/^\|.*\|$/.test(t)){ closeList(); tableBuf.push(line); return; }
     flushTable();
-    if(/^#{1,3}\s/.test(t)){ closeList(); html+='<h3>'+inline(t.replace(/^#{1,3}\s/,''))+'</h3>'; }
+    if(/^\$\$.*\$\$$/.test(t)){ closeList(); html+='<div class="math-block">'+formatMath(esc(t.slice(2,-2).trim()))+'</div>'; }
+    else if(/^#{1,3}\s/.test(t)){ closeList(); var hl=t.match(/^#+/)[0].length; var htag=hl===1?'h2':(hl===2?'h3':'h4'); html+='<'+htag+'>'+inline(t.replace(/^#{1,3}\s/,''))+'</'+htag+'>'; }
     else if(/^[-*•]\s/.test(t)){ if(listType!=='ul'){ closeList(); html+='<ul>'; listType='ul'; } html+='<li>'+inline(t.replace(/^[-*•]\s/,''))+'</li>'; }
     else if(/^\d+[.)]\s/.test(t)){ if(listType!=='ol'){ closeList(); html+='<ol>'; listType='ol'; } html+='<li>'+inline(t.replace(/^\d+[.)]\s/,''))+'</li>'; }
     else if(/^>\s/.test(t)){ closeList(); html+='<p style="border-left:3px solid var(--accent);padding-left:12px;color:var(--muted)">'+inline(t.replace(/^>\s/,''))+'</p>'; }
@@ -1273,7 +1343,7 @@ function setProgress(steps, activeIdx){
     else h+='<div class="progress-step"><span style="width:18px;text-align:center">•</span>'+esc(s)+'</div>';
   });
   h+='</div>'; box.innerHTML=h;
-  $('scrollArea').scrollTop=$('scrollArea').scrollHeight;
+  if(state.nearBottom) $('scrollArea').scrollTop=$('scrollArea').scrollHeight;
 }
 
 /* Answer pipeline: AI-with-sources → AI-from-knowledge → smart source answer. One of them ALWAYS succeeds. */
@@ -1328,7 +1398,7 @@ function megaQueries(topic, entity){
 }
 function setMegaProgress(batch, collected, mega){
   $('progressBox').innerHTML='<div class="progress"><div class="progress-step done"><span class="spinner"></span><span><b>Mega Deep Research</b> — batch '+batch+' done • <b>'+collected+'</b> unique '+esc(mega.entity)+' collected so far (you asked for '+mega.count.toLocaleString()+'). Searching more batches across the whole internet…</span></div></div>';
-  $('scrollArea').scrollTop=$('scrollArea').scrollHeight;
+  if(state.nearBottom) $('scrollArea').scrollTop=$('scrollArea').scrollHeight;
 }
 function megaSearch(topic, mega){
   var queries=megaQueries(topic, mega.entity);
@@ -1375,12 +1445,14 @@ function megaSearchFlow(text, mega, chat, lang, historyText){
     }
     $('progressBox').innerHTML='<div class="progress"><div class="progress-step done"><span class="spinner"></span><span><b>'+items.length+'</b> unique '+esc(mega.entity)+' collected. Now analyzing all of them and building the best-of-best ranking…</span></div></div>';
     return megaAnswer(text, mega, items, lang).then(function(result){
+      hideTyping();
       var ansTl=timeLabelFor(Date.now());
       var msg={role:'ai', html:'', plain:result.plain, viaVoice:!!state.currentAskViaVoice, question:text, sources: state.sourcesOn?items.slice(0,18):[], followups: makeFollowups(text, lang), lang:lang, ts:Date.now(), daypart:ansTl.daypart, daypartRoman:ansTl.daypartRoman, timeLabel:ansTl.full, _fullHtml:result.html};
       chat.messages.push(msg); renderMessages();
       streamMessage(chat, msg);
     });
   }).catch(function(){
+    hideTyping();
     setProgress(null);
     var fh=fallbackAnswer(text, [], lang, true);
     var errTl=timeLabelFor(Date.now());
@@ -1402,11 +1474,22 @@ function setGenerating(on){
   $('sendIconUse').setAttribute('href', on?'#i-stop':'#i-send');
   sb.title=on?'Stop generating':'Send (Enter)';
   sb.setAttribute('aria-label', on?'Stop generating':'Send');
+  if(!on) syncSendBtn();
+}
+/* Send button states: disabled + faded while the box is empty, solid as soon as there is text or a file, Stop while generating */
+function syncSendBtn(){
+  var sb=$('sendBtn'); if(!sb) return;
+  if(state.isGenerating){ sb.disabled=false; sb.classList.remove('idle'); return; }
+  var ready=!!($('input').value.trim() || state.pendingFiles.length);
+  sb.disabled=!ready;
+  sb.classList.toggle('idle', !ready);
+  sb.title=ready?'Send (Enter)':'Write a message or attach a file first';
 }
 function stopGeneration(){
   if(!state.isGenerating) return;
   state.stopRequested=true;
   if(state.streamTimer){ clearInterval(state.streamTimer); state.streamTimer=null; }
+  hideTyping();
   setProgress(null);
   setGenerating(false);
   var c=activeChat();
@@ -1424,8 +1507,13 @@ function sendCurrent(){
   if(!text && !state.pendingFiles.length) return;
   var viaVoice=!!state.nextAskViaVoice;
   state.nextAskViaVoice=false;
-  $('input').value=''; autoGrow();
-  askQuestion(text, viaVoice);
+  $('input').value=''; autoGrow(); syncSendBtn();
+  try{ askQuestion(text, viaVoice); }
+  catch(e){
+    /* Sending failed before the question was even posted — put the typed text back, nothing is lost */
+    $('input').value=text; autoGrow(); syncSendBtn();
+    toast('Sending failed — your text is back in the box. Tap Send to try again.');
+  }
 }
 
 function askQuestion(text, viaVoice){
@@ -1452,6 +1540,7 @@ function askQuestion(text, viaVoice){
     ? ['Understanding your question deeply…','Searching in batches across the whole internet…','Reading and verifying the websites…','Preparing your detailed report…']
     : ['Understanding your question deeply…','Searching live in several ways…','Reading the best sources…','Preparing your complete answer…'];
   setProgress(steps,1);
+  showTyping();
 
   var historyText = chat.messages.slice(-12, -1).map(function(m){ var tl=timeLabelFor(m.ts||Date.now()); return '['+tl.full+' • '+timeAgoText(m.ts)+'] '+(m.role==='user'?'User: ':'AI: ')+(m.text||stripHtml(m.html||'')).slice(0,450); }).join('\n');
   if(!historyText) historyText='(No previous conversation — this is the first message, asked now at '+askTl.full+'.)';
@@ -1477,6 +1566,7 @@ function askQuestion(text, viaVoice){
     return answerWithSources(text, sources, lang, deep, historyText, steps);
   }).then(function(result){
     if(state.stopRequested) return;
+    hideTyping();
     setProgress(steps,3);
     var ansTl=timeLabelFor(Date.now());
     var msg={role:'ai', html:'', plain:result.plain, viaVoice:askViaVoice, question:text, sources: state.sourcesOn?result.sources:[], followups: makeFollowups(text, lang), lang:lang, ts:Date.now(), daypart:ansTl.daypart, daypartRoman:ansTl.daypartRoman, timeLabel:ansTl.full, _fullHtml:result.html};
@@ -1486,6 +1576,7 @@ function askQuestion(text, viaVoice){
   }).catch(function(){
     if(state.stopRequested) return;
     // Last-resort safety net: still deliver a full, helpful answer — never an error-only reply
+    hideTyping();
     setProgress(null);
     var fh=fallbackAnswer(text, [], lang, effectiveDeep());
     var errTl=timeLabelFor(Date.now());
@@ -1829,6 +1920,93 @@ $('renameSave').onclick=function(){
 document.querySelectorAll('.modal').forEach(function(m){ m.addEventListener('click', function(e){ if(e.target===m) m.classList.remove('open'); }); });
 var exBtns=document.querySelectorAll('#examples .ex');
 exBtns.forEach(function(b){ b.onclick=function(){ var t=b.childNodes[0].textContent.trim(); askQuestion(t); }; });
+
+/* ---------- PIECE 2 WIRING — typing indicator, smart scrolling, attachments ---------- */
+function showTyping(){
+  var t=$('typingRow'); if(!t) return;
+  t.style.display='flex';
+  if(state.nearBottom) $('scrollArea').scrollTop=$('scrollArea').scrollHeight;
+}
+function hideTyping(){ var t=$('typingRow'); if(t) t.style.display='none'; }
+
+/* Smart scrolling: near the bottom the chat follows new messages; scrolled up to read
+   an older message, nothing ever pulls the reader back down — a button offers the way back. */
+(function(){
+  var sa=$('scrollArea'); if(!sa) return;
+  sa.addEventListener('scroll', function(){
+    state.nearBottom = (sa.scrollHeight - sa.scrollTop - sa.clientHeight) < 140;
+    $('scrollDownBtn').classList.toggle('show', !state.nearBottom);
+  });
+  $('scrollDownBtn').onclick=function(){ sa.scrollTo({top:sa.scrollHeight, behavior:'smooth'}); };
+})();
+
+/* Attachments: type + size validation, real read progress, previews, remove before sending */
+var MAX_FILE_BYTES=10*1024*1024;
+var DOC_EXTS=['pdf','doc','docx','xls','xlsx','csv','txt','md'];
+var TEXT_EXTS=['txt','md','csv'];
+function fmtFileSize(n){
+  if(n<1024) return n+' B';
+  if(n<1024*1024) return (n/1024).toFixed(1)+' KB';
+  return (n/(1024*1024)).toFixed(1)+' MB';
+}
+function renderAttachRow(){
+  var row=$('attachRow'); if(!row) return;
+  row.innerHTML='';
+  row.classList.toggle('show', state.pendingFiles.length>0);
+  state.pendingFiles.forEach(function(f, idx){
+    var chip=document.createElement('div'); chip.className='attachchip';
+    var thumb=(f.kind==='image' && f.dataUrl)
+      ? '<img src="'+f.dataUrl+'" alt="Preview of '+esc(f.name)+'">'
+      : '<svg class="ic ic-lg"><use href="#i-doc"/></svg>';
+    var sub=fmtFileSize(f.size)+(f.progress<100 ? ' • Reading '+f.progress+'%' : ' • Ready to send');
+    chip.innerHTML=thumb+'<div style="min-width:0"><div class="ac-name" title="'+esc(f.name)+'">'+esc(f.name)+'</div><div class="ac-sub">'+esc(sub)+'</div><div class="ac-progress"><i style="width:'+(f.progress||0)+'%"></i></div></div>'
+      +'<button class="ac-x" type="button" aria-label="Remove attachment '+esc(f.name)+'" title="Remove this attachment before sending">×</button>';
+    chip.querySelector('.ac-x').onclick=function(){ state.pendingFiles.splice(idx,1); renderAttachRow(); syncSendBtn(); $('input').focus(); };
+    row.appendChild(chip);
+  });
+}
+function handleFiles(list){
+  Array.prototype.forEach.call(list, function(f){
+    var ext=((f.name.split('.').pop()||'').toLowerCase());
+    var isImg=f.type.indexOf('image/')===0;
+    if(!isImg && DOC_EXTS.indexOf(ext)===-1){ toast('“'+f.name+'” is not a supported type — use an image, PDF, Word, Excel, CSV or text file'); return; }
+    if(isImg && ['png','jpg','jpeg','gif','webp'].indexOf(ext)===-1 && f.type.indexOf('image/svg')===0){ toast('“'+f.name+'” — SVG images are not supported'); return; }
+    if(f.size>MAX_FILE_BYTES){ toast('“'+f.name+'” is '+fmtFileSize(f.size)+' — the limit is 10 MB per file'); return; }
+    if(state.pendingFiles.length>=5){ toast('Up to 5 files per message'); return; }
+    var rec={name:f.name, kind:isImg?'image':'doc', size:f.size, text:'', dataUrl:'', progress:0};
+    state.pendingFiles.push(rec); renderAttachRow(); syncSendBtn();
+    var reader=new FileReader();
+    reader.onprogress=function(ev){ if(ev.lengthComputable){ rec.progress=Math.min(99, Math.round(ev.loaded/ev.total*100)); renderAttachRow(); } };
+    reader.onload=function(){
+      rec.progress=100;
+      if(isImg) rec.dataUrl=reader.result;
+      else if(TEXT_EXTS.indexOf(ext)>-1) rec.text=String(reader.result||'');
+      renderAttachRow();
+    };
+    reader.onerror=function(){ rec.progress=100; renderAttachRow(); toast('“'+f.name+'” could not be read — it will be attached by name only'); };
+    if(isImg) reader.readAsDataURL(f); else reader.readAsText(f);
+  });
+}
+$('attachBtn').onclick=function(e){
+  e.stopPropagation();
+  var m=$('attachMenu'); m.hidden=!m.hidden;
+};
+$('amImage').onclick=function(){ $('attachMenu').hidden=true; var fi=$('fileInput'); fi.accept='image/*'; fi.click(); };
+$('amDoc').onclick=function(){ $('attachMenu').hidden=true; var fi=$('fileInput'); fi.accept='.pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.md'; fi.click(); };
+document.addEventListener('click', function(e){
+  var m=$('attachMenu'); if(!m || m.hidden) return;
+  if(!m.contains(e.target) && !$('attachBtn').contains(e.target)) m.hidden=true;
+});
+$('fileInput').addEventListener('change', function(){ if(this.files && this.files.length) handleFiles(this.files); this.value=''; });
+$('input').addEventListener('input', syncSendBtn);
+syncSendBtn();
+
+/* Confirmation dialog — the Yes button runs the pending action (chat delete and friends) */
+$('confirmYes').onclick=function(){
+  var cb=confirmCb; confirmCb=null;
+  closeModal('confirmModal');
+  if(cb) cb();
+};
 
 // Init — restore permanent memory first; purani chats aur un ka context wapas aa jata hai
 var restored = loadChats();
