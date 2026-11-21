@@ -815,28 +815,13 @@ html[data-theme="dark"] .composer-box{border-color:#1e4d3f;box-shadow:0 10px 30p
 .cpill .cpill-chev{width:13px;height:13px;color:var(--muted)}
 /* The attachment chooser now opens right above the Attach pill */
 .attachmenu{left:62px}
-/* Page footer — one thin bar: privacy left, brand centre, Help / Feedback right */
-.pagefoot{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;background:var(--surface);border-top:1px solid var(--line);padding:8px 18px calc(8px + env(safe-area-inset-bottom));font-size:12.5px;color:var(--muted)}
-.pf-left{display:inline-flex;align-items:center;gap:7px;font-weight:600;color:var(--ink);white-space:nowrap}
-.pf-left .pf-shield{width:19px;height:19px;margin:0;vertical-align:0}
-.pf-center{font-weight:600;white-space:nowrap;text-align:center}
-.pf-right{display:inline-flex;align-items:center;gap:4px;justify-self:end}
-.pf-link{display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;color:var(--ink);font-size:12.5px;font-weight:600;min-height:32px;padding:4px 8px;border-radius:8px}
-.pf-link:hover{background:var(--surface2);color:var(--accent)}
-.pf-link .ic{width:17px;height:17px;margin:0;vertical-align:0}
-.pf-div{width:1px;height:18px;background:var(--line);margin:0 4px}
-/* The toast floats above the taller composer + footer, never on top of them */
+/* The toast floats above the composer, never on top of it */
 .toast{bottom:252px}
 /* Whole-page polish — one radius family on the remaining shells, no clipped shadows */
 .hero-banner,.acard{border-radius:18px}
 .modal-card{border-radius:18px}
 @media(max-width:820px){
   .toast{bottom:308px}
-  .pagefoot{padding-left:14px;padding-right:14px}
-}
-@media(max-width:640px){
-  .pf-center{display:none}
-  .pagefoot{grid-template-columns:1fr auto}
 }
 @media(max-width:560px){
   .composer-box{border-radius:18px;padding:10px}
@@ -915,12 +900,6 @@ html[data-theme="dark"] .composer-box{border-color:#1e4d3f;box-shadow:0 10px 30p
 .alwaysdeep .switch{width:32px;height:19px;min-height:19px;flex:0 0 32px}
 .alwaysdeep .switch-thumb{width:13px;height:13px}
 .alwaysdeep .switch[aria-checked="true"] .switch-thumb{left:16px}
-.pagefoot{padding:3px 14px calc(3px + env(safe-area-inset-bottom));font-size:11.5px;gap:8px}
-.pf-left{gap:5px}
-.pf-left .pf-shield{width:15px;height:15px}
-.pf-link{font-size:11.5px;min-height:24px;padding:2px 6px;gap:5px;border-radius:7px}
-.pf-link .ic{width:14px;height:14px}
-.pf-div{height:14px;margin:0 2px}
 /* The toast now floats just above the slim bottom block, not high over the chat */
 .toast{bottom:148px}
 @media(max-width:820px){ .toast{bottom:172px} }
@@ -1151,15 +1130,6 @@ html[data-theme="dark"] .composer-box{border-color:#1e4d3f;box-shadow:0 10px 30p
     </div>
   </footer>
 
-  <div class="pagefoot">
-    <span class="pf-left"><svg class="ic pf-shield"><use href="#i-shield"/></svg> Your privacy is our priority</span>
-    <span class="pf-center">ENAO AI • Smarter AI for a Better Tomorrow</span>
-    <span class="pf-right">
-      <button class="pf-link" id="helpBtn" title="Help — what ENAO AI is and how it works"><svg class="ic"><use href="#i-help"/></svg> Help</button>
-      <span class="pf-div" aria-hidden="true"></span>
-      <button class="pf-link" id="feedbackBtn" title="Share your feedback about ENAO AI"><svg class="ic"><use href="#i-heart"/></svg> Feedback</button>
-    </span>
-  </div>
 </main>
 
 <!-- ABOUT MODAL -->
@@ -3758,8 +3728,6 @@ setInterval(function(){
   el('pillImage').onclick=function(){ fi.accept='image/*'; fi.click(); };
   el('pillDoc').onclick=function(){ fi.accept='.pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.md'; fi.click(); };
   el('pillTools').onclick=function(){ openTools(); };
-  el('helpBtn').onclick=function(){ openModal('aboutModal'); };
-  el('feedbackBtn').onclick=function(){ openModal('feedbackModal'); el('fbText').focus(); };
   el('fbCopy').onclick=function(){
     var t=el('fbText').value.trim();
     if(!t){ toast('Write your feedback first, then tap Copy'); el('fbText').focus(); return; }
