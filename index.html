@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<meta name="enao-build" content="v61-deep-triggers-4lang">
+<meta name="enao-build" content="v62-learning">
+<meta name="enao-build" content="v62-identity">
 <meta name="enao-build" content="v60-universal-scope">
 <meta name="enao-build" content="v57-universal-intel">
 <meta name="enao-build" content="v55-master-intel">
@@ -1689,6 +1690,2431 @@ global.EnzoResearchTriggers = api;
 if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
+<!-- v62-learning: piece 41-teaching (byte-identical) -->
+<script>/* ==========================================================================
+ * PIECE 41 — Teaching-intent detection (4 languages) + learned store
+ * ENAO AI learning track (artifact slug: enao-ai, live build
+ * v61-deep-triggers-4lang). This piece wires nothing itself, never edits
+ * the artifact, never deploys.
+ *
+ * WHAT IT DOES
+ *   Detects when Raja TEACHES ENZO something ("learn this", "ye seekh
+ *   lo", "یہ سیکھ لو", "ایہ سکھ لو", ...) and when he CORRECTS ENZO
+ *   ("ye ghalat hai, sahi ye hai ..."), stores the taught item in a NEW
+ *   localStorage key, and builds a compact prompt block so answers
+ *   honour what was taught. It does NOT change the existing
+ *   `enao_learned_v1` shape (langs / lengthPref / topics / corrections)
+ *   — other code reads that shape, and this piece leaves it alone.
+ *
+ * THE STORE (new, separate key):
+ *   localStorage key `enao_learned_items_v1` — an array of items:
+ *   { id, kind:'fact'|'preference'|'correction'|'skill', text, detail,
+ *     lang, source:'taught', ts, topic? }
+ *   Items survive reload and new chats (localStorage). `detail` holds
+ *   the wrong part of a correction; `text` holds the right part (or the
+ *   wrong part when no right part was given).
+ *
+ * THE RULES (locked by this piece):
+ *   - A teaching order is an explicit teaching trigger PLUS taught
+ *     content. A bare trigger with nothing taught ("remember this"
+ *     alone) stores nothing.
+ *   - A correction outranks teaching: it is checked first and is
+ *     stored with kind 'correction'.
+ *   - Ordinary questions, research orders and bare "find me..." are
+ *     NEVER teaching, even when they share a word with a trigger
+ *     ("Do you remember this song?", "I want to learn French").
+ *   - The confirmation line is ONE short line in the user's language
+ *     and never echoes the taught content back.
+ *   - buildLearnedNote puts corrections first, then preferences, then
+ *     facts/skills; max 12 items, 120 chars each; the oldest items are
+ *     dropped from the NOTE only, never from storage.
+ *
+ * PUBLIC API (pure functions, no DOM, no network, no dependencies):
+ *   detectTeaching(text)
+ *     -> { isTeaching:true, kind, content, lang, matched } | null
+ *   detectCorrection(text)
+ *     -> { isCorrection:true, wrongPart, rightPart, lang } | null
+ *   createLearnedStore(storage?)
+ *     -> { addItem, getItems, deleteItem, clearAll, findByTopic }
+ *     storage defaults to localStorage, with a shared in-memory
+ *     fallback when localStorage is absent (Node). Pass the same
+ *     storage object to share one store across instances.
+ *   confirmLine(item, lang?) -> one short line, user's language
+ *   buildLearnedNote(items) -> prompt block string ('' when empty)
+ *   applyTeaching(text, deps?)
+ *     -> { learned:item|null, confirm:string|null, isCorrection:bool }
+ *     deps: { store } or { storage }; defaults to the shared store.
+ *   detectTeachLang(text) -> 'en' | 'roman' | 'urdu' | 'punjabi'
+ *
+ * WIRING (assembler — this piece wires nothing itself):
+ *   1. FRONTEND, message-send path, BEFORE intent routing: call
+ *      EnzoTeaching.applyTeaching(text). If result.learned is set,
+ *      show result.confirm as the reply and do NOT route the message
+ *      as a question / research order / normal answer.
+ *   2. FRONTEND, learnedPrefs / learnedNote (~line 16351): read the
+ *      items store as well — call EnzoTeaching.buildLearnedNote(
+ *      EnzoTeaching.createLearnedStore().getItems()) and append its
+ *      block to the prompt, so corrections and taught facts reach
+ *      answer generation. The existing `enao_learned_v1` note stays
+ *      as-is; this block is additional.
+ *   3. FRONTEND, Settings "what ENZO has learned" panel: list the
+ *      items store (getItems) with per-item Delete (deleteItem) and a
+ *      Delete-everything (clearAll), next to the existing learned
+ *      panel. Learned things are shown there and deletable, per the
+ *      learning rule.
+ *
+ * STYLE: plain ES5, var + function declarations, no modules, matching
+ * the existing artifact style and the piece-31 trigger style (regex
+ * families per language, guarded UMD export). Zero emojis. No topic
+ * names anywhere in this file.
+ * ========================================================================== */
+(function (root) {
+'use strict';
+
+/* ---------- small helpers ---------- */
+function trim(s) { return String(s == null ? '' : s).replace(/^\s+|\s+$/g, ''); }
+
+/* ---------- language detection ----------
+   Mirrors the artifact's detectLang, extended with Punjabi Shahmukhi
+   (the artifact returns 'urdu' for all Arabic-script text). Punjabi
+   markers: ایہ / اگوں / توں / تسی / لبھو / ویکھو / سکھو / کردا /
+   چاہندا / کھلدا / آں / وچ / مینوں, and a standalone اے as the
+   copula (Urdu uses ہے instead). Roman Punjabi markers: tusi /
+   vekho / labho / sikho / eh / aggon. */
+var PUNJABI_SCRIPT_RE = /ایہ|اگوں|توں|تسی|تواڈا|لبھو|ویکھو|سکھو|چکو|چھڈو|کردا|چاہندا|کھلدا|آں|مینوں| وچ | نال |(^|\s)اے(\s|$|[؟۔،؛!?.،,])/;
+var ROMAN_PUNJABI_RE = /\b(tusi|tussi|vekho|labho|sikho|eh|aggon|tuada|meinu|tainu)\b/;
+var ROMAN_MARKER_RE = /\b(kya|kia|hai|hain|yaad|seekh|aage|mera|meri|mujhe|batao|karo|chahiye|hamesha|pasand|ghalat|galat|sahi|kuch|aur|nahi|kab|kaise|kyun)\b/;
+
+function detectTeachLang(text) {
+  var raw = String(text || '');
+  if (/[\u0600-\u06FF]/.test(raw)) {
+    if (PUNJABI_SCRIPT_RE.test(raw)) return 'punjabi';
+    return 'urdu';
+  }
+  var low = ' ' + raw.toLowerCase() + ' ';
+  if (ROMAN_PUNJABI_RE.test(low)) return 'punjabi';
+  if (ROMAN_MARKER_RE.test(low)) return 'roman';
+  return 'en';
+}
+
+/* ---------- teaching triggers ----------
+   Ordered longest-first inside each language family so the longest
+   phrase wins the match (e.g. "ye yaad rakhna" before "yaad rakhna",
+   "from now on do it like this" before "from now on"). `kind` is the
+   trigger's default; content-based preference signals can still
+   promote a fact to a preference (see isPreferenceContent). */
+var TEACH_PATTERNS = [
+  /* English */
+  { re: /from now on(?:,)?\s+do it like this/i, kind: 'preference' },
+  { re: /from now on/i, kind: 'preference' },
+  { re: /learn how to/i, kind: 'skill' },
+  { re: /learn this/i, kind: 'fact' },
+  { re: /learn that/i, kind: 'fact' },
+  { re: /remember this/i, kind: 'fact' },
+  { re: /remember that/i, kind: 'fact' },
+  { re: /keep in mind/i, kind: 'preference' },
+  { re: /note this down/i, kind: 'fact' },
+  { re: /make a note of this/i, kind: 'fact' },
+  { re: /note this/i, kind: 'fact' },
+  /* Roman Urdu */
+  { re: /aage se aisa karna/i, kind: 'preference' },
+  { re: /aage se aisa karo/i, kind: 'preference' },
+  { re: /ye yaad rakhna/i, kind: 'fact' },
+  { re: /yeh yaad rakhna/i, kind: 'fact' },
+  { re: /yaad rakhna/i, kind: 'fact' },
+  { re: /yaad rakho/i, kind: 'fact' },
+  { re: /ye seekh lo/i, kind: 'fact' },
+  { re: /yeh seekh lo/i, kind: 'fact' },
+  /* Urdu script (specific phrases first) */
+  { re: /آگے سے ایسا کرنا/, kind: 'preference' },
+  { re: /یہ یاد رکھنا/, kind: 'fact' },
+  { re: /یہ سیکھ لو/, kind: 'fact' },
+  /* Punjabi Shahmukhi (specific phrases first) */
+  { re: /اگوں توں ایداں کرنا/, kind: 'preference' },
+  { re: /اگوں توں ایداں کرو/, kind: 'preference' },
+  { re: /ایہ یاد رکھنا/, kind: 'fact' },
+  { re: /ایہ یاد رکھو/, kind: 'fact' },
+  { re: /ایہ سکھ لو/, kind: 'fact' },
+  /* Shared Urdu-script phrases (same words in Urdu and Punjabi) */
+  { re: /یاد رکھنا/, kind: 'fact' },
+  { re: /یاد رکھو/, kind: 'fact' }
+];
+
+/* Preference signals in the taught content itself: "I always want
+   short answers" is a preference even when the trigger was "learn
+   this". Checked on the extracted content, not the whole message. */
+function isPreferenceContent(content) {
+  var low = ' ' + String(content).toLowerCase() + ' ';
+  if (/\b(always|never|from now on|i (like|prefer|love|hate|want)|i don'?t (like|want|eat))\b/.test(low)) return true;
+  if (/\b(hamesha|pasand|chahta|chahti|chahiye|kabhi nahi)\b/.test(low)) return true;
+  if (/(ہمیشہ|پسند|چاہتا|چاہتی|چاہندا|چاہیے|کبھی نہیں)/.test(content)) return true;
+  return false;
+}
+
+/* Strip the trigger phrase's surrounding separators and a leading
+   connector word ("ke" / "کہ" / "that") from the extracted content. */
+function cleanContent(s) {
+  var out = trim(s);
+  out = out.replace(/^[:\-–—,\.،؛؛\s]+/, '');
+  out = out.replace(/[:\-–—,\.،؛؛\s]+$/, '');
+  out = out.replace(/^(ke|کہ|that)\s+/i, '');
+  return trim(out);
+}
+
+function detectTeaching(text) {
+  var raw = String(text == null ? '' : text);
+  var trimmed = trim(raw);
+  if (!trimmed) return null;
+  /* A question is never teaching, even when it shares a trigger word
+     ("Do you remember this song?"). Teaching orders are imperatives
+     or statements, never questions. */
+  if (/\?\s*$/.test(trimmed)) return null;
+  if (/\bdo you remember\b/i.test(trimmed)) return null;
+  /* The user wanting to learn something himself is not teaching ENZO
+     ("I want to learn French", "teach me how to cook"). */
+  if (/^(teach me|help me learn|can you teach)\b/i.test(trimmed)) return null;
+  if (/\b(i want|i need|i would like|i'?d like|help me|teach me)\b[^.?!]*\b(to )?learn\b/i.test(trimmed)) return null;
+
+  var i, m, pat, after, before, content, kind;
+  for (i = 0; i < TEACH_PATTERNS.length; i++) {
+    pat = TEACH_PATTERNS[i];
+    m = pat.re.exec(raw);
+    if (!m) continue;
+    /* Content usually follows the trigger ("learn this: X"); when
+       the trigger comes last ("X, remember this") it precedes it. */
+    after = trim(raw.slice(m.index + m[0].length));
+    before = trim(raw.slice(0, m.index));
+    content = cleanContent(after || before);
+    if (!content) return null; /* bare trigger, nothing taught */
+    kind = pat.kind;
+    if (isPreferenceContent(content)) kind = 'preference';
+    return { isTeaching: true, kind: kind, content: content,
+      lang: detectTeachLang(raw), matched: m[0] };
+  }
+  return null;
+}
+
+/* ---------- corrections (higher priority than teaching) ----------
+   A correction names what was wrong and, usually, what is right:
+   "ye ghalat hai, sahi ye hai ke ..." / "that's wrong, the right
+   thing is ...". The separator phrase splits right from wrong; when
+   there is no separator, the whole remainder (minus the "wrong"
+   phrase) is the wrong part and rightPart is ''. */
+var CORR_WRONG_RES = [
+  /that'?s wrong/i, /that is wrong/i, /that'?s not right/i,
+  /that'?s incorrect/i, /that is incorrect/i,
+  /ye ghalat hai/i, /yeh ghalat hai/i, /ye galat hai/i, /yeh galat hai/i,
+  /یہ غلط ہے/, /ایہ غلط اے/, /غلط ہے/, /غلط اے/
+];
+var CORR_SEP_RES = [
+  /the right thing is/i, /the correct (thing|answer) is/i,
+  /sahi ye hai/i, /sahi yeh hai/i, /asal ye hai/i, /asal yeh hai/i,
+  /صحیح یہ ہے/, /اصل یہ ہے/, /صحیح ایہ اے/, /اصل ایہ اے/
+];
+
+function stripWrongPhrases(s) {
+  var out = String(s == null ? '' : s), i;
+  for (i = 0; i < CORR_WRONG_RES.length; i++) out = out.replace(CORR_WRONG_RES[i], ' ');
+  out = out.replace(/^(no|nahi|nahin|نہیں|نئیں)[,\s]+/i, '');
+  return cleanContent(out);
+}
+
+function detectCorrection(text) {
+  var raw = String(text == null ? '' : text);
+  var trimmed = trim(raw);
+  if (!trimmed) return null;
+  var i, m, sep = null, hasWrong = false;
+  for (i = 0; i < CORR_WRONG_RES.length; i++) {
+    if (CORR_WRONG_RES[i].test(raw)) { hasWrong = true; break; }
+  }
+  for (i = 0; i < CORR_SEP_RES.length; i++) {
+    m = CORR_SEP_RES[i].exec(raw);
+    if (m) { sep = m; break; }
+  }
+  if (!hasWrong && !sep) return null;
+  var wrongPart, rightPart;
+  if (sep) {
+    rightPart = cleanContent(raw.slice(sep.index + sep[0].length));
+    wrongPart = stripWrongPhrases(trim(raw.slice(0, sep.index)));
+  } else {
+    wrongPart = stripWrongPhrases(trimmed);
+    rightPart = '';
+  }
+  return { isCorrection: true, wrongPart: wrongPart, rightPart: rightPart,
+    lang: detectTeachLang(raw) };
+}
+
+/* ---------- the learned store ----------
+   Storage adapter injected via deps; default is localStorage with a
+   shared in-memory fallback (Node / no-localStorage). The fallback is
+   module-level so repeated default stores share one memory copy. */
+var ITEMS_KEY = 'enao_learned_items_v1';
+var _counter = 0;
+var _fallbackStorage = null;
+
+function memoryStorage() {
+  var data = {};
+  return {
+    getItem: function (k) { return Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null; },
+    setItem: function (k, v) { data[k] = String(v); },
+    removeItem: function (k) { delete data[k]; }
+  };
+}
+
+function defaultStorage() {
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage && localStorage.getItem) return localStorage;
+  } catch (e) {}
+  if (!_fallbackStorage) _fallbackStorage = memoryStorage();
+  return _fallbackStorage;
+}
+
+function createLearnedStore(storage) {
+  var store = storage || defaultStorage();
+
+  function read() {
+    try {
+      var j = JSON.parse(store.getItem(ITEMS_KEY) || 'null');
+      if (j && Object.prototype.toString.call(j) === '[object Array]') return j;
+    } catch (e) {}
+    return [];
+  }
+  function write(items) {
+    try { store.setItem(ITEMS_KEY, JSON.stringify(items)); } catch (e) {}
+  }
+
+  function addItem(item) {
+    if (!item || !trim(String(item.text || ''))) return null;
+    var items = read();
+    _counter++;
+    var now = Date.now();
+    var saved = {
+      id: 'li_' + now + '_' + _counter,
+      kind: item.kind || 'fact',
+      text: String(item.text).slice(0, 500),
+      detail: item.detail ? String(item.detail).slice(0, 500) : '',
+      lang: item.lang || 'en',
+      source: 'taught',
+      ts: item.ts || now
+    };
+    if (item.topic) saved.topic = String(item.topic).slice(0, 100);
+    items.push(saved);
+    write(items);
+    return saved;
+  }
+  function getItems() { return read(); }
+  function deleteItem(id) {
+    var items = read();
+    var kept = items.filter(function (it) { return it.id !== id; });
+    if (kept.length === items.length) return false;
+    write(kept);
+    return true;
+  }
+  function clearAll() {
+    write([]);
+    try { store.removeItem(ITEMS_KEY); } catch (e) {}
+  }
+  function findByTopic(topic) {
+    var q = trim(String(topic == null ? '' : topic)).toLowerCase();
+    if (!q) return [];
+    return read().filter(function (it) {
+      var hay = ((it.text || '') + ' ' + (it.detail || '') + ' ' + (it.topic || '')).toLowerCase();
+      return hay.indexOf(q) !== -1;
+    });
+  }
+  return { addItem: addItem, getItems: getItems, deleteItem: deleteItem,
+    clearAll: clearAll, findByTopic: findByTopic, key: ITEMS_KEY };
+}
+
+/* ---------- confirmation line ----------
+   ONE short line in the user's language. Never echoes the taught
+   content back. */
+var CONFIRM_LINES = {
+  en: { learned: "Got it — I've learned that.", correction: "Got it — I've corrected that." },
+  roman: { learned: "Samajh gaya — ye seekh liya hai.", correction: "Samajh gaya — ghalti theek kar li hai." },
+  urdu: { learned: "سمجھ گیا — یہ سیکھ لیا ہے۔", correction: "سمجھ گیا — غلطی ٹھیک کر لی ہے۔" },
+  punjabi: { learned: "سمجھ گیا — ایہ سکھ لیا اے۔", correction: "سمجھ گیا — غلطی ٹھیک کر لئی اے۔" }
+};
+
+function confirmLine(item, lang) {
+  var l = lang || (item && item.lang) || 'en';
+  if (!CONFIRM_LINES[l]) l = 'en';
+  var kind = (item && item.kind === 'correction') ? 'correction' : 'learned';
+  return CONFIRM_LINES[l][kind];
+}
+
+/* ---------- prompt block for answer generation ----------
+   Corrections FIRST (highest priority), then preferences, then facts
+   and skills. Newest first inside each group. Max 12 items, 120
+   chars of item text each. Items dropped from the note are the
+   oldest of the lowest-priority group — storage is never trimmed
+   here. Returns '' when there is nothing to note. */
+var NOTE_MAX_ITEMS = 12;
+var NOTE_MAX_CHARS = 120;
+
+function noteLine(item) {
+  var text = trim(String(item.text || '')).slice(0, NOTE_MAX_CHARS);
+  var detail = trim(String(item.detail || '')).slice(0, NOTE_MAX_CHARS);
+  if (item.kind === 'correction') {
+    if (detail) return 'CORRECTION: never say "' + detail + '" again; say "' + text + '" instead.';
+    return 'CORRECTION: "' + text + '" is wrong — never say it again.';
+  }
+  if (item.kind === 'preference') return 'PREFERENCE: ' + text + '.';
+  if (item.kind === 'skill') return 'SKILL: ' + text + '.';
+  return 'FACT: ' + text + '.';
+}
+
+function buildLearnedNote(items) {
+  var list = (items || []).slice(0);
+  if (!list.length) return '';
+  var rank = { correction: 0, preference: 1, fact: 2, skill: 2 };
+  list.sort(function (a, b) {
+    var ra = rank[a.kind] == null ? 2 : rank[a.kind];
+    var rb = rank[b.kind] == null ? 2 : rank[b.kind];
+    if (ra !== rb) return ra - rb;
+    return (b.ts || 0) - (a.ts || 0);
+  });
+  var lines = list.slice(0, NOTE_MAX_ITEMS).map(noteLine);
+  return '[What ENZO has learned from you — apply silently:\n' +
+    lines.map(function (l) { return '- ' + l; }).join('\n') + '\n]';
+}
+
+/* ---------- wiring entry ----------
+   Correction first, then teaching. Returns the stored item (or null)
+   plus the one-line confirmation. A bare trigger, a question, a
+   research order or a greeting stores nothing. */
+function applyTeaching(text, deps) {
+  deps = deps || {};
+  var store = deps.store || createLearnedStore(deps.storage);
+  var corr = detectCorrection(text);
+  if (corr) {
+    var saved = store.addItem({
+      kind: 'correction',
+      text: corr.rightPart || corr.wrongPart,
+      detail: corr.rightPart ? corr.wrongPart : '',
+      lang: corr.lang || detectTeachLang(text)
+    });
+    return { learned: saved, confirm: saved ? confirmLine(saved) : null, isCorrection: true };
+  }
+  var t = detectTeaching(text);
+  if (!t) return { learned: null, confirm: null, isCorrection: false };
+  var saved2 = store.addItem({
+    kind: t.kind, text: t.content, detail: '', lang: t.lang
+  });
+  return { learned: saved2, confirm: saved2 ? confirmLine(saved2) : null, isCorrection: false };
+}
+
+/* ---------- exports (guarded UMD, piece-31 style) ---------- */
+var api = {
+  detectTeaching: detectTeaching,
+  detectCorrection: detectCorrection,
+  detectTeachLang: detectTeachLang,
+  createLearnedStore: createLearnedStore,
+  confirmLine: confirmLine,
+  buildLearnedNote: buildLearnedNote,
+  applyTeaching: applyTeaching,
+  ITEMS_KEY: ITEMS_KEY,
+  NOTE_MAX_ITEMS: NOTE_MAX_ITEMS,
+  NOTE_MAX_CHARS: NOTE_MAX_CHARS
+};
+if (typeof module !== 'undefined' && module.exports) module.exports = api;
+root.EnzoTeaching = api;
+
+})(typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : this));
+</script>
+<!-- v62-learning: piece 42-directed (byte-identical) -->
+<script>/* ==========================================================================
+ * PIECE 42 — Directed learning flow (internet + YouTube, real sources only)
+ * ENAO AI learning track (artifact slug: enao-ai, live build
+ * v61-deep-triggers-4lang). DO NOT EDIT THE ARTIFACT. DO NOT DEPLOY.
+ * Piece build only.
+ *
+ * PURPOSE
+ * -------
+ * A "learn this" order is different from a research order: the user is
+ * not asking for an answer, they are asking ENZO to LEARN something
+ * from a named place (the internet, YouTube, a specific video) and to
+ * remember what it learned. This piece detects that order, runs the
+ * learning through injected deps, and saves each learned point to the
+ * learned store (piece 41 spec) with its real source attached.
+ *
+ * WHAT IT REUSES (never reimplements)
+ * -----------------------------------
+ * - Piece 31 triggers (31-triggers.js): the four-language research
+ *   trigger sets. This piece does NOT reuse them directly — a directed
+ *   learning order needs a LEARN verb plus a named source, which is a
+ *   narrower signal than a research order — but it follows the same
+ *   four-language pattern (EN / Urdu script / Roman Urdu / Punjabi
+ *   Shahmukhi) and the same language labels ('en' | 'urdu' | 'roman'
+ *   | 'punjabi').
+ * - Piece 25 orchestrator (25-orchestrator.js): the central research
+ *   runner. In the app, deps.search is the orchestrator/backend
+ *   research path; this piece never fetches the internet itself.
+ * - Piece 41 store (41-teaching.js, spec): store.addItem({ kind, text,
+ *   detail, lang, source, ts, topic }). Piece 41 did not exist when
+ *   this piece was built; the code resolves the store from deps.store
+ *   first, then window.EnzoLearningTeaching when present, and saves
+ *   nothing (honestly, savedIds []) when neither is available.
+ *
+ * RULES (locked by this piece)
+ * -----------------------------
+ * - A directed-learning order needs BOTH a learn verb AND a named
+ *   source (internet / YouTube / a video). "research karo" without a
+ *   learn verb is NOT directed learning; "learn about X" with no
+ *   source named is NOT directed learning; a plain question is not.
+ * - Only REAL returned results become learned points. 0 results ->
+ *   status 'partial' with an honest message, never invented points.
+ * - YouTube has NO free transcript API. A video's learnable content
+ *   is its real title, description, channel and publish date, fetched
+ *   through deps.resolveVideo (oEmbed / page fetch in the app). If the
+ *   dep returns metadata only (no description / transcript text),
+ *   points = [] and status = 'metadata-only' with an honest message.
+ *   NEVER invent what a video says.
+ * - No fabricated sources or counts: every learned point cites the
+ *   real source object it came from; summaries state real numbers
+ *   only and name what could NOT be learned.
+ *
+ * PUBLIC API (on EnzoDirectedLearning)
+ * -------------------------------------
+ * detectDirectedLearning(text)
+ *   -> { isDirected:true, source:'internet'|'youtube'|'video',
+ *        topic:string|null, videoUrl:string|null, lang:string }
+ *      or null when the text is not a directed-learning order.
+ * learnFromInternet(topic, deps)
+ *   -> Promise resolving to { learned:[{ point, source:{ title, url,
+ *      date } }], sourcesVerified:number, status:'ok'|'partial'|
+ *      'failed', message:string, topic:string }.
+ *      deps.search(topic) -> array of results, or { results:[...] },
+ *      or a Promise of either. Each result needs a real url; results
+ *      without one are dropped, never cited.
+ * learnFromYouTube(videoUrlOrQuery, deps)
+ *   -> Promise resolving to { video:{ title, channel, url, published
+ *      }|null, points:[{ point, source:{ title, url, date } }],
+ *      status:'ok'|'metadata-only'|'failed', message:string }.
+ *      deps.resolveVideo(input) -> { title, channel, url, published,
+ *      description?, transcript? } or null, or a Promise of either.
+ *      Points come ONLY from real description / transcript text the
+ *      dep returned; metadata-only input yields points [].
+ * summariseLearning(result, lang)
+ *   -> string. Short summary in the user's language: what was learned
+ *      (bullets, each with its real source), what could NOT be learned
+ *      or accessed, and what ENZO will now do differently. Honest
+ *      about gaps; no invented counts.
+ * applyDirectedLearning(text, deps)
+ *   -> Promise resolving to { directed:boolean, detected:object|null,
+ *      result:object|null, summary:string|null, savedIds:array }.
+ *      detect -> run the right learner -> save each learned point as
+ *      a store item with its source attached -> return everything.
+ * extractVideoUrl(text) -> string|null (first YouTube URL in text).
+ * VERSION: '42-directed-1.0.0'
+ *
+ * DEP CONTRACT (for the app wiring — see 42-directed.EVIDENCE.md)
+ * -----------------------------------------------------------------
+ * deps.search(topic): the app's real research path (piece 25
+ *   orchestrator / backend /api/v2). Returns results with real
+ *   { title, url, date?, snippet?|text? }.
+ * deps.resolveVideo(input): oEmbed / page fetch through the app's
+ *   proxy (/api/fetch). Returns real video metadata and, when the
+ *   page actually carries it, description / transcript text.
+ * deps.store (optional): an object with addItem(item). Falls back to
+ *   window.EnzoLearningTeaching when it exposes addItem. When neither
+ *   exists, nothing is saved and savedIds is [].
+ * ========================================================================== */
+(function (global) {
+'use strict';
+
+var VERSION = '42-directed-1.0.0';
+
+/* ------------------------------------------------------------------ */
+/* Small helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+function asString(v) { return (v === null || v === undefined) ? '' : String(v); }
+function trim(s) { return asString(s).replace(/^\s+|\s+$/g, ''); }
+function hasUrduScript(text) { return /[\u0600-\u06FF]/.test(asString(text)); }
+
+function toPromise(value) {
+  try {
+    if (value && typeof value.then === 'function') return value;
+  } catch (e) { /* treat as plain value */ }
+  return Promise.resolve(value);
+}
+
+function getGlobal(name) {
+  try {
+    if (typeof globalThis !== 'undefined' && globalThis[name]) return globalThis[name];
+    if (typeof window !== 'undefined' && window[name]) return window[name];
+  } catch (e) { /* lookup is best-effort */ }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Language detection (same four labels as piece 31)                   */
+/* ------------------------------------------------------------------ */
+
+var PUNJABI_MARKERS = /توں|ایہ|ویکھ|سکھو|سکھ\s*لو|دے\s|نیں|کیویں|چکو|چھڈو|وچ|نال/;
+var ROMAN_MARKER_RE = /\b(seekh\w*|sikh\w*|seekho|sikho|batao|karo|kar|ye|yeh|kaise|kya|mujhe|meri|bhi|aur|par|se|lo|dekh|bare|mein|ke|ka|ki|ko)\b/i;
+
+function detectDirectedLanguage(text) {
+  var raw = asString(text);
+  if (hasUrduScript(raw)) {
+    if (PUNJABI_MARKERS.test(raw)) return 'punjabi';
+    return 'urdu';
+  }
+  if (ROMAN_MARKER_RE.test(raw)) return 'roman';
+  return 'en';
+}
+
+/* ------------------------------------------------------------------ */
+/* Video URL extraction                                                */
+/* ------------------------------------------------------------------ */
+
+var VIDEO_URL_RE = /https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?[^ \s'"]*|shorts\/[^ \s'"/]+|embed\/[^ \s'"/]+|live\/[^ \s'"/]+)|youtu\.be\/[^ \s'"/]+)/i;
+
+function extractVideoUrl(text) {
+  var m = VIDEO_URL_RE.exec(asString(text));
+  return m ? m[0] : null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Trigger detection                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Learn verbs, per language. Imperative forms only: past-tense forms
+   ("learned", "seekha") and "what did you learn" questions are NOT
+   orders and are excluded by the guards below. */
+function hasLearnVerb(text, lang) {
+  var raw = asString(text);
+  if (/\blearn\b/i.test(raw)) return true;
+  if (/\bwatch\b/i.test(raw) && /\blearn\b/i.test(raw)) return true;
+  if (/سیکھ/.test(raw)) return true;   /* Urdu script: سیکھو، سیکھ لو، سیکھ کر */
+  if (/سکھ/.test(raw)) return true;    /* Punjabi Shahmukhi: سکھو، سکھ لو */
+  if (/\b(seekh\w*|sikh\w*|seekho|sikho)\b/i.test(raw)) return true;
+  return false;
+}
+
+/* Guards: questions ABOUT learning, and past-tense learning, are not
+   orders. "tum ne is video se kya seekha" / "what did you learn from
+   this video" ask about the past; they do not order new learning. */
+function isAboutPastLearning(text) {
+  var raw = asString(text);
+  var low = raw.toLowerCase();
+  if (/\bwhat\s+did\s+you\s+learn\b/.test(low)) return true;
+  if (/\bwhat\s+have\s+you\s+(learnt|learned)\b/.test(low)) return true;
+  if (/\b(kya|kia)\s+seekha\b/.test(low)) return true;
+  if (/\bseekha\s+(hai|tha|thi)\b/.test(low)) return true;
+  if (/کیا\s*سیکھا/.test(raw)) return true;
+  if (/کیا\s*سکھیا/.test(raw)) return true;
+  return false;
+}
+
+/* Source presence. A source counts only when named as the place to
+   learn FROM (se / par / from / توں beside it, or a video URL). */
+function detectDirectedSource(text) {
+  var raw = asString(text);
+  var videoUrl = extractVideoUrl(raw);
+  if (videoUrl) return { source: 'video', videoUrl: videoUrl };
+  if (/\bthis\s+video\b/i.test(raw) || /\bthat\s+video\b/i.test(raw) ||
+      /\bis\s+video\b/i.test(raw) || /اس\s*ویڈیو/.test(raw) ||
+      /\bvideo\b/i.test(raw) || /ویڈیو/.test(raw)) {
+    return { source: 'video', videoUrl: null };
+  }
+  if (/\byoutube\b/i.test(raw) || /یوٹیوب/.test(raw)) {
+    return { source: 'youtube', videoUrl: null };
+  }
+  if (/\binternet\b/i.test(raw) || /انٹرنیٹ/.test(raw)) {
+    return { source: 'internet', videoUrl: null };
+  }
+  return { source: null, videoUrl: null };
+}
+
+/* Topic extraction: strip the trigger words (learn verb, source words,
+   demonstratives, particles, "please", "about") and keep what is left.
+   The trigger words are never the topic. When nothing is left, the
+   topic is null and the learning flow asks for it. */
+var TOPIC_STRIP_EN = /\b(learn|watch|from|the|internet|youtube|yt|video|videos|this|that|it|about|please|and|on|via|through|is|a|an|of|to|kar|karo|seekh\w*|sikh\w*)\b/gi;
+var TOPIC_STRIP_ROMAN = /\b(seekh\w*|sikh\w*|seekho|sikho|dekh|kar|se|internet|youtube|video|is|ye|yeh|wo|woh|batao|lo|ke|ka|ki|ko|bare|mein|par|please|aur|karo|karke)\b/gi;
+var TOPIC_LEAD_FILLER = /^(ke|کہ|ki|کا|کے|about|on|par|se|from|aur|and|to|is|ye|یہ|اس|ایہ|توں|تے|وچ|نال|دا|دی|دے)\s+/i;
+
+/* Urdu-script strip set: whole tokens only. Substring stripping would
+   eat letters inside real topic words (e.g. "کو" inside "کوانٹم"),
+   so the Urdu-script branch tokenises on whitespace and drops only
+   tokens that ARE trigger / particle words. */
+var TOPIC_STRIP_URDU_TOKENS = {
+  'انٹرنیٹ': 1, 'یوٹیوب': 1, 'ویڈیو': 1,
+  'سیکھو': 1, 'سیکھ': 1, 'سکھو': 1, 'سکھ': 1,
+  'ویکھ': 1, 'ویکھو': 1, 'دیکھ': 1, 'دیکھو': 1,
+  'بتاؤ': 1, 'بتا': 1, 'دسو': 1,
+  'سے': 1, 'توں': 1, 'پر': 1, 'پے': 1,
+  'کے': 1, 'کا': 1, 'کی': 1, 'کو': 1, 'میں': 1, 'بارے': 1,
+  'یہ': 1, 'اس': 1, 'ایہ': 1, 'ایس': 1, 'کہ': 1, 'لو': 1, 'کر': 1,
+  'براہ': 1, 'کرم': 1
+};
+
+function extractDirectedTopic(text) {
+  var raw = asString(text);
+  /* A URL is never part of the topic. */
+  var t = raw.replace(/https?:\/\/[^\s'"]+/gi, ' ');
+  if (hasUrduScript(t)) {
+    var toks = t.replace(/[?!.,;:'"()\[\]{}؟۔،؛]+/g, ' ').split(/\s+/);
+    var kept = [];
+    var i;
+    for (i = 0; i < toks.length; i++) {
+      if (!toks[i]) continue;
+      if (!TOPIC_STRIP_URDU_TOKENS[toks[i]]) kept.push(toks[i]);
+    }
+    t = kept.join(' ');
+  } else {
+    t = t.replace(TOPIC_STRIP_EN, ' ');
+    t = t.replace(TOPIC_STRIP_ROMAN, ' ');
+    t = trim(t.replace(/[?!.,;:'"()\[\]{}]+/g, ' ').replace(/\s+/g, ' '));
+  }
+  /* Strip leading particles left over after the trigger strip. */
+  var guard = 0;
+  while (TOPIC_LEAD_FILLER.test(t) && guard < 6) {
+    t = trim(t.replace(TOPIC_LEAD_FILLER, ''));
+    guard++;
+  }
+  if (!t) return null;
+  if (/^(it|that|this|these|those|them|ye|yeh|wo|woh|us|is|isi|usi)$/i.test(t)) return null;
+  return t.slice(0, 120);
+}
+
+/* detectDirectedLearning(text)
+   Needs BOTH a learn verb AND a named source. Returns null otherwise:
+   plain research orders ("research karo"), normal questions and
+   definitions never fire here. */
+function detectDirectedLearning(text) {
+  var raw = asString(text);
+  if (!trim(raw)) return null;
+  if (isAboutPastLearning(raw)) return null;
+  if (!hasLearnVerb(raw)) return null;
+  var src = detectDirectedSource(raw);
+  if (!src.source) return null;
+  var lang = detectDirectedLanguage(raw);
+  return {
+    isDirected: true,
+    source: src.source,
+    topic: extractDirectedTopic(raw),
+    videoUrl: src.videoUrl,
+    lang: lang
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Internet learner                                                    */
+/* ------------------------------------------------------------------ */
+
+function normaliseSearchResults(res) {
+  if (!res) return [];
+  if (Array.isArray(res)) return res;
+  if (typeof res === 'object' && Array.isArray(res.results)) return res.results;
+  return [];
+}
+
+function resultPoint(r) {
+  if (!r || typeof r !== 'object') return null;
+  var url = asString(r.url || r.link || '');
+  if (!url || url.indexOf('http') !== 0) return null;
+  var title = asString(r.title || '');
+  var text = asString(r.snippet || r.text || r.description || title);
+  if (!trim(text) && !trim(title)) return null;
+  return {
+    point: trim(text) || trim(title),
+    source: {
+      title: title || url,
+      url: url,
+      date: asString(r.date || r.published || r.publishedAt || '')
+    }
+  };
+}
+
+/* learnFromInternet(topic, deps)
+   Runs real research through deps.search. Only real returned results
+   become learned points; 0 results -> 'partial' with an honest
+   message, never invented points. Always returns a Promise. */
+function learnFromInternet(topic, deps) {
+  deps = (deps && typeof deps === 'object') ? deps : {};
+  var t = trim(topic);
+  if (!t) {
+    return Promise.resolve({
+      learned: [], sourcesVerified: 0, status: 'failed',
+      message: 'No topic was given, so there was nothing to learn from the internet.',
+      topic: null
+    });
+  }
+  if (typeof deps.search !== 'function') {
+    return Promise.resolve({
+      learned: [], sourcesVerified: 0, status: 'failed',
+      message: 'No search function was supplied, so I could not look anything up on the internet.',
+      topic: t
+    });
+  }
+  var out;
+  try {
+    out = deps.search(t);
+  } catch (e) {
+    return Promise.resolve({
+      learned: [], sourcesVerified: 0, status: 'failed',
+      message: 'The internet search failed (' + ((e && e.message) || String(e)) + '), so I learned nothing.',
+      topic: t
+    });
+  }
+  return toPromise(out).then(function (res) {
+    var list = normaliseSearchResults(res);
+    var learned = [];
+    var i, p;
+    for (i = 0; i < list.length; i++) {
+      p = resultPoint(list[i]);
+      if (p) learned.push(p);
+    }
+    if (!learned.length) {
+      return {
+        learned: [], sourcesVerified: 0, status: 'partial',
+        message: 'I searched the internet for "' + t + '" but found no usable results, so I learned nothing. I did not invent an answer.',
+        topic: t
+      };
+    }
+    return {
+      learned: learned,
+      sourcesVerified: learned.length,
+      status: 'ok',
+      message: 'Learned ' + learned.length + ' point' + (learned.length === 1 ? '' : 's') +
+        ' about "' + t + '" from ' + learned.length + ' real source' +
+        (learned.length === 1 ? '' : 's') + '.',
+      topic: t
+    };
+  }, function (err) {
+    return {
+      learned: [], sourcesVerified: 0, status: 'failed',
+      message: 'The internet search failed (' + ((err && err.message) || String(err)) + '), so I learned nothing.',
+      topic: t
+    };
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* YouTube learner                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Split real description / transcript text into learnable points:
+   one point per non-empty sentence, capped at 5, each citing the
+   video as its source. Nothing is added that the text does not say. */
+function pointsFromText(text, videoSource) {
+  var raw = asString(text);
+  if (!trim(raw)) return [];
+  var parts = raw.split(/(?<=[.!?])\s+|\n+/);
+  var out = [];
+  var i, s;
+  for (i = 0; i < parts.length && out.length < 5; i++) {
+    s = trim(parts[i]);
+    if (!s) continue;
+    if (s.length < 8) continue;
+    out.push({
+      point: s,
+      source: {
+        title: videoSource.title,
+        url: videoSource.url,
+        date: videoSource.date || ''
+      }
+    });
+  }
+  return out;
+}
+
+/* learnFromYouTube(videoUrlOrQuery, deps)
+   Resolves the video through deps.resolveVideo. Metadata only (no
+   description / transcript text) -> points [] and status
+   'metadata-only' with an honest message. NEVER fabricate transcript
+   content. Always returns a Promise. */
+function learnFromYouTube(videoUrlOrQuery, deps) {
+  deps = (deps && typeof deps === 'object') ? deps : {};
+  var input = trim(videoUrlOrQuery);
+  if (!input) {
+    return Promise.resolve({
+      video: null, points: [], status: 'failed',
+      message: 'No video was given, so there was nothing to learn from.'
+    });
+  }
+  if (typeof deps.resolveVideo !== 'function') {
+    return Promise.resolve({
+      video: null, points: [], status: 'failed',
+      message: 'No video resolver was supplied, so I could not open the video.'
+    });
+  }
+  var out;
+  try {
+    out = deps.resolveVideo(input);
+  } catch (e) {
+    return Promise.resolve({
+      video: null, points: [], status: 'failed',
+      message: 'Opening the video failed (' + ((e && e.message) || String(e)) + '), so I learned nothing.'
+    });
+  }
+  return toPromise(out).then(function (v) {
+    if (!v || typeof v !== 'object' || (!v.title && !v.url)) {
+      return {
+        video: null, points: [], status: 'failed',
+        message: 'I could not find or open that video, so I learned nothing from it.'
+      };
+    }
+    var video = {
+      title: asString(v.title || ''),
+      channel: asString(v.channel || v.author || ''),
+      url: asString(v.url || input),
+      published: asString(v.published || v.publishedAt || v.date || '')
+    };
+    var text = asString(v.transcript || v.description || '');
+    var source = { title: video.title || video.url, url: video.url, date: video.published };
+    var points = pointsFromText(text, source);
+    if (!points.length) {
+      return {
+        video: video, points: [], status: 'metadata-only',
+        message: 'I could read the video\'s title and description, but not a full transcript, so I learned only what the description states. The video is "' +
+          (video.title || video.url) + '"' +
+          (video.channel ? ' by ' + video.channel : '') +
+          '; I did not invent anything it says.',
+        transcriptAvailable: false
+      };
+    }
+    return {
+      video: video,
+      points: points,
+      status: 'ok',
+      message: 'Learned ' + points.length + ' point' + (points.length === 1 ? '' : 's') +
+        ' from the video "' + (video.title || video.url) + '", taken only from its real description' +
+        (v.transcript ? ' and transcript' : '') + '.',
+      transcriptAvailable: !!v.transcript
+    };
+  }, function (err) {
+    return {
+      video: null, points: [], status: 'failed',
+      message: 'Opening the video failed (' + ((err && err.message) || String(err)) + '), so I learned nothing.'
+    };
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Summary                                                             */
+/* ------------------------------------------------------------------ */
+
+var SUMMARY_TEXT = {
+  en: {
+    learned: 'What I learned:',
+    notLearned: 'What I could not learn:',
+    next: 'What I will do differently: I will remember these points and use them when you ask about this topic again, citing the same sources.'
+  },
+  urdu: {
+    learned: 'میں نے کیا سیکھا:',
+    notLearned: 'میں کیا نہیں سیکھ سکا:',
+    next: 'آگے میں کیا مختلف کروں گا: میں ان باتوں کو یاد رکھوں گا اور جب آپ اس موضوع پر دوبارہ پوچھیں گے تو انہی ذرائع کے حوالے سے استعمال کروں گا۔'
+  },
+  roman: {
+    learned: 'Maine kya seekha:',
+    notLearned: 'Main kya nahi seekh saka:',
+    next: 'Aage main kya mukhtalif karoon ga: main in baton ko yaad rakhon ga aur jab aap is topic par dobara poochein ge to inhi sources ke hawale se istemal karoon ga.'
+  },
+  punjabi: {
+    learned: 'میں کی سکھیا:',
+    notLearned: 'میں کی نہیں سکھ سکیا:',
+    next: 'اگے میں کی وکھرا کراں گا: میں ایناں گلاں نوں یاد رکھاں گا تے جدوں تسیں ایس موضوع تے دوبارہ پچھو گے تاں اوہناں ای ذرائع دے حوالے نال ورتاؤں گا۔'
+  }
+};
+
+function learnedPointsOf(result) {
+  if (!result || typeof result !== 'object') return [];
+  if (Array.isArray(result.learned)) return result.learned;
+  if (Array.isArray(result.points)) return result.points;
+  return [];
+}
+
+/* summariseLearning(result, lang)
+   Short summary in the user's language: what was learned (bullets,
+   each with its real source), what could NOT be learned/accessed,
+   and what ENZO will now do differently. Honest about gaps; no
+   invented counts. */
+function summariseLearning(result, lang) {
+  var l = SUMMARY_TEXT[lang] ? lang : 'en';
+  var t = SUMMARY_TEXT[l];
+  var points = learnedPointsOf(result);
+  var lines = [];
+  if (result && result.video && result.video.title) {
+    lines.push('Video: "' + result.video.title + '"' +
+      (result.video.channel ? ' by ' + result.video.channel : '') + '.');
+  }
+  lines.push(t.learned);
+  if (points.length) {
+    var i, p, src;
+    for (i = 0; i < points.length; i++) {
+      p = points[i];
+      src = (p && p.source) || {};
+      lines.push('- ' + asString(p.point || '') +
+        (src.url ? ' (Source: ' + asString(src.title || src.url) + ' — ' + src.url + ')' : ''));
+    }
+  } else {
+    lines.push('- ' + (result && result.message ? asString(result.message) : 'Nothing was learned.'));
+  }
+  var gap = null;
+  if (result && result.status === 'metadata-only') {
+    gap = result.message ||
+      'I could read the video\'s title and description, but not a full transcript, so I learned only what the description states.';
+  } else if (result && (result.status === 'partial' || result.status === 'failed')) {
+    gap = result.message || 'Nothing could be learned.';
+  } else if (result && result.video && !points.length) {
+    gap = 'No learnable text was available from the video.';
+  }
+  if (gap) {
+    lines.push(t.notLearned);
+    lines.push('- ' + gap);
+  }
+  lines.push(t.next);
+  return lines.join('\n');
+}
+
+/* ------------------------------------------------------------------ */
+/* Wiring entry                                                        */
+/* ------------------------------------------------------------------ */
+
+function resolveStore(deps) {
+  if (deps && deps.store && typeof deps.store.addItem === 'function') return deps.store;
+  var teaching = getGlobal('EnzoLearningTeaching');
+  if (teaching && typeof teaching.addItem === 'function') return teaching;
+  var learning = getGlobal('EnzoLearning');
+  if (learning && typeof learning.addItem === 'function') return learning;
+  return null;
+}
+
+/* applyDirectedLearning(text, deps)
+   detect -> run the right learner -> save each learned point as a
+   store item with its source attached -> return { result, summary,
+   savedIds }. Non-directed text returns directed:false and no work. */
+function applyDirectedLearning(text, deps) {
+  deps = (deps && typeof deps === 'object') ? deps : {};
+  var detected = detectDirectedLearning(text);
+  if (!detected) {
+    return Promise.resolve({
+      directed: false, detected: null, result: null, summary: null, savedIds: []
+    });
+  }
+  var job;
+  if (detected.source === 'internet') {
+    job = learnFromInternet(detected.topic, deps);
+  } else {
+    job = learnFromYouTube(detected.videoUrl || detected.topic || '', deps);
+  }
+  return toPromise(job).then(function (result) {
+    var points = learnedPointsOf(result);
+    var savedIds = [];
+    var store = resolveStore(deps);
+    if (store && points.length) {
+      var i, p, item, id;
+      for (i = 0; i < points.length; i++) {
+        p = points[i];
+        item = {
+          kind: detected.source === 'internet' ? 'fact' : 'skill',
+          text: asString(p.point || ''),
+          detail: (p.source && p.source.title) ? asString(p.source.title) : '',
+          lang: detected.lang,
+          source: {
+            type: detected.source,
+            url: (p.source && p.source.url) || '',
+            title: (p.source && p.source.title) || '',
+            date: (p.source && p.source.date) || ''
+          },
+          ts: Date.now(),
+          topic: detected.topic || ''
+        };
+        try {
+          id = store.addItem(item);
+          savedIds.push((id === undefined || id === null) ? i : id);
+        } catch (e) { /* one failed save must not lose the rest */ }
+      }
+    }
+    return {
+      directed: true,
+      detected: detected,
+      result: result,
+      summary: summariseLearning(result, detected.lang),
+      savedIds: savedIds
+    };
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Exports                                                             */
+/* ------------------------------------------------------------------ */
+
+var api = {
+  VERSION: VERSION,
+  detectDirectedLearning: detectDirectedLearning,
+  detectDirectedLanguage: detectDirectedLanguage,
+  extractVideoUrl: extractVideoUrl,
+  learnFromInternet: learnFromInternet,
+  learnFromYouTube: learnFromYouTube,
+  summariseLearning: summariseLearning,
+  applyDirectedLearning: applyDirectedLearning
+};
+
+global.EnzoDirectedLearning = api;
+if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<!-- v62-learning: piece 43-settings (byte-identical) -->
+<script>/* 43-settings.js — Settings learned-items UI + chat "forget this"
+ * Piece (c) for ENAO AI (artifact slug enao-ai, live build v61-deep-triggers-4lang).
+ * EXTENDS the existing Settings "What ENZO knows about me" box
+ * (renderLearned / learnedBox / learnedBody in enao-ai.html) — it does NOT
+ * rebuild Settings and does NOT duplicate the existing rows (language,
+ * answer length, topics, corrections). It adds ONE new section under them
+ * for explicit learned items from the learned store (piece 41 spec).
+ *
+ * Learned store spec (piece 41): localStorage key `enao_learned_items_v1`,
+ * items {id, kind:'fact'|'preference'|'correction'|'skill', text, detail,
+ * lang, source:'taught'|{type:'internet'|'youtube', url, title, date},
+ * ts, topic?}; store API addItem/getItems/deleteItem(id)/clearAll
+ * (window.EnzoLearningTeaching if present, else deps.store).
+ *
+ * "Forget" removes the effect IMMEDIATELY: deleting an item also calls
+ * deps.onItemsChanged(), the hook the app uses to rebuild the in-memory
+ * learned prompt note (see buildLearnedNote). Deleting never claims a
+ * deletion that did not happen.
+ *
+ * Style: ES5 IIFE, guarded UMD export (window.EnzoSettingsLearned +
+ * module.exports), zero emojis, all user text HTML-escaped.
+ */
+(function (root, factory) {
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = factory();
+  } else {
+    root.EnzoSettingsLearned = factory();
+  }
+}(typeof window !== 'undefined' ? window : this, function () {
+  'use strict';
+
+  var STORE_KEY = 'enao_learned_items_v1';
+  var MAX_ROWS = 50;
+  var EMPTY_STATE = 'Nothing learned yet — teach ENZO something and it will appear here.';
+
+  var KIND_LABELS = {
+    fact: 'Fact',
+    preference: 'Preference',
+    correction: 'Correction',
+    skill: 'Skill'
+  };
+
+  var TOASTS = {
+    deleted: {
+      en: 'Deleted — ENZO will no longer use that.',
+      roman: 'Delete kar diya — ENZO ab ye use nahi karega.',
+      ur: 'حذف کر دیا گیا — ENZO اب اسے استعمال نہیں کرے گا۔',
+      pa: 'مٹا دتا گیا — ENZO ہن ایہنوں ورتے گا نہیں۔'
+    },
+    deletedAll: {
+      en: 'Deleted everything ENZO learned — it will no longer use any of it.',
+      roman: 'Sab kuch delete kar diya — ENZO ab kuch bhi use nahi karega.',
+      ur: 'جو کچھ ENZO نے سیکھا تھا سب حذف کر دیا گیا — وہ اب کچھ بھی استعمال نہیں کرے گا۔',
+      pa: 'جو کچھ ENZO نے سکھیا سی سب مٹا دتا گیا — اوہ ہن کچھ وی نہیں ورتے گا۔'
+    },
+    forgotLast: {
+      en: 'Forgotten — ENZO will no longer use that.',
+      roman: 'Bhool gaya — ENZO ab ye use nahi karega.',
+      ur: 'بھول گیا — ENZO اب اسے استعمال نہیں کرے گا۔',
+      pa: 'بھل گیا — ENZO ہن ایہنوں ورتے گا نہیں۔'
+    },
+    nothingToForget: {
+      en: 'Nothing learned yet — there is nothing to forget.',
+      roman: 'Abhi kuch seekha hi nahi — bhoolne ke liye kuch nahi hai.',
+      ur: 'ابھی کچھ سیکھا ہی نہیں — بھولنے کے لیے کچھ نہیں ہے۔',
+      pa: 'اجے کچھ سکھیا ہی نہیں — بھلن لئی کچھ نہیں ہے۔'
+    },
+    noMatch: {
+      en: 'I could not find anything matching that in what ENZO learned — nothing was deleted.',
+      roman: 'ENZO ne jo seekha hai us mein is se milta kuch nahi mila — kuch delete nahi hua.',
+      ur: 'ENZO نے جو سیکھا ہے اس میں اس سے ملتا کچھ نہیں ملا — کچھ حذف نہیں ہوا۔',
+      pa: 'ENZO نے جو سکھیا ہے اوس وچ ایس نال ملدا کچھ نہیں ملیا — کچھ مٹیا نہیں گیا۔'
+    }
+  };
+
+  /* ---------------- helpers ---------------- */
+
+  function escH(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function esc(deps) {
+    if (deps && typeof deps.esc === 'function') return deps.esc;
+    return escH;
+  }
+
+  function normLang(lang) {
+    if (!lang) return 'en';
+    var l = String(lang).toLowerCase();
+    if (l === 'ur' || l === 'urdu') return 'ur';
+    if (l === 'pa' || l === 'punjabi' || l === 'pnj') return 'pa';
+    if (l === 'roman' || l === 'roman-urdu' || l === 'romanurdu') return 'roman';
+    return 'en';
+  }
+
+  /* Detect the user's language from free text. Arabic script with Punjabi
+   * markers -> 'pa', other Arabic script -> 'ur'; Latin with Roman-Urdu
+   * markers -> 'roman'; otherwise 'en'. */
+  function detectLang(text) {
+    var t = String(text || '');
+    if (/[\u0600-\u06FF]/.test(t)) {
+      if (/ایہ|بھل|اینوں|ہن|اوہ|کجھ|سکھیا/.test(t)) return 'pa';
+      return 'ur';
+    }
+    if (/\b(bhool|bhoolna|yaad|rakho|rakhna|jao|jaa|yeh|ye|isay|isko|karo|mujhe|meri|mera)\b/i.test(t)) return 'roman';
+    return 'en';
+  }
+
+  function langOf(text, deps) {
+    if (deps && deps.lang) return normLang(deps.lang);
+    return detectLang(text);
+  }
+
+  function toastFor(kind, text, deps) {
+    var lang = langOf(text, deps);
+    var table = TOASTS[kind] || TOASTS.deleted;
+    return table[lang] || table.en;
+  }
+
+  function formatDate(ts) {
+    if (!ts) return '';
+    var d = new Date(ts);
+    if (isNaN(d.getTime())) return '';
+    try {
+      return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    } catch (e) {
+      return d.toISOString().slice(0, 10);
+    }
+  }
+
+  /* Resolve the learned store: explicit deps.store first, then the piece-41
+   * global if present, then a localStorage-backed default. Returns null
+   * when no store can be resolved (callers treat as empty). */
+  function resolveStore(deps) {
+    if (deps && deps.store) return deps.store;
+    if (typeof window !== 'undefined' && window.EnzoLearningTeaching) return window.EnzoLearningTeaching;
+    if (typeof localStorage !== 'undefined') {
+      return {
+        getItems: function () {
+          try {
+            var raw = localStorage.getItem(STORE_KEY);
+            var arr = raw ? JSON.parse(raw) : [];
+            return Array.isArray(arr) ? arr : [];
+          } catch (e) { return []; }
+        },
+        deleteItem: function (id) {
+          var items = this.getItems().filter(function (it) { return String(it.id) !== String(id); });
+          try { localStorage.setItem(STORE_KEY, JSON.stringify(items)); } catch (e) {}
+          return true;
+        },
+        clearAll: function () {
+          try { localStorage.removeItem(STORE_KEY); } catch (e) {}
+          return true;
+        }
+      };
+    }
+    return null;
+  }
+
+  function getItems(store) {
+    if (!store || typeof store.getItems !== 'function') return [];
+    var items;
+    try { items = store.getItems(); } catch (e) { return []; }
+    if (!Array.isArray(items)) return [];
+    return items.slice().sort(function (a, b) {
+      return (b.ts || 0) - (a.ts || 0);
+    });
+  }
+
+  function sourceHtml(item, escFn) {
+    var src = item.source;
+    if (!src || src === 'taught') return 'Taught by Raja';
+    if (typeof src === 'object') {
+      var title = escFn(src.title || src.url || (src.type === 'youtube' ? 'YouTube video' : 'Internet source'));
+      var url = escFn(src.url || '');
+      var label = src.type === 'youtube' ? 'YouTube' : 'Internet';
+      if (url) return label + ': <a href="' + url + '" target="_blank" rel="noopener">' + title + '</a>';
+      return label + ': ' + title;
+    }
+    return escFn(String(src));
+  }
+
+  /* The in-memory learned prompt note, rebuilt from the current items.
+   * The app rebuilds this note inside deps.onItemsChanged() after every
+   * delete, so a deleted item stops affecting answers immediately. */
+  function buildLearnedNote(items) {
+    var list = (items || []).slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); });
+    if (!list.length) return '';
+    var lines = ['Things ENZO learned from Raja:'];
+    list.forEach(function (it) {
+      var label = KIND_LABELS[it.kind] || 'Fact';
+      var text = String(it.text || '');
+      if (it.detail) text += ' — ' + String(it.detail);
+      lines.push('- [' + label + '] ' + text);
+    });
+    return lines.join('\n');
+  }
+
+  /* ---------------- 1. render ---------------- */
+
+  /* Renders the explicit learned-items section into `box` (a DOM element
+   * or a DOM-lite object with an innerHTML property). One row per item,
+   * newest first, capped at MAX_ROWS with a count line. Each row shows the
+   * learned text (escaped), kind label, date, source, and a Delete button.
+   * In a real DOM the buttons are wired to delete + re-render; in a
+   * DOM-lite container only the HTML is produced. Returns the item count. */
+  function renderLearnedItems(box, store, deps) {
+    if (!box) return 0;
+    deps = deps || {};
+    var escFn = esc(deps);
+    var items = getItems(store || resolveStore(deps));
+    var h = '';
+    h += '<div class="lrn-items-head"><h4>Things ENZO learned</h4>';
+    h += '<p class="lrn-note">Explicit things you taught ENZO, or ENZO learned from the internet or YouTube for you. Delete anything and ENZO stops using it right away.</p></div>';
+    if (!items.length) {
+      h += '<div class="lrn-row"><span>' + escFn(EMPTY_STATE) + '</span></div>';
+      box.innerHTML = h;
+      return 0;
+    }
+    var shown = items.slice(0, MAX_ROWS);
+    h += '<div class="lrn-count">' + (items.length > MAX_ROWS
+      ? 'Showing ' + MAX_ROWS + ' of ' + items.length + ' learned items'
+      : items.length + (items.length === 1 ? ' learned item' : ' learned items')) + '</div>';
+    shown.forEach(function (it) {
+      var kind = KIND_LABELS[it.kind] || 'Fact';
+      var date = formatDate(it.ts);
+      h += '<div class="lrn-item" data-lrn-id="' + escFn(it.id) + '">';
+      h += '<div class="lrn-item-text">' + escFn(it.text || '') + '</div>';
+      if (it.detail) h += '<div class="lrn-item-detail">' + escFn(it.detail) + '</div>';
+      h += '<div class="lrn-item-meta"><span class="lrn-kind">' + escFn(kind) + '</span>';
+      if (date) h += ' <span class="lrn-date">' + escFn(date) + '</span>';
+      h += ' <span class="lrn-src">' + sourceHtml(it, escFn) + '</span></div>';
+      h += '<button type="button" class="lrn-x" data-lrn-item="' + escFn(it.id) + '">Delete</button>';
+      h += '</div>';
+    });
+    h += '<button type="button" class="lrn-clear" data-lrn-clear-all>Delete all learned items</button>';
+    box.innerHTML = h;
+    if (box.querySelectorAll) {
+      box.querySelectorAll('[data-lrn-item]').forEach(function (b) {
+        b.onclick = function () {
+          deleteLearnedItem(b.getAttribute('data-lrn-item'), store, deps);
+          renderLearnedItems(box, store, deps);
+        };
+      });
+      var clr = box.querySelector('[data-lrn-clear-all]');
+      if (clr) clr.onclick = function () {
+        deleteAllLearned(store, deps);
+        renderLearnedItems(box, store, deps);
+      };
+    }
+    return items.length;
+  }
+
+  /* ---------------- 2 & 3. delete ---------------- */
+
+  function deleteLearnedItem(id, store, deps) {
+    deps = deps || {};
+    var s = store || resolveStore(deps);
+    if (s && typeof s.deleteItem === 'function') {
+      try { s.deleteItem(id); } catch (e) {}
+    }
+    if (deps.onItemsChanged) { try { deps.onItemsChanged(); } catch (e) {} }
+    return toastFor('deleted', '', deps);
+  }
+
+  function deleteAllLearned(store, deps) {
+    deps = deps || {};
+    var s = store || resolveStore(deps);
+    if (s && typeof s.clearAll === 'function') {
+      try { s.clearAll(); } catch (e) {}
+    }
+    if (deps.onItemsChanged) { try { deps.onItemsChanged(); } catch (e) {} }
+    return toastFor('deletedAll', '', deps);
+  }
+
+  /* ---------------- 4. detectForget ---------------- */
+
+  /* Chat command "forget this / forget that" in all 4 languages.
+   * Returns {isForget:true, target:'last'|'named', text?} or null.
+   * "Forget this" with no naming = the most recent learned item.
+   * A named thing ("forget the SEO rule") -> target 'named' + named text.
+   * Deliberately does NOT match "don't forget", "never forget",
+   * "remember this", "I forgot my password", or "forget-me-not". */
+  function detectForget(text) {
+    if (text == null) return null;
+    var raw = String(text).trim();
+    if (!raw) return null;
+    var lower = raw.toLowerCase();
+
+    /* Guard: explicit "don't forget" / "never forget" is the opposite. */
+    if (/\b(don'?t|do not|never|not)\s+forget\b/.test(lower)) return null;
+    if (/forget-me-not/.test(lower)) return null;
+    if (/\bi\s+forgot\b/.test(lower) && !/\bforget\s+(this|that|it|the|about)\b/.test(lower)) return null;
+    /* "What did I forget to buy?" / "forget to ..." is a question, not a command. */
+    if (/\bforget\s+to\b/.test(lower)) return null;
+    if (/did\s+(i|you)\s+forget|have\s+i\s+forgotten|what\s+did\s+i\s+forget/.test(lower)) return null;
+
+    /* --- English --- */
+    var m;
+    m = lower.match(/^(?:please\s+)?(?:forget|don'?t\s+remember|do\s+not\s+remember)\s+(this|that|it|what\s+i\s+(?:just\s+)?told\s+you|what\s+i\s+said)\b/);
+    if (m) return { isForget: true, target: 'last' };
+    m = lower.match(/\bforget\s+(?:this|that|it)\b/);
+    if (m) return { isForget: true, target: 'last' };
+    m = lower.match(/\b(?:don'?t|do\s+not)\s+remember\s+(?:this|that|it)\b/);
+    if (m) return { isForget: true, target: 'last' };
+    m = lower.match(/\bforget\s+(?:about\s+)?(?:the\s+)?(.+)$/);
+    if (m && m[1] && !/^(this|that|it)\b/.test(m[1].trim())) {
+      var named = cleanNamed(m[1]);
+      if (named) return { isForget: true, target: 'named', text: named };
+    }
+    m = lower.match(/\bforget\s+what\s+i\s+told\s+you\s+about\s+(.+)$/);
+    if (m) return { isForget: true, target: 'named', text: cleanNamed(m[1]) };
+
+    /* --- Roman Urdu: "ye bhool jao", "ye yaad na rakho" (+ named before it) --- */
+    m = lower.match(/^(yeh|ye|isay|isko|is\s+ko|yeh\s+sab)\s+(bhool\s+jao|bhool\s+ja|bhool\s+jaye|yaad\s+na\s+rakho|mat\s+yaad\s+rakho)\b/);
+    if (m) return { isForget: true, target: 'last' };
+    if (/\b(bhool\s+jao|bhool\s+ja|yaad\s+na\s+rakho)\b/.test(lower)) {
+      var before = lower.replace(/\b(bhool\s+jao|bhool\s+ja|yaad\s+na\s+rakho)\b.*$/, '').trim()
+        .replace(/^(please|plz|zara|ab)\s+/, '');
+      if (before && !/^(yeh|ye|isay|isko|is|yeh\s+sab)$/.test(before)) {
+        return { isForget: true, target: 'named', text: before };
+      }
+      return { isForget: true, target: 'last' };
+    }
+
+    /* --- Urdu script: "یہ بھول جاؤ", "یہ یاد نہ رکھو" --- */
+    if (/یہ\s+(بھول\s+جاؤ|بھول\s+جا|یاد\s+نہ\s+رکھو|مت\s+یاد\s+رکھو)/.test(raw) ||
+        /اسے\s+بھول\s+جاؤ/.test(raw) || /اس\s+کو\s+بھول\s+جاؤ/.test(raw)) {
+      return { isForget: true, target: 'last' };
+    }
+    m = raw.match(/(.+?)\s*(?:کو\s*)?بھول\s+جاؤ\s*$/);
+    if (m && m[1].trim() && !/^(یہ|اسے|اس)$/.test(m[1].trim())) {
+      return { isForget: true, target: 'named', text: m[1].trim() };
+    }
+    m = raw.match(/(.+?)\s*یاد\s+نہ\s+رکھو\s*$/);
+    if (m && m[1].trim() && !/^(یہ|اسے)$/.test(m[1].trim())) {
+      return { isForget: true, target: 'named', text: m[1].trim() };
+    }
+
+    /* --- Punjabi Shahmukhi: "ایہ بھل جاؤ", "ایہ یاد نہ رکھو" --- */
+    if (/ایہ\s+(بھل\s+جاؤ|بھل\s+جا|یاد\s+نہ\s+رکھو)/.test(raw) ||
+        /اینوں\s+بھل\s+جاؤ/.test(raw)) {
+      return { isForget: true, target: 'last' };
+    }
+    m = raw.match(/(.+?)\s*بھل\s+جاؤ\s*$/);
+    if (m && m[1].trim() && !/^(ایہ|اینوں)$/.test(m[1].trim())) {
+      return { isForget: true, target: 'named', text: m[1].trim() };
+    }
+
+    return null;
+  }
+
+  function cleanNamed(s) {
+    return String(s || '').trim()
+      .replace(/[.!?]+$/, '')
+      .replace(/^(the|about)\s+/, '')
+      .trim();
+  }
+
+  /* ---------------- 5. handleForget ---------------- */
+
+  function findNamed(items, named) {
+    var q = String(named || '').toLowerCase().trim();
+    if (!q) return null;
+    var best = null, bestScore = 0;
+    items.forEach(function (it) {
+      var hay = ((it.topic || '') + ' ' + (it.text || '') + ' ' + (it.detail || '')).toLowerCase();
+      var score = 0;
+      if ((it.topic || '').toLowerCase() === q) score = 100;
+      else if (hay.indexOf(q) !== -1) score = 50 + q.length;
+      else {
+        var words = q.split(/\s+/).filter(function (w) { return w.length > 2; });
+        var hits = 0;
+        words.forEach(function (w) { if (hay.indexOf(w) !== -1) hits++; });
+        if (words.length && hits === words.length) score = 20 + hits;
+      }
+      if (score > bestScore) { bestScore = score; best = it; }
+    });
+    return best;
+  }
+
+  /* Wiring entry: detect -> find item (last, or best text match) -> delete.
+   * Returns {deleted:item|null, reply:string}. Never claims a deletion
+   * that did not happen; a no-match reply says so plainly. */
+  function handleForget(text, store, deps) {
+    deps = deps || {};
+    var found = detectForget(text);
+    if (!found) return { deleted: null, reply: '' };
+    var lang = langOf(text, deps);
+    var items = getItems(store || resolveStore(deps));
+    var target = null;
+    if (found.target === 'named') {
+      target = findNamed(items, found.text);
+      if (!target) {
+        return { deleted: null, reply: (TOASTS.noMatch[lang] || TOASTS.noMatch.en) };
+      }
+    } else {
+      if (!items.length) {
+        return { deleted: null, reply: (TOASTS.nothingToForget[lang] || TOASTS.nothingToForget.en) };
+      }
+      target = items[0]; /* newest first */
+    }
+    deleteLearnedItem(target.id, store, deps);
+    var replyTable = TOASTS.forgotLast;
+    return { deleted: target, reply: (replyTable[lang] || replyTable.en) };
+  }
+
+  return {
+    STORE_KEY: STORE_KEY,
+    MAX_ROWS: MAX_ROWS,
+    EMPTY_STATE: EMPTY_STATE,
+    KIND_LABELS: KIND_LABELS,
+    escH: escH,
+    formatDate: formatDate,
+    buildLearnedNote: buildLearnedNote,
+    renderLearnedItems: renderLearnedItems,
+    deleteLearnedItem: deleteLearnedItem,
+    deleteAllLearned: deleteAllLearned,
+    detectForget: detectForget,
+    handleForget: handleForget,
+    detectLang: detectLang,
+    resolveStore: resolveStore
+  };
+}));
+</script>
+<!-- v62-learning: piece 44-correction-guard (byte-identical) -->
+<script>/* 44-correction-guard.js — ENAO AI learning piece (d)
+ *
+ * Correction priority + never-repeat-a-mistake guard + taught-fact
+ * contradiction check.
+ *
+ * Works against the learned store spec (piece 41):
+ *   localStorage key `enao_learned_items_v1`, items shaped
+ *   {id, kind:'fact'|'preference'|'correction'|'skill', text, detail,
+ *    lang, source, ts, topic?, status?}
+ *   corrections carry kind 'correction' with detail {wrong, right}
+ *   when parsed.
+ *
+ * Standing replacement rule: a new correction replaces conflicting old
+ * behaviour immediately; the old wrong behaviour never returns. Old items
+ * are marked superseded, never deleted (audit trail).
+ *
+ * ACCURACY RULE (Raja, 22 Nov 2026 ~6:57 PM): a taught "fact" that
+ * contradicts a verified real source must be flagged plainly, never
+ * silently stored as truth.
+ *
+ * Pure logic, no DOM, no network, no dependencies. ES5 IIFE with a
+ * guarded UMD export (window.CorrectionGuard + module.exports).
+ * Zero emojis. No fabricated claims.
+ */
+(function (global, factory) {
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
+  } else {
+    global.CorrectionGuard = factory();
+  }
+}(typeof window !== 'undefined' ? window : this, function () {
+  'use strict';
+
+  var MAX_NOTE = 8;
+
+  var STOPWORDS = {
+    that: 1, this: 1, with: 1, from: 1, have: 1, been: 1, about: 1,
+    into: 1, your: 1, their: 1, there: 1, when: 1, what: 1, which: 1,
+    also: 1, than: 1, then: 1, them: 1, they: 1, were: 1, being: 1,
+    after: 1, before: 1, should: 1, would: 1, could: 1, said: 1,
+    says: 1, user: 1
+  };
+
+  var _uidCounter = 0;
+
+  /* ---------- small helpers ---------- */
+
+  function trim(s) {
+    return String(s == null ? '' : s).replace(/^\s+|\s+$/g, '');
+  }
+
+  function normText(s) {
+    return trim(String(s == null ? '' : s)).toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ');
+  }
+
+  function normTopic(t) {
+    return normText(t).replace(/\s+/g, '-');
+  }
+
+  function makeId(prefix) {
+    _uidCounter += 1;
+    return prefix + '_' + Date.now().toString(36) + '_' + _uidCounter +
+      '_' + Math.floor(Math.random() * 1296).toString(36);
+  }
+
+  function significantTokens(text) {
+    var out = [];
+    var seen = {};
+    var parts = normText(text).split(' ');
+    var i, w;
+    for (i = 0; i < parts.length; i++) {
+      w = parts[i];
+      if (w.length >= 4 && !STOPWORDS[w] && !seen[w]) {
+        seen[w] = 1;
+        out.push(w);
+      }
+    }
+    return out;
+  }
+
+  function sharedTokens(a, b) {
+    var ta = significantTokens(a);
+    var tb = {};
+    var i;
+    var shared = [];
+    var bt = significantTokens(b);
+    for (i = 0; i < bt.length; i++) { tb[bt[i]] = 1; }
+    for (i = 0; i < ta.length; i++) {
+      if (tb[ta[i]]) { shared.push(ta[i]); }
+    }
+    return shared;
+  }
+
+  function containsPhrase(haystack, phrase) {
+    var h = normText(haystack);
+    var p = normText(phrase);
+    if (!p) { return false; }
+    return (' ' + h + ' ').indexOf(' ' + p + ' ') !== -1;
+  }
+
+  function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /* ---------- store access ---------- */
+
+  // Accepts a store object {items:[...]}, a bare array of items, or
+  // null/undefined (treated as an empty store). Returns the items array.
+  function getItems(store) {
+    if (!store) { return []; }
+    if (Object.prototype.toString.call(store) === '[object Array]') {
+      return store;
+    }
+    if (store.items && Object.prototype.toString.call(store.items) === '[object Array]') {
+      return store.items;
+    }
+    return [];
+  }
+
+  function ensureStore(store) {
+    if (store && Object.prototype.toString.call(store) !== '[object Array]' &&
+        store.items && Object.prototype.toString.call(store.items) === '[object Array]') {
+      return store;
+    }
+    if (Object.prototype.toString.call(store) === '[object Array]') {
+      return { items: store };
+    }
+    return { items: [] };
+  }
+
+  function isActive(item) {
+    if (!item) { return false; }
+    var st = item.status;
+    return st === undefined || st === null || st === '' || st === 'active';
+  }
+
+  function activeItems(store) {
+    var items = getItems(store);
+    var out = [];
+    var i;
+    for (i = 0; i < items.length; i++) {
+      if (isActive(items[i])) { out.push(items[i]); }
+    }
+    return out;
+  }
+
+  function itemContent(item) {
+    var parts = [];
+    if (item.text) { parts.push(item.text); }
+    if (item.topic) { parts.push(item.topic); }
+    if (item.detail) {
+      if (item.detail.wrong) { parts.push(item.detail.wrong); }
+      if (item.detail.right) { parts.push(item.detail.right); }
+    }
+    return parts.join(' ');
+  }
+
+  /* ---------- correction parsing ---------- */
+
+  // Best-effort parse of "not X but Y" / "wrong: X, right: Y" wording
+  // into {wrong, right}. Returns null when nothing can be parsed.
+  function parseCorrectionText(text) {
+    var t = trim(text);
+    var m;
+    if (!t) { return null; }
+    m = /wrong\s*[:\-]\s*(.+?)\s*[,;]\s*right\s*[:\-]\s*(.+)/i.exec(t);
+    if (m) { return { wrong: trim(m[1]), right: trim(m[2]) }; }
+    m = /\bnot\s+(.+?)\s+but\s+(.+)/i.exec(t);
+    if (m) { return { wrong: trim(m[1]), right: trim(m[2]) }; }
+    m = /(.+?)\s+is\s+wrong\s*[,.]?\s*(?:it\s+is|it'?s|it\s+should\s+be)\s+(.+)/i.exec(t);
+    if (m) { return { wrong: trim(m[1]), right: trim(m[2]) }; }
+    return null;
+  }
+
+  function correctionWrong(c) {
+    if (c.detail && c.detail.wrong) { return trim(c.detail.wrong); }
+    var parsed = parseCorrectionText(c.text || '');
+    return parsed ? parsed.wrong : '';
+  }
+
+  function correctionRight(c) {
+    if (c.detail && c.detail.right) { return trim(c.detail.right); }
+    var parsed = parseCorrectionText(c.text || '');
+    return parsed ? parsed.right : '';
+  }
+
+  /* ---------- conflict detection ---------- */
+
+  // True when an older learned item conflicts with the correction's
+  // `right` content: same topic, the corrected-wrong wording, or the
+  // same subject said differently. An item that already states the
+  // right version does NOT conflict.
+  function conflictsWithCorrection(item, correction) {
+    if (!item || item.id === correction.id) { return false; }
+    if (!isActive(item)) { return false; }
+
+    var right = correctionRight(correction);
+    var wrong = correctionWrong(correction);
+
+    if (item.topic && correction.topic &&
+        normTopic(item.topic) === normTopic(correction.topic)) {
+      return true;
+    }
+
+    var content = itemContent(item);
+    if (wrong && wrong.length >= 4 &&
+        (containsPhrase(content, wrong) || containsPhrase(wrong, content))) {
+      return true;
+    }
+
+    if (right) {
+      // Overlap is measured on the older item's own words (text + topic),
+      // not on its stored detail: a previous correction's own right
+      // wording must not make it look like it conflicts with the next
+      // correction about something else.
+      var ownWords = trim(item.text || '') + ' ' + trim(item.topic || '');
+      if (normText(ownWords) === normText(right)) { return false; }
+      if (containsPhrase(ownWords, right)) { return false; }
+      var shared = sharedTokens(ownWords, right);
+      if (shared.length >= 2) { return true; }
+    }
+    return false;
+  }
+
+  /* ---------- generic store ---------- */
+
+  function storeLearnedItem(item, store) {
+    var s = ensureStore(store);
+    var it = item || {};
+    if (!it.id) { it.id = makeId('item'); }
+    if (!it.ts) { it.ts = Date.now(); }
+    if (!it.status) { it.status = 'active'; }
+    s.items.push(it);
+    return { stored: it, store: s };
+  }
+
+  /* ---------- 1. applyCorrection ---------- */
+
+  function applyCorrection(newCorrection, store) {
+    var s = ensureStore(store);
+    var corr = newCorrection || {};
+    var item = {
+      id: corr.id || makeId('corr'),
+      kind: 'correction',
+      text: trim(corr.text || ''),
+      detail: {},
+      lang: corr.lang || '',
+      source: corr.source || 'user-correction',
+      ts: corr.ts || Date.now(),
+      status: 'active'
+    };
+    if (corr.topic) { item.topic = corr.topic; }
+    if (corr.detail) {
+      if (corr.detail.wrong) { item.detail.wrong = trim(corr.detail.wrong); }
+      if (corr.detail.right) { item.detail.right = trim(corr.detail.right); }
+    }
+    if (!item.detail.wrong && !item.detail.right) {
+      var parsed = parseCorrectionText(item.text);
+      if (parsed) { item.detail = parsed; }
+    }
+
+    var supersededIds = [];
+    var items = s.items;
+    var i;
+    for (i = 0; i < items.length; i++) {
+      if (conflictsWithCorrection(items[i], item)) {
+        items[i].status = 'superseded';
+        items[i].supersededBy = item.id;
+        items[i].supersededTs = Date.now();
+        supersededIds.push(items[i].id);
+      }
+    }
+
+    s.items.push(item);
+    return { stored: item, supersededIds: supersededIds, store: s };
+  }
+
+  /* ---------- 2. checkAnswer ---------- */
+
+  // Finds the literal occurrence of `wrong` inside `answer` (case
+  // insensitive, punctuation tolerant). Returns the matched slice from
+  // the original answer, or the stored wrong wording as a fallback.
+  function findWrongInAnswer(answer, wrong) {
+    var low = String(answer).toLowerCase();
+    var idx = low.indexOf(String(wrong).toLowerCase());
+    if (idx !== -1) {
+      return String(answer).slice(idx, idx + String(wrong).length);
+    }
+    // Punctuation-tolerant pass: normalise both sides to words.
+    if (containsPhrase(answer, wrong)) { return trim(wrong); }
+    return '';
+  }
+
+  function checkAnswer(answer, store) {
+    var violations = [];
+    var text = String(answer == null ? '' : answer);
+    if (!trim(text)) { return { violations: violations }; }
+    var corrections = activeItems(store);
+    var i, c, wrong, right, matched;
+    for (i = 0; i < corrections.length; i++) {
+      c = corrections[i];
+      if (c.kind && c.kind !== 'correction') { continue; }
+      wrong = correctionWrong(c);
+      if (!wrong || wrong.length < 2) { continue; }
+      matched = findWrongInAnswer(text, wrong);
+      if (matched) {
+        right = correctionRight(c);
+        violations.push({
+          correctionId: c.id,
+          matchedText: matched,
+          wrong: wrong,
+          right: right
+        });
+      }
+    }
+    return { violations: violations };
+  }
+
+  /* ---------- 3. fixAnswer ---------- */
+
+  function splitSentences(text) {
+    var out = [];
+    var re = /[^.!?\n]+[.!?]+["')\]]*|[^.!?\n]+/g;
+    var m;
+    while ((m = re.exec(text)) !== null) {
+      var s = trim(m[0]);
+      if (s) { out.push(s); }
+    }
+    return out.length ? out : [trim(text)];
+  }
+
+  function detectLang(text) {
+    if (/[\u0600-\u06FF]/.test(text)) { return 'urdu'; }
+    if (/\b(mujhe|batao|chahiye|karo|aap|aapko|sahi|galat|ghalat|samjho|likho|bhejo)\b/i.test(text)) {
+      return 'roman';
+    }
+    if (/\b(yeh|ye|hai|nahi|nahin|kya|mera|meri|ka|ki|ko|se|mein)\b/i.test(text)) {
+      var hits = text.match(/\b(yeh|ye|hai|nahi|nahin|kya|mera|meri|ka|ki|ko|se|mein)\b/gi);
+      if (hits && hits.length >= 2) { return 'roman'; }
+    }
+    return 'en';
+  }
+
+  function correctionNoteForFix(violations, lang) {
+    var rights = [];
+    var i;
+    for (i = 0; i < violations.length; i++) {
+      if (violations[i].right && rights.indexOf(violations[i].right) === -1) {
+        rights.push(violations[i].right);
+      }
+    }
+    var rightPart = rights.length ? rights.join('; ') : '';
+    if (lang === 'urdu') {
+      return rightPart ?
+        'نوٹ: صارف کی تصحیح یہاں لاگو ہوتی ہے — صحیح ورژن یہ ہے: ' + rightPart + '۔' :
+        'نوٹ: صارف کی تصحیح یہاں لاگو ہوتی ہے — غلط جملہ ہٹا دیا گیا ہے۔';
+    }
+    if (lang === 'roman') {
+      return rightPart ?
+        'Note: user ki correction yahan laagu hoti hai — sahi version ye hai: ' + rightPart + '.' :
+        'Note: user ki correction yahan laagu hoti hai — ghalat jumla hata diya gaya hai.';
+    }
+    return rightPart ?
+      'Note: a correction from the user applies here — the correct version is: ' + rightPart + '.' :
+      'Note: a correction from the user applies here — the incorrect sentence was removed.';
+  }
+
+  function fixAnswer(answer, checkResult) {
+    var text = String(answer == null ? '' : answer);
+    var violations = (checkResult && checkResult.violations) || [];
+    if (!violations.length) {
+      return { fixed: text, blocked: false, violations: violations };
+    }
+
+    var sentences = splitSentences(text);
+    var badIdx = {};
+    var i, j, v;
+    for (i = 0; i < sentences.length; i++) {
+      for (j = 0; j < violations.length; j++) {
+        v = violations[j];
+        if (v.wrong && containsPhrase(sentences[i], v.wrong)) {
+          badIdx[i] = 1;
+        }
+      }
+    }
+    var badCount = 0;
+    for (i = 0; i < sentences.length; i++) { if (badIdx[i]) { badCount += 1; } }
+
+    var words = normText(text).split(' ').length;
+    // Blocked when the answer ONLY repeats the corrected mistake as its
+    // core claim: every sentence carries the mistake, or the whole
+    // answer is one short mistaken claim.
+    if (badCount === sentences.length || (sentences.length === 1 && words <= 40)) {
+      return { fixed: null, blocked: true, violations: violations };
+    }
+
+    var kept = [];
+    for (i = 0; i < sentences.length; i++) {
+      if (!badIdx[i]) { kept.push(sentences[i]); }
+    }
+    if (!kept.length) {
+      return { fixed: null, blocked: true, violations: violations };
+    }
+
+    var lang = detectLang(text);
+    var fixed = kept.join(' ') + ' ' + correctionNoteForFix(violations, lang);
+    return { fixed: fixed, blocked: false, violations: violations };
+  }
+
+  /* ---------- 4. checkTaughtFact ---------- */
+
+  // A negation only counts when it negates something the taught fact
+  // itself claims. "The Eiffel Tower is in Paris, not London" negates
+  // London, so it contradicts a fact claiming London but not a fact
+  // claiming Paris. Whole-claim words (false, incorrect, myth...) do
+  // negate the entire claim.
+  var WHOLE_CLAIM_RE = /\b(false|incorrect|wrong|myth|debunked|no\s+evidence)\b/i;
+  var SCOPED_NEG_RE = /\b(not|isn'?t|aren'?t|doesn'?t|does\s+not|did\s+not|don'?t|can'?t|cannot|never)\b/i;
+
+  function negationContradicts(factText, sentence) {
+    if (WHOLE_CLAIM_RE.test(sentence)) { return true; }
+    var m = SCOPED_NEG_RE.exec(sentence);
+    if (!m) { return false; }
+    var after = sentence.slice(m.index + m[0].length);
+    var negated = significantTokens(after);
+    var factToks = significantTokens(factText);
+    var i;
+    for (i = 0; i < negated.length; i++) {
+      if (factToks.indexOf(negated[i]) !== -1) { return true; }
+    }
+    return false;
+  }
+
+  function extractNumbers(text) {
+    var nums = [];
+    var re = /(?:\$|£|€)?\d[\d,]*(?:\.\d+)?/g;
+    var m;
+    while ((m = re.exec(String(text))) !== null) {
+      nums.push(m[0].replace(/[$£€,]/g, ''));
+    }
+    return nums;
+  }
+
+  function sourceSentences(source) {
+    var t = (source && (source.text || source.snippet || '')) || '';
+    return splitSentences(t);
+  }
+
+  function sourceLabel(source) {
+    if (!source) { return 'a verified source'; }
+    var label = trim(source.title || '') || trim(source.url || '') || 'a verified source';
+    return label;
+  }
+
+  // Conservative default matcher: only a strong explicit contradiction
+  // counts — a negation in a sentence about the same subject, or a
+  // different number/date for the same subject. Weak similarity never
+  // flags.
+  function defaultMatcher(factText, source) {
+    var sentences = sourceSentences(source);
+    var i, s, shared, factNums, sentNums, common, k;
+    for (i = 0; i < sentences.length; i++) {
+      s = sentences[i];
+      shared = sharedTokens(factText, s);
+      if (shared.length < 2) { continue; }
+      if (negationContradicts(factText, s)) {
+        return {
+          contradicts: true,
+          evidence: sourceLabel(source) + ' says: "' + trim(s) + '"'
+        };
+      }
+      factNums = extractNumbers(factText);
+      sentNums = extractNumbers(s);
+      if (factNums.length && sentNums.length) {
+        common = false;
+        for (k = 0; k < factNums.length; k++) {
+          if (sentNums.indexOf(factNums[k]) !== -1) { common = true; }
+        }
+        if (!common) {
+          return {
+            contradicts: true,
+            evidence: sourceLabel(source) + ' says: "' + trim(s) + '"'
+          };
+        }
+      }
+    }
+    return { contradicts: false, evidence: null };
+  }
+
+  function checkTaughtFact(factText, verifiedSources, deps) {
+    var fact = trim(factText || '');
+    if (!fact) { return { contradicts: false, evidence: null }; }
+    var sources = verifiedSources || [];
+    var matcher = (deps && typeof deps.matcher === 'function') ?
+      deps.matcher : defaultMatcher;
+    var i, src, res;
+    for (i = 0; i < sources.length; i++) {
+      src = sources[i];
+      try {
+        res = matcher(fact, src);
+      } catch (e) {
+        res = defaultMatcher(fact, src);
+      }
+      if (res === true) {
+        return {
+          contradicts: true,
+          evidence: sourceLabel(src) + ' states the opposite.'
+        };
+      }
+      if (typeof res === 'string' && res) {
+        return { contradicts: true, evidence: res };
+      }
+      if (res && res.contradicts) {
+        return {
+          contradicts: true,
+          evidence: res.evidence || (sourceLabel(src) + ' states the opposite.')
+        };
+      }
+    }
+    return { contradicts: false, evidence: null };
+  }
+
+  /* ---------- 5. correctionNote ---------- */
+
+  function correctionNote(store) {
+    var corrections = activeItems(store);
+    var only = [];
+    var i;
+    for (i = 0; i < corrections.length; i++) {
+      if (!corrections[i].kind || corrections[i].kind === 'correction') {
+        only.push(corrections[i]);
+      }
+    }
+    if (!only.length) { return ''; }
+    only.sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); });
+    only = only.slice(0, MAX_NOTE);
+    var lines = [];
+    for (i = 0; i < only.length; i++) {
+      var wrong = correctionWrong(only[i]);
+      var right = correctionRight(only[i]);
+      if (wrong && right) {
+        lines.push((i + 1) + '. Never say "' + wrong + '" — say "' + right + '" instead.');
+      } else if (right) {
+        lines.push((i + 1) + '. Always use: "' + right + '".');
+      } else if (wrong) {
+        lines.push((i + 1) + '. Never say "' + wrong + '".');
+      } else if (trim(only[i].text || '')) {
+        lines.push((i + 1) + '. Remember this correction: "' + trim(only[i].text) + '".');
+      }
+    }
+    if (!lines.length) { return ''; }
+    return '[Corrections from the user — never repeat these mistakes:\n' +
+      lines.join('\n') + ']';
+  }
+
+  return {
+    applyCorrection: applyCorrection,
+    checkAnswer: checkAnswer,
+    fixAnswer: fixAnswer,
+    checkTaughtFact: checkTaughtFact,
+    correctionNote: correctionNote,
+    storeLearnedItem: storeLearnedItem,
+    activeItems: activeItems,
+    _internals: {
+      normText: normText,
+      containsPhrase: containsPhrase,
+      parseCorrectionText: parseCorrectionText,
+      conflictsWithCorrection: conflictsWithCorrection,
+      defaultMatcher: defaultMatcher,
+      splitSentences: splitSentences,
+      detectLang: detectLang
+    }
+  };
+}));
+</script>
+<!-- v62-learning: wiring block (intercept + note + guard + deps) -->
+<script>
+/* ==========================================================================
+ * v62-learning wiring (22 Nov 2026): pieces 41-44 (learning track).
+ * Inlined byte-identical right after the piece-31 block; this block only
+ * WIRES them into the live artifact. No voice / language / backend /
+ * identity code touched. No backend change. No new backend endpoint is
+ * invented here: search reuses searchWeb() (the real /api/search proxy
+ * path) and video resolving reuses /api/fetch + YouTube oEmbed.
+ *
+ * Store-shape note (reconciliation the pieces leave to the assembler):
+ * piece 41 stores a correction's detail as a STRING (the wrong part);
+ * piece 44 stores detail as an OBJECT {wrong, right}. Corrections are
+ * stored in the piece-44 object form (the guard needs detail.wrong),
+ * and every reader that expects the piece-41 string form gets a
+ * normalised copy (detail -> detail.wrong) via enzoLearningNoteItems()
+ * / the Settings adapter. The stored item itself is never rewritten.
+ * Disputed / superseded items are excluded from the prompt note and
+ * from the guard (piece 44 already filters them); they stay in the
+ * store so Raja can see and delete them in Settings.
+ * ========================================================================== */
+
+/* ---------- small shared helpers ---------- */
+function enzoLearningStore(){
+  try{ if(window.EnzoTeaching) return window.EnzoTeaching.createLearnedStore(); }catch(e){}
+  return null;
+}
+function enzoLearningActiveItems(){
+  var items=[];
+  try{
+    var all=enzoLearningStore().getItems()||[];
+    for(var i=0;i<all.length;i++){ var st=all[i].status; if(!st||st==='active') items.push(all[i]); }
+  }catch(e){}
+  return items;
+}
+function enzoLearningPersist(items){
+  try{ if(window.EnzoTeaching) localStorage.setItem(window.EnzoTeaching.ITEMS_KEY, JSON.stringify(items||[])); }catch(e){}
+}
+/* Normalised copies for piece-41 readers (buildLearnedNote expects
+   detail to be a string — the wrong part — never an object). */
+function enzoLearningNoteItems(items){
+  var out=[];
+  for(var i=0;i<(items||[]).length;i++){
+    var it=items[i], d=it.detail;
+    if(d && typeof d==='object'){
+      out.push({kind:it.kind, text:it.text, detail:(d.wrong||''), lang:it.lang, ts:it.ts, topic:it.topic});
+    } else out.push(it);
+  }
+  return out;
+}
+/* The combined prompt block: piece 41 learned note + piece 44 active
+   corrections note. Used by learnedNote() (legacy prompts) and
+   learnedPrefs() (backend /ask preferences). '' when nothing learned. */
+function enzoLearningNoteBlocks(){
+  var parts=[];
+  try{
+    if(!window.EnzoTeaching) return '';
+    var active=enzoLearningActiveItems();
+    if(!active.length) return '';
+    var n1=window.EnzoTeaching.buildLearnedNote(enzoLearningNoteItems(active));
+    if(n1) parts.push(n1);
+    if(window.CorrectionGuard){
+      var n2=window.CorrectionGuard.correctionNote(active);
+      if(n2) parts.push(n2);
+    }
+  }catch(e){}
+  return parts.join('\n');
+}
+
+/* ---------- Settings CSS for the piece-43 rows ---------- */
+try{
+  var lrnCss=document.createElement('style'); lrnCss.id='enzoV62LearnCss';
+  lrnCss.textContent='.lrn-items-head h4{margin:14px 0 2px;font-size:13px;color:var(--ink)}'
+    +'.lrn-count{font-size:12px;color:var(--muted);margin:6px 0}'
+    +'.lrn-item{padding:7px 0;border-bottom:1px dashed var(--line);font-size:12.5px;color:var(--ink)}'
+    +'.lrn-item-detail{color:var(--muted);font-size:12px;margin-top:2px}'
+    +'.lrn-item-meta{color:var(--muted);font-size:11.5px;margin-top:3px}'
+    +'.lrn-item-meta a{color:var(--muted);text-decoration:underline}'
+    +'.lrn-item .lrn-x{margin-top:5px}';
+  document.head.appendChild(lrnCss);
+}catch(e){}
+
+/* ---------- delivering a learning reply (mirrors the small-talk reply
+   shape in askQuestion: user message already pushed, then the AI reply,
+   render, save, speak) ---------- */
+function enzoLearningPushUser(chat, raw, lang, viaVoice){
+  var tl=timeLabelFor(Date.now());
+  chat.messages.push({role:'user', text:raw, lang:lang, viaVoice:!!viaVoice, ts:Date.now(), daypart:tl.daypart, daypartRoman:tl.daypartRoman, timeLabel:tl.full});
+  renderChatList(); renderMessages(true); saveChats();
+}
+function enzoLearningDeliverReply(chat, replyText, lang, viaVoice){
+  var tl=timeLabelFor(Date.now());
+  var msg={role:'ai', html:mdToHtml(replyText), plain:replyText, viaVoice:!!viaVoice, question:'', sources:[], deep:false, modeWhy:'Learned from Raja — stored, and used in future answers', auto:false, followups:[], lang:lang, ts:Date.now(), daypart:tl.daypart, daypartRoman:tl.daypartRoman, timeLabel:tl.full};
+  chat.messages.push(msg); renderMessages(); saveChats();
+  setCentreEnzo('success');
+  setTimeout(function(){ if(!state.isGenerating) setCentreEnzo('idle'); }, 2800);
+  (window.EnaoV54Voice ? window.EnaoV54Voice.patchDirectSpeak(msg, answersMode()) : maybeSpeak(msg));
+}
+
+/* ---------- piece 42 deps: the app's REAL research + video paths ---------- */
+/* search: the real research path — searchWeb() over the /api/search proxy,
+   mapped to the {title, url, date, snippet} shape piece 42 reads. Page
+   text (extract) is used as the snippet, capped, so learned points carry
+   real page content; at most 5 results become learned points. */
+function enzoLearningSearchDep(topic){
+  return searchWeb(topic, true).then(function(all){
+    var arr=(all||[]).slice(0,5), out=[];
+    for(var i=0;i<arr.length;i++){
+      var s=arr[i]||{}; if(!s.url) continue;
+      var snip=String(s.extract||s.snippet||s.text||s.description||s.title||'');
+      out.push({title:String(s.title||s.url), url:String(s.url), date:String(s.date||s.published||s.publishedAt||''), snippet:snip.slice(0,400)});
+    }
+    return out;
+  });
+}
+function enzoLearningHtmlUnesc(s){
+  return String(s||'').replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>');
+}
+/* resolveVideo: real video metadata via /api/fetch + YouTube oEmbed
+   (title + channel), plus the watch page's real og:description and
+   datePublished when the page actually carries them. No transcript API
+   exists, so description-less videos honestly resolve metadata-only in
+   piece 42. A bare topic (no URL) is first searched for a real YouTube
+   watch URL; when none is found the resolver returns null. */
+function enzoLearningResolveVideo(input){
+  var raw=String(input||'').trim();
+  if(!raw) return Promise.resolve(null);
+  function watchUrlOf(u){
+    var m;
+    m=/youtu\.be\/([A-Za-z0-9_-]{6,})/.exec(u); if(m) return 'https://www.youtube.com/watch?v='+m[1];
+    m=/[?&]v=([A-Za-z0-9_-]{6,})/.exec(u); if(m) return 'https://www.youtube.com/watch?v='+m[1];
+    m=/youtube\.com\/(?:shorts|embed|live)\/([A-Za-z0-9_-]{6,})/.exec(u); if(m) return 'https://www.youtube.com/watch?v='+m[1];
+    return null;
+  }
+  function resolveWatch(watchUrl){
+    var oeUrl='https://www.youtube.com/oembed?url='+encodeURIComponent(watchUrl)+'&format=json';
+    var oeFetch=window.EnzoPagesBackend.getSearchUrl('/api/fetch?url='+encodeURIComponent(oeUrl));
+    return fetchJSONT(oeFetch, 15000).then(function(j){
+      var oe=j;
+      if(oe && typeof oe.text==='string'){ try{ oe=JSON.parse(oe.text); }catch(e){ oe=null; } }
+      if(!oe || !oe.title) return null;
+      var meta={title:String(oe.title||''), channel:String(oe.author_name||''), url:watchUrl, published:'', description:''};
+      var pageFetch=window.EnzoPagesBackend.getSearchUrl('/api/fetch?url='+encodeURIComponent(watchUrl));
+      return fetchJSONT(pageFetch, 15000).then(function(pj){
+        var html=(pj && typeof pj.text==='string') ? pj.text : '';
+        if(html){
+          var dm=/<meta[^>]+(?:property="og:description"|name="description")[^>]+content="([^"]*)"/i.exec(html)
+            || /<meta[^>]+content="([^"]*)"[^>]+(?:property="og:description"|name="description")/i.exec(html);
+          if(dm) meta.description=enzoLearningHtmlUnesc(dm[1]).slice(0,2000);
+          var pub=/"(?:datePublished|uploadDate)"\s*:\s*"([^"]+)"/.exec(html);
+          if(pub) meta.published=pub[1];
+        }
+        return meta;
+      }, function(){ return meta; });
+    }, function(){ return null; });
+  }
+  var direct=watchUrlOf(raw);
+  if(direct) return resolveWatch(direct);
+  return searchWeb(raw+' youtube', false).then(function(all){
+    var arr=all||[];
+    for(var i=0;i<arr.length;i++){
+      var w=(arr[i] && arr[i].url) ? watchUrlOf(String(arr[i].url)) : null;
+      if(w) return resolveWatch(w);
+    }
+    return null;
+  }, function(){ return null; });
+}
+function enzoLearningDeps(){
+  var deps={search:enzoLearningSearchDep, resolveVideo:enzoLearningResolveVideo};
+  try{
+    var baseStore=enzoLearningStore();
+    if(baseStore){
+      /* Piece 41's addItem hard-codes source:'taught' and drops the
+         source object piece 42 attaches to learned points. The adapter
+         keeps the piece-41 store as the single store but writes the
+         real source object back onto the saved item, so directed
+         learning keeps its real source (and Settings can link it). */
+      deps.store={
+        addItem:function(item){
+          var saved=baseStore.addItem(item);
+          if(saved && item && item.source && typeof item.source==='object'){
+            try{
+              var all=baseStore.getItems();
+              for(var i=0;i<all.length;i++){ if(all[i].id===saved.id){ all[i].source=item.source; break; } }
+              enzoLearningPersist(all);
+              saved.source=item.source;
+            }catch(e){}
+          }
+          return saved;
+        },
+        getItems:function(){ return baseStore.getItems(); },
+        deleteItem:function(id){ return baseStore.deleteItem(id); },
+        clearAll:function(){ return baseStore.clearAll(); }
+      };
+    }
+  }catch(e){}
+  return deps;
+}
+
+/* ---------- verified sources on hand: the last AI answer's sources ---------- */
+function enzoLearningLastVerifiedSources(chat){
+  try{
+    var msgs=chat.messages||[];
+    for(var i=msgs.length-1;i>=0;i--){
+      var m=msgs[i];
+      if(m && m.role==='ai' && m.sources && m.sources.length){
+        var out=[];
+        for(var j=0;j<m.sources.length;j++){
+          var s=m.sources[j]; if(!s) continue;
+          if(typeof s==='string'){ out.push({title:s, url:'', text:''}); continue; }
+          out.push({title:String(s.title||s.url||''), url:String(s.url||''), text:String(s.extract||s.snippet||s.text||''), date:String(s.date||s.published||'')});
+        }
+        if(out.length) return out;
+      }
+    }
+  }catch(e){}
+  return [];
+}
+
+/* ---------- reply texts ---------- */
+var DIRECTED_FAIL_T={
+  en:'I could not finish learning that just now — the lookup failed. Please try again.',
+  roman:'Main abhi ye seekh nahi saka — lookup fail ho gaya. Dobara koshish karein.',
+  urdu:'میں ابھی یہ نہیں سیکھ سکا — تلاش ناکام ہو گئی۔ دوبارہ کوشش کریں۔'
+};
+var DISPUTE_T={
+  en:function(fact, ev){ return 'You taught me "'+fact+'", but '+ev+' — which one should I keep? I have saved this as disputed, not as a fact, until you decide.'; },
+  roman:function(fact, ev){ return 'Aap ne mujhe "'+fact+'" sikhaya, lekin '+ev+' — main kis ko rakhoon? Maine isay disputed save kiya hai, fact ke tor par nahi, jab tak aap faisla na karein.'; },
+  urdu:function(fact, ev){ return 'آپ نے مجھے "'+fact+'" سکھایا، لیکن '+ev+' — میں کس کو رکھوں؟ میں نے اسے متنازع محفوظ کیا ہے، حقیقت کے طور پر نہیں، جب تک آپ فیصلہ نہ کریں۔'; },
+  punjabi:function(fact, ev){ return 'تسیں مینوں "'+fact+'" سکھایا، لیکن '+ev+' — میں کیہنوں رکھاں؟ میں اینوں متنازع محفوظ کیتا اے، حقیقت دے طور تے نہیں، جدوں تک تسیں فیصلہ نہ کرو۔'; }
+};
+var BLOCKED_T={
+  en:'Sorry — my answer repeated something you already corrected, so I did not send it. Which version should I use instead? Tell me the right version and I will use it from now on.',
+  roman:'Maazrat — mera jawab us baat ko dohra raha tha jo aap pehle hi theek kar chuke hain, is liye maine wo jawab nahi bheja. Aap batayein, main kis version ko use karoon? Sahi version bata dein, main aage se wohi use karoon ga.',
+  urdu:'معذرت — میرا جواب اس بات کو دہرا رہا تھا جو آپ پہلے ہی ٹھیک کر چکے ہیں، اس لیے میں نے وہ جواب نہیں بھیجا۔ آپ بتائیں، میں کس ورژن کو استعمال کروں؟ صحیح ورژن بتا دیں، میں آگے سے وہی استعمال کروں گا۔'
+};
+
+/* ---------- pre-delivery blocked reply (piece 44 fixAnswer blocked:true):
+   the draft is NEVER delivered; a short apology + ask goes out instead. ---------- */
+function enzoLearningDeliverBlocked(ctx, violations){
+  ctx.delivered=true;
+  try{ hideTyping(); }catch(e){}
+  try{ if(typeof setGenerating==='function') setGenerating(false); }catch(e){}
+  try{ if(typeof setCentreEnzo==='function') setCentreEnzo('idle'); }catch(e){}
+  try{ if(window.__enzoLifecycle && ctx.myRun) window.__enzoLifecycle.completeTask(ctx.myRun); }catch(e){}
+  try{ if(typeof setProgress==='function') setProgress(null); }catch(e){}
+  var lang=ctx.lang||'en';
+  var line=BLOCKED_T[lang]||BLOCKED_T.en;
+  var msg=aiMsgShell(ctx, line, {html:mdToHtml(line), deep:false, modeWhy:'Blocked — the draft repeated a corrected mistake, so it was not delivered', followups:[]});
+  ctx.chat.messages.push(msg);
+  saveChats();
+  if(activeChat()===ctx.chat){ renderMessages(); streamMessage(ctx.chat, msg); }
+  else { msg.html=msg._fullHtml; renderChatList(); saveChats(); }
+  (window.EnaoV54Voice ? window.EnaoV54Voice.patchDirectSpeak(msg, answersMode()) : maybeSpeak(msg));
+  return msg;
+}
+
+/* ---------- message-send intercept: runs BEFORE intent routing.
+   Returns true when the message was handled (sync reply delivered, or
+   the async directed-learning run started); false to continue normal
+   routing. Order: (a) forget, (b) directed learning, (c) correction
+   via piece 44, then teaching via piece 41. ---------- */
+function enzoLearningIntercept(raw, chat, viaVoice){
+  try{
+    if(!window.EnzoTeaching && !window.EnzoDirectedLearning && !window.EnzoSettingsLearned) return false;
+    if(!chat){ try{ chat=createChat(String(raw||'').slice(0,42)); }catch(e){ return false; } }
+    var lang=(typeof detectLang==='function')?detectLang(raw):'en';
+    var store=null;
+    try{ if(window.EnzoTeaching) store=window.EnzoTeaching.createLearnedStore(); }catch(e){}
+    /* (a) forget — first. A non-empty reply means a forget command. */
+    if(window.EnzoSettingsLearned && store){
+      var fr=null;
+      try{ fr=window.EnzoSettingsLearned.handleForget(raw, store, {onItemsChanged:function(){ try{ renderLearned(); }catch(e){} }}); }catch(e){}
+      if(fr && fr.reply){
+        enzoLearningPushUser(chat, raw, lang, viaVoice);
+        enzoLearningDeliverReply(chat, fr.reply, lang, viaVoice);
+        return true;
+      }
+    }
+    /* (b) directed learning — async; the normal generating indicator
+       stays on while the real lookup runs. */
+    if(window.EnzoDirectedLearning){
+      var det=null;
+      try{ det=window.EnzoDirectedLearning.detectDirectedLearning(raw); }catch(e){}
+      if(det){
+        enzoLearningPushUser(chat, raw, lang, viaVoice);
+        try{ setGenerating(true); showTyping(); setTypingStatus('Learning…'); }catch(e){}
+        window.EnzoDirectedLearning.applyDirectedLearning(raw, enzoLearningDeps()).then(function(out){
+          try{ hideTyping(); setGenerating(false); }catch(e){}
+          var summary=(out && out.summary) || (out && out.result && out.result.message) || '';
+          enzoLearningDeliverReply(chat, summary, lang, viaVoice);
+        }, function(){
+          try{ hideTyping(); setGenerating(false); }catch(e){}
+          enzoLearningDeliverReply(chat, (DIRECTED_FAIL_T[lang]||DIRECTED_FAIL_T.en), lang, viaVoice);
+        });
+        return true;
+      }
+    }
+    /* (c) corrections route through piece 44 (detail.wrong/right), so
+       the guard can catch repeats; teaching goes through piece 41. */
+    if(window.EnzoTeaching && store){
+      var corr=null;
+      try{ corr=window.EnzoTeaching.detectCorrection(raw); }catch(e){}
+      if(corr && window.CorrectionGuard){
+        var items=store.getItems();
+        try{ window.CorrectionGuard.applyCorrection({text:corr.rightPart||corr.wrongPart, detail:{wrong:corr.wrongPart, right:corr.rightPart}, lang:corr.lang||lang}, items); }catch(e){}
+        enzoLearningPersist(items);
+        var confirm=window.EnzoTeaching.confirmLine({kind:'correction', lang:corr.lang||lang});
+        enzoLearningPushUser(chat, raw, lang, viaVoice);
+        enzoLearningDeliverReply(chat, confirm, lang, viaVoice);
+        return true;
+      }
+      var taught=null;
+      try{ taught=window.EnzoTeaching.applyTeaching(raw); }catch(e){}
+      if(taught && taught.learned){
+        var item=taught.learned;
+        /* Taught facts only: when the last delivered answer carries
+           verified sources, check the fact against them. On a real
+           contradiction, ask Raja plainly and store as 'disputed',
+           never as truth. No sources on hand = no check possible. */
+        if(item.kind==='fact' && window.CorrectionGuard){
+          var vsrcs=enzoLearningLastVerifiedSources(chat);
+          if(vsrcs && vsrcs.length){
+            var chk=null;
+            try{ chk=window.CorrectionGuard.checkTaughtFact(item.text, vsrcs); }catch(e){}
+            if(chk && chk.contradicts){
+              try{
+                var all2=store.getItems();
+                for(var k=0;k<all2.length;k++){ if(all2[k].id===item.id){ all2[k].status='disputed'; break; } }
+                enzoLearningPersist(all2);
+              }catch(e){}
+              var dl=(DISPUTE_T[item.lang]||DISPUTE_T.en)(item.text, chk.evidence||'a verified source states the opposite');
+              enzoLearningPushUser(chat, raw, lang, viaVoice);
+              enzoLearningDeliverReply(chat, dl, lang, viaVoice);
+              return true;
+            }
+          }
+        }
+        enzoLearningPushUser(chat, raw, lang, viaVoice);
+        enzoLearningDeliverReply(chat, taught.confirm, lang, viaVoice);
+        return true;
+      }
+    }
+  }catch(e){}
+  return false;
+}
+
+</script>
 <script>
 /* ==========================================================================
  * ENAO AI — Live-defect fix, worker 3: CHAT-SYNC + POLLING 404 STORM
@@ -2900,12 +5326,452 @@ window.__enzoGetTransport59 = function () {
   }catch(e){}
   window.__enzoMobileUI=function(){ return window.innerWidth<=820||document.documentElement.classList.contains('phone-forced'); };
 })();</script>
+<script>
+/* 31-identity-frontend.js — ENZO identity for the ENAO AI frontend.
+ *
+ * Defect fixed: asking ENZO its name got "ChatGPT". The artifact's prompt
+ * builders say "You are ENZO AI" only inside user-role message content,
+ * and the fetch calls send messages:[{role:'user', content:prompt}] with
+ * NO system role at all, so Pollinations' openai model answers name
+ * questions from its own built-in identity.
+ *
+ * This piece supplies the fix in one place:
+ *   - ENZO_IDENTITY: the canonical identity line, carried as a system
+ *     message (buildMessages) and, as defence in depth, as the first line
+ *     of the prompt text itself (withIdentity).
+ *   - buildMessages(prompt): system identity + user task, for the fetch
+ *     calls in callAIOnce, rewritePassage and describeImage.
+ *   - withIdentity(prompt): idempotent prompt prefix, for the three
+ *     prompt builders (buildPrompt, buildKnowledgePrompt, megaAnswer).
+ *   - answerNameQuestion(text, lang): whole-message name fast path, so a
+ *     name question never reaches the model at all. It fires only when
+ *     the WHOLE message asks the assistant's name / who it is / who made
+ *     it, in English, Urdu script, Roman Urdu or Punjabi (Shahmukhi or
+ *     Roman). Topic questions about a third party never fire.
+ *
+ * ES5 style to match the artifact (var, function, no arrow functions,
+ * no template literals, no const/let). No emojis. No other behaviour.
+ * UMD: window.EnzoIdentity in the browser, module.exports under Node.
+ */
+(function (global) {
+  'use strict';
+
+  var ENZO_IDENTITY = 'You are ENZO, also called ENZO AI \u2014 a personal AI assistant built for Raja. Your name is ENZO. Never say your name is ChatGPT, OpenAI, GPT, or any other AI. If asked who you are, what your name is, or who made you, say you are ENZO (ENZO AI), Raja\'s personal AI assistant.';
+
+  /* ---------- messages / prompt helpers ---------- */
+
+  function buildMessages(prompt) {
+    var p = (prompt === null || prompt === undefined) ? '' : String(prompt);
+    return [
+      { role: 'system', content: ENZO_IDENTITY },
+      { role: 'user', content: p }
+    ];
+  }
+
+  function withIdentity(prompt) {
+    var p = (prompt === null || prompt === undefined) ? '' : String(prompt);
+    if (p.indexOf(ENZO_IDENTITY) === 0) return p;
+    if (!p) return ENZO_IDENTITY;
+    return ENZO_IDENTITY + '\n\n' + p;
+  }
+
+  /* ---------- name fast path ---------- */
+
+  var NAME_ANSWERS = {
+    en: {
+      name: 'My name is ENZO (ENZO AI). I am Raja\'s personal AI assistant.',
+      maker: 'I am ENZO (ENZO AI), Raja\'s personal AI assistant. I was built for Raja.'
+    },
+    roman: {
+      name: 'Mera naam ENZO hai (ENZO AI). Main Raja ka personal AI assistant hoon.',
+      maker: 'Main ENZO hoon (ENZO AI), Raja ka personal AI assistant. Mujhe Raja ke liye banaya gaya hai.'
+    },
+    urdu: {
+      name: '\u0645\u06cc\u0631\u0627 \u0646\u0627\u0645 \u0627\u06cc\u0646\u0632\u0648 \u06c1\u06d2 (ENZO AI)\u06d4 \u0645\u06cc\u06ba \u0631\u0627\u062c\u06c1 \u06a9\u0627 \u0630\u0627\u062a\u06cc AI \u0627\u0633\u0633\u0679\u0646\u0679 \u06c1\u0648\u06ba\u06d4',
+      maker: '\u0645\u06cc\u06ba \u0627\u06cc\u0646\u0632\u0648 \u06c1\u0648\u06ba (ENZO AI)\u060c \u0631\u0627\u062c\u06c1 \u06a9\u0627 \u0630\u0627\u062a\u06cc AI \u0627\u0633\u0633\u0679\u0646\u0679\u06d4 \u0645\u062c\u06be\u06d2 \u0631\u0627\u062c\u06c1 \u06a9\u06d2 \u0644\u06cc\u06d2 \u0628\u0646\u0627\u06cc\u0627 \u06af\u06cc\u0627 \u06c1\u06d2\u06d4'
+    },
+    punjabi: {
+      name: '\u0645\u06cc\u0631\u0627 \u0646\u0627\u06ba \u0627\u06cc\u0646\u0632\u0648 \u0627\u06d2 (ENZO AI)\u06d4 \u0645\u06cc\u06ba \u0631\u0627\u062c\u06c1 \u062f\u0627 \u0630\u0627\u062a\u06cc AI \u0627\u0633\u0633\u0679\u0646\u0679 \u0622\u06ba\u06d4',
+      maker: '\u0645\u06cc\u06ba \u0627\u06cc\u0646\u0632\u0648 \u0622\u06ba (ENZO AI)\u060c \u0631\u0627\u062c\u06c1 \u062f\u0627 \u0630\u0627\u062a\u06cc AI \u0627\u0633\u0633\u0679\u0646\u0679\u06d4 \u0645\u06cc\u0646\u0648\u06ba \u0631\u0627\u062c\u06c1 \u0644\u0626\u06cc \u0628\u0646\u0627\u06cc\u0627 \u06af\u06cc\u0627 \u0627\u06d2\u06d4'
+    },
+    punjabiRoman: {
+      name: 'Mera naa ENZO ae (ENZO AI). Main Raja da personal AI assistant aan.',
+      maker: 'Main ENZO aan (ENZO AI), Raja da personal AI assistant. Mainu Raja layi banaya gaya ae.'
+    }
+  };
+
+  /* Whole-message patterns only: anchored ^...$, so a name word inside a
+     longer or topic question never matches. One entry per language;
+     'maker' patterns are the who-made-you form of the same question. */
+  var NAME_PATTERNS = {
+    en: [
+      { re: /^(who are you|who are u|what is your name|whats your name|what is ur name|whats ur name|tell me your name|your name|what are you called)$/, kind: 'name' },
+      { re: /^(who made you|who created you|who built you)$/, kind: 'maker' }
+    ],
+    roman: [
+      { re: /^(tum kaun ho|aap kaun ho|tu kaun hai|tu kaun ho|tum kon ho|aap kon ho|tumhara naam kya hai|tumhara naam kya he|tumhara naam kya ha|tumhara naam kya|aapka naam kya hai|aapka naam kya|aap ka naam kya hai|tumhara naam batao|aapka naam batao)$/, kind: 'name' },
+      { re: /^(tumhe kisne banaya|tumhe kis ne banaya|tum ko kisne banaya|tum ko kis ne banaya|aapko kisne banaya|aap ko kisne banaya|aap ko kis ne banaya)$/, kind: 'maker' }
+    ],
+    urdu: [
+      { re: /^(\u062a\u0645 \u06a9\u0648\u0646 \u06c1\u0648|\u0622\u067e \u06a9\u0648\u0646 \u06c1\u0648|\u062a\u0645\u06c1\u0627\u0631\u0627 \u0646\u0627\u0645 \u06a9\u06cc\u0627 \u06c1\u06d2|\u0622\u067e \u06a9\u0627 \u0646\u0627\u0645 \u06a9\u06cc\u0627 \u06c1\u06d2|\u062a\u06cc\u0631\u0627 \u0646\u0627\u0645 \u06a9\u06cc\u0627 \u06c1\u06d2|\u062a\u0645\u06c1\u0627\u0631\u0627 \u0646\u0627\u0645 \u0628\u062a\u0627\u0624|\u0622\u067e \u06a9\u0627 \u0646\u0627\u0645 \u0628\u062a\u0627\u0626\u06cc\u06ba)$/, kind: 'name' },
+      { re: /^(\u062a\u0645\u06c1\u06cc\u06ba \u06a9\u0633 \u0646\u06d2 \u0628\u0646\u0627\u06cc\u0627|\u0622\u067e \u06a9\u0648 \u06a9\u0633 \u0646\u06d2 \u0628\u0646\u0627\u06cc\u0627)$/, kind: 'maker' }
+    ],
+    punjabi: [
+      { re: /^(\u062a\u0648\u06ba \u06a9\u0648\u0646 \u0627\u06cc\u06ba|\u062a\u0648\u06ba \u06a9\u0648\u0646 \u0627\u06d2|\u062a\u0633\u06cc \u06a9\u0648\u0646 \u0627\u0648|\u062a\u0633\u06cc \u06a9\u0648\u0646 \u06c1\u0648|\u062a\u06cc\u0631\u0627 \u0646\u0627\u06ba \u06a9\u06cc \u0627\u06d2|\u062a\u0648\u0627\u0688\u0627 \u0646\u0627\u06ba \u06a9\u06cc \u0627\u06d2|\u062a\u06c1\u0627\u0688\u0627 \u0646\u0627\u06ba \u06a9\u06cc \u0627\u06d2|\u062a\u06cc\u0631\u0627 \u0646\u0627\u06ba \u06a9\u06cc \u06c1\u06d2)$/, kind: 'name' },
+      { re: /^(\u062a\u06cc\u0646\u0648\u06ba \u06a9\u0633 \u0646\u06d2 \u0628\u0646\u0627\u06cc\u0627|\u062a\u06cc\u0646\u0648\u06ba \u06a9\u0633 \u0646\u06d2 \u0628\u0646\u0627\u06cc\u0627 \u0627\u06d2)$/, kind: 'maker' }
+    ],
+    punjabiRoman: [
+      /* Optional leading 'mainu das / mainu daso / mainu dso' ('tell me').
+         The prefix alone never fires — a name question must follow it. */
+      { re: /^((mainu das|mainu daso|mainu dso) )?(tu kaun ain|tu kaun ae|tussi kaun ho|tusi kaun ho|tussi kaun o|tera naam ki hai|tera naa ki ae|tera naam ki ae|tera naa ki hai)$/, kind: 'name' },
+      { re: /^(tainu kisne banaya|tenu kis ne banaya|tainu kis ne banaya)$/, kind: 'maker' }
+    ]
+  };
+
+  function hasUrduScript(s) {
+    return /[\u0600-\u06FF]/.test(s);
+  }
+
+  function isPunjabiScript(s) {
+    /* Shahmukhi Punjabi markers. The sharpest is NAAN with noon ghunna
+       (U+06BA) instead of Urdu NAAM: 'میرا ناں' is Punjabi, 'میرا نام' is
+       Urdu. 'توں / تسی / تواڈا / تینوں' and 'کون ایں / کون اے' are
+       Punjabi-only; 'وچ / نال / دا' alone are weaker, so they are not
+       used here on their own. */
+    return /(\u0646\u0627\u06ba|\u062a\u0648\u06ba|\u062a\u0633\u06cc|\u062a\u0648\u0627\u0688\u0627|\u062a\u06cc\u0646\u0648\u06ba|\u06a9\u0648\u0646 \u0627\u06cc\u06ba|\u06a9\u0648\u0646 \u0627\u06d2)/.test(s);
+  }
+
+  function isPunjabiRoman(s) {
+    /* Roman Punjabi markers: 'tera / tainu / tenu' + 'ki / ae / ain',
+       or 'tu kaun ain/ae', 'tussi/tusi kaun'. Plain 'tum / aap / kya /
+       hai' stays Roman Urdu. */
+    return /(^|\s)(tera|tainu|tenu|tussi|tusi)(\s|$)/.test(s) ||
+      /\btu kaun (ain|ae)\b/.test(s) ||
+      /\b(naa ki|naam ki hai)\b/.test(s);
+  }
+
+  function isRomanUrdu(s) {
+    return /\b(tum|aap|tumhara|aapka|kaun|kon|naam|kya|kia|hai|he|ho|batao|kisne|banaya)\b/.test(s);
+  }
+
+  /* Language of the question text itself. The caller's lang is only a
+     tiebreak hint and never overrides what the text says. */
+  function detectNameLang(text, lang) {
+    var s = String(text || '');
+    if (hasUrduScript(s)) return isPunjabiScript(s) ? 'punjabi' : 'urdu';
+    var n = s.toLowerCase();
+    if (isPunjabiRoman(n)) return 'punjabiRoman';
+    if (isRomanUrdu(n)) return 'roman';
+    if (lang === 'punjabi' || lang === 'punjabiRoman') return 'punjabiRoman';
+    if (lang === 'roman' || lang === 'urdu') return lang;
+    return 'en';
+  }
+
+  function normalizeNameQuestion(text) {
+    var s = String(text || '').toLowerCase();
+    s = s.replace(/['\u2018\u2019]/g, '');
+    s = s.replace(/[?!.,;:()"'\u060C\u061B\u061F\u06D4]+/g, ' ');
+    s = s.replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
+    s = s.replace(/^(hi|hello|hey|salam|assalamualaikum|aoa)\s+/, '');
+    s = s.replace(/\s+(please|batao|batayen|bataein|daso)$/, '');
+    return s;
+  }
+
+  function wordCount(s) {
+    if (!s) return 0;
+    return s.split(' ').length;
+  }
+
+  function answerNameQuestion(text, lang) {
+    if (text === null || text === undefined) return null;
+    var raw = String(text);
+    if (!raw.replace(/^\s+|\s+$/g, '')) return null;
+    var norm = normalizeNameQuestion(raw);
+    if (!norm) return null;
+    /* Whole-message questions are short. Anything longer is a compound
+       or topic question, never a bare name question. */
+    if (wordCount(norm) > 12) return null;
+    /* Third-party guard: a question ABOUT ChatGPT / Gemini / Claude /
+       OpenAI is a topic question, never a question about this assistant.
+       The one exception is the identity-denial form ("are you ChatGPT?",
+       "tum ChatGPT ho?"), which is a question about this assistant and
+       is answered with the ENZO name answer (which never names ChatGPT). */
+    var mentionsOther = /\b(chatgpt|chat gpt|gemini|claude|openai|gpt-?4|gpt-?3)\b/.test(norm);
+    if (mentionsOther) {
+      var denial = /^(are you (chatgpt|chat gpt|openai|gpt)|kya tum (chatgpt|chat gpt|openai) ho|tum (chatgpt|chat gpt|openai) ho)$/.test(norm);
+      if (!denial) return null;
+      var denialLang = detectNameLang(raw, lang);
+      return NAME_ANSWERS[denialLang].name;
+    }
+    var detected = detectNameLang(raw, lang);
+    var order = [detected, 'en', 'roman', 'urdu', 'punjabi', 'punjabiRoman'];
+    var seen = {};
+    var i, j, set, entry, ans;
+    for (i = 0; i < order.length; i++) {
+      if (seen[order[i]]) continue;
+      seen[order[i]] = true;
+      set = NAME_PATTERNS[order[i]];
+      if (!set) continue;
+      for (j = 0; j < set.length; j++) {
+        entry = set[j];
+        if (entry.re.test(norm)) {
+          ans = NAME_ANSWERS[order[i]];
+          return entry.kind === 'maker' ? ans.maker : ans.name;
+        }
+      }
+    }
+    return null;
+  }
+
+  var api = {
+    ENZO_IDENTITY: ENZO_IDENTITY,
+    NAME_ANSWERS: NAME_ANSWERS,
+    buildMessages: buildMessages,
+    withIdentity: withIdentity,
+    detectNameLang: detectNameLang,
+    answerNameQuestion: answerNameQuestion
+  };
+
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  if (global) global.EnzoIdentity = api;
+})(typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : this));
+</script>
+<script>
+/* ENAO AI — piece 32: identity safety net.
+ *
+ * Last line of defence for self-identification: the model can still
+ * occasionally answer "I am ChatGPT" even with identity prompts fixed.
+ * correctIdentity() rewrites FIRST-PERSON self-identification claims
+ * (assistant is ChatGPT / OpenAI / GPT) to ENZO after the answer
+ * arrives and before display or speech.
+ *
+ * It MUST NOT alter topic discussion ("ChatGPT is a chatbot by
+ * OpenAI"), comparisons, code blocks, URLs or quoted text — only
+ * first-person self-identification sentences are corrected.
+ *
+ * UMD / IIFE, ES5 style. Exposes window.EnzoIdentityGuard in the
+ * browser and module.exports under Node. Python mirror:
+ * 32-identity-safetynet.py (same rules, same order, same behaviour).
+ * Shared test cases: shared_cases.json.
+ */
+(function (root, factory) {
+  if (typeof define === 'function' && define.amd) {
+    define([], factory);
+  } else if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
+  } else {
+    root.EnzoIdentityGuard = factory();
+  }
+}(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  /* Name token for the claimed identity (EN / Latin script).
+   * Longest alternatives first so "OpenAI's GPT-4" and "ChatGPT-4o"
+   * are consumed whole instead of leaving a version suffix behind. */
+  var NAME_EN = "(OpenAI['\u2019]s GPT(?:-?(?:4o?|5|3\\.?5)|\\s(?:4o?|5|3\\.?5))?" +
+    "|Chat\\s?GPT(?:-?(?:4o?|5|3\\.?5)|\\s(?:4o?|5|3\\.?5))?" +
+    "|OpenAI" +
+    "|GPT(?:-?(?:4o?|5|3\\.?5)|\\s(?:4o?|5|3\\.?5))?" +
+    "|GPT)";
+
+  /* Name token for the claimed identity (Urdu script, plus Latin name
+   * inside an Urdu sentence). Words may be joined by a space or a
+   * zero-width non-joiner. */
+  var NAME_UR = "(\u0686\u06cc\u0679[\\s\u200c]*\u062c\u06cc[\\s\u200c]*\u067e\u06cc[\\s\u200c]*\u0679\u06cc" +
+    "|\u0627\u0648\u067e\u0646[\\s\u200c]*\u0627\u06d2[\\s\u200c]*\u0622\u0626\u06cc" +
+    "|\u062c\u06cc[\\s\u200c]*\u067e\u06cc[\\s\u200c]*\u0679\u06cc(?:[\\s\u200c]*\u0641\u0648\u0631)?" +
+    "|Chat\\s?GPT(?:-?(?:4o?|5|3\\.?5)|\\s(?:4o?|5|3\\.?5))?" +
+    "|OpenAI)";
+
+  var WS_UR = "[\\s\u200c]+";
+
+  /* A span that must never be touched: fenced code, inline code,
+   * URLs, double-quoted text (straight or curly), single-quoted
+   * text naming ChatGPT/OpenAI/GPT. */
+  var PROTECTED_RE = /(```[\s\S]*?```|`[^`]*`|https?:\/\/[^\s<>"']+|www\.[^\s<>"']+|\u201c[^\u201d]*\u201d|"[^"]*"|'[^']*(?:Chat\s?GPT|OpenAI|GPT)[^']*')/g;
+
+  /* Sentence boundaries: . ! ? plus Urdu full stop / question mark.
+   * A period followed by a digit (GPT-3.5, 3.5) is not a boundary. */
+  var SENTENCE_RE = /([.!?\u06d4\u061f]+(?![0-9])[\s\t\r\n]*|\n+)/;
+
+  /* "created by OpenAI" left over in a sentence that already had a
+   * self-claim corrected (e.g. "I am ChatGPT, an AI assistant created
+   * by OpenAI"). Only applied when a rule below already changed the
+   * sentence, so third-person topic sentences such as "ChatGPT was
+   * created by OpenAI" are never touched. */
+  var CREATED_BY_RE = /(created|developed|built|made)\s+by\s+OpenAI/gi;
+
+  function normSubject(subj) {
+    var low = subj.toLowerCase();
+    if (low === 'i am') { return 'I am'; }
+    if (low === "i'm" || low === 'i\u2019m') { return "I'm"; }
+    if (low === 'i was') { return 'I was'; }
+    return subj;
+  }
+
+  /* Each rule: [RegExp, replacer(match, g1, g2, ...)].
+   * Rules carry an optional "(not\s+)?" group: a negated claim
+   * ("I am not ChatGPT", "My name is not ChatGPT") is returned
+   * unchanged. Order matters: specific frames before general ones. */
+  var RULES = [
+    /* EN: I am an OpenAI (AI) (language) model */
+    [new RegExp('\\b(I am|I\'m|I\u2019m)\\s+(not\\s+)?(an?\\s+)?OpenAI\\s+(AI\\s+)?(language\\s+)?model\\b', 'gi'),
+      function (m, subj, neg, art, ai, lang) {
+        if (neg) { return m; }
+        return normSubject(subj) + ' ENZO';
+      }],
+    /* EN: I am / I'm ChatGPT | OpenAI's GPT | OpenAI | GPT-4/4o/5/3.5 */
+    [new RegExp('\\b(I am|I\'m|I\u2019m)\\s+(not\\s+)?(an?\\s+|the\\s+)?' + NAME_EN + '(\\s+model)?\\b', 'gi'),
+      function (m, subj, neg, art, name, model) {
+        if (neg) { return m; }
+        return normSubject(subj) + ' ENZO';
+      }],
+    /* EN: My name is / My name's / Call me / I go by / I am known as */
+    [new RegExp('\\b(My name is|My name\'s|My name\u2019s|Call me|I go by|I am known as)\\s+(not\\s+)?' + NAME_EN + '\\b', 'gi'),
+      function (m, frame, neg, name) {
+        if (neg) { return m; }
+        return frame + ' ENZO';
+      }],
+    /* EN: I was / I am created|developed|built|made by OpenAI */
+    [new RegExp('\\b(I was|I am|I\'m|I\u2019m)\\s+(not\\s+)?(created|developed|built|made)\\s+by\\s+(OpenAI|Open\\s+AI)\\b', 'gi'),
+      function (m, subj, neg, verb, maker) {
+        if (neg) { return m; }
+        return normSubject(subj) + ' ' + verb + ' for Raja as ENZO';
+      }],
+    /* EN: OpenAI created|developed|built|made me */
+    [/\bOpenAI\s+(created|developed|built|made)\s+me\b/gi,
+      function (m, verb) {
+        return 'Raja ' + verb + ' me as ENZO';
+      }],
+    /* EN: As ChatGPT, I ... (comma required: "As ChatGPT becomes more
+       popular" is topic discussion and must pass through). */
+    [new RegExp('\\b(As)\\s+(Chat\\s?GPT|OpenAI)\\s*,', 'gi'),
+      function (m, asWord, name) {
+        return asWord + ' ENZO,';
+      }],
+    /* EN: As an AI language model built by OpenAI, I ... */
+    [new RegExp('\\b(As\\s+an?\\s+AI\\s+language\\s+model\\s+)(created|developed|built|made)\\s+by\\s+OpenAI\\b', 'gi'),
+      function (m, frame, verb) {
+        return frame + verb + ' for Raja as ENZO';
+      }],
+    /* Roman Urdu: mera naam / mera naan ChatGPT hai|he|ae */
+    [new RegExp('\\b(mera naam|mera naan)\\s+' + NAME_EN + '\\s+(hai|he|ae)\\b', 'gi'),
+      function (m, frame, name, copula) {
+        return frame + ' ENZO ' + copula;
+      }],
+    /* Roman Urdu / Punjabi: main|mein ChatGPT hoon|hun|haan|aan */
+    [new RegExp('\\b(main|mein)\\s+' + NAME_EN + '\\s+(hoon|hun|haan|aan)\\b', 'gi'),
+      function (m, subj, name, copula) {
+        return subj + ' ENZO ' + copula;
+      }],
+    /* Roman Urdu: mujhe OpenAI ne banaya hai|tha */
+    [/\b(mujhe)\s+OpenAI\s+ne\s+banaya\s+(hai|tha)\b/gi,
+      function (m, obj, tense) {
+        return obj + ' Raja ke liye ENZO ke tor par banaya gaya ' + tense;
+      }],
+    /* Roman Urdu: OpenAI ne mujhe banaya hai|tha */
+    [/\bOpenAI\s+ne\s+(mujhe)\s+banaya\s+(hai|tha)\b/gi,
+      function (m, obj, tense) {
+        return 'Raja ne ' + obj + ' ENZO ke tor par banaya ' + tense;
+      }],
+    /* Roman Urdu: main OpenAI ka banaya hua hoon|hun */
+    [/\b(main|mein)\s+OpenAI\s+ka\s+banaya\s+hua\s+(hoon|hun)\b/gi,
+      function (m, subj, copula) {
+        return subj + ' Raja ke liye ENZO ke tor par banaya gaya ' + copula;
+      }],
+    /* Urdu script: mera naam / mera naan ... hai|ae */
+    [new RegExp('(\u0645\u06cc\u0631\u0627 \u0646\u0627\u0645|\u0645\u06cc\u0631\u0627 \u0646\u0627\u06ba)' + WS_UR + NAME_UR + WS_UR + '(\u06c1\u06d2|\u0627\u06d2)', 'g'),
+      function (m, frame, name, copula) {
+        return frame + ' \u0627\u06cc\u0646\u0632\u0648 ' + copula;
+      }],
+    /* Urdu script: main ... hoon|haan|aan (incl. Punjabi) */
+    [new RegExp('(\u0645\u06cc\u06ba)' + WS_UR + NAME_UR + WS_UR + '(\u06c1\u0648\u06ba|\u06c1\u0627\u06ba|\u0622\u06ba)', 'g'),
+      function (m, subj, name, copula) {
+        return subj + ' \u0627\u06cc\u0646\u0632\u0648 ' + copula;
+      }],
+    /* Urdu script: mujhe OpenAI ne banaya hai|tha */
+    [new RegExp('(\u0645\u062c\u06be\u06d2)' + WS_UR + '\u0627\u0648\u067e\u0646[\\s\u200c]*\u0627\u06d2[\\s\u200c]*\u0622\u0626\u06cc' + WS_UR + '\u0646\u06d2' + WS_UR + '\u0628\u0646\u0627\u06cc\u0627' + WS_UR + '(\u06c1\u06d2|\u062a\u06be\u0627)', 'g'),
+      function (m, obj, tense) {
+        return obj + ' \u0631\u0627\u062c\u06c1 \u06a9\u06d2 \u0644\u06cc\u06d2 \u0627\u06cc\u0646\u0632\u0648 \u06a9\u06d2 \u0637\u0648\u0631 \u067e\u0631 \u0628\u0646\u0627\u06cc\u0627 \u06af\u06cc\u0627 ' + tense;
+      }],
+    /* Urdu script: OpenAI ne mujhe banaya hai|tha */
+    [new RegExp('\u0627\u0648\u067e\u0646[\\s\u200c]*\u0627\u06d2[\\s\u200c]*\u0622\u0626\u06cc' + WS_UR + '\u0646\u06d2' + WS_UR + '(\u0645\u062c\u06be\u06d2)' + WS_UR + '\u0628\u0646\u0627\u06cc\u0627' + WS_UR + '(\u06c1\u06d2|\u062a\u06be\u0627)', 'g'),
+      function (m, obj, tense) {
+        return '\u0631\u0627\u062c\u06c1 \u0646\u06d2 ' + obj + ' \u0627\u06cc\u0646\u0632\u0648 \u06a9\u06d2 \u0637\u0648\u0631 \u067e\u0631 \u0628\u0646\u0627\u06cc\u0627 ' + tense;
+      }]
+  ];
+
+  /* Apply every rule to one sentence. Afterwards, if a rule already
+   * changed the sentence, fix a leftover "created by OpenAI" in the
+   * same sentence (see CREATED_BY_RE note above). */
+  function correctSentence(text) {
+    var out = text;
+    var i;
+    for (i = 0; i < RULES.length; i++) {
+      RULES[i][0].lastIndex = 0;
+      out = out.replace(RULES[i][0], RULES[i][1]);
+    }
+    if (out !== text) {
+      CREATED_BY_RE.lastIndex = 0;
+      if (CREATED_BY_RE.test(out)) {
+        CREATED_BY_RE.lastIndex = 0;
+        out = out.replace(CREATED_BY_RE, function (m, verb) {
+          return verb + ' for Raja as ENZO';
+        });
+      }
+    }
+    return out;
+  }
+
+  /* Split an unprotected span into sentences (delimiters kept) and
+   * correct each piece. Splitting keeps the gate above sentence-local:
+   * a topic sentence never inherits a self-claim from its neighbour. */
+  function correctUnprotected(text) {
+    var parts = text.split(SENTENCE_RE);
+    var i;
+    for (i = 0; i < parts.length; i++) {
+      parts[i] = correctSentence(parts[i]);
+    }
+    return parts.join('');
+  }
+
+  function correctIdentity(answer) {
+    if (typeof answer !== 'string') { return answer; }
+    if (answer === '') { return answer; }
+    var out = '';
+    var last = 0;
+    var m;
+    PROTECTED_RE.lastIndex = 0;
+    while ((m = PROTECTED_RE.exec(answer)) !== null) {
+      if (m.index > last) {
+        out += correctUnprotected(answer.slice(last, m.index));
+      }
+      out += m[0];
+      last = m.index + m[0].length;
+    }
+    if (last < answer.length) {
+      out += correctUnprotected(answer.slice(last));
+    }
+    return out;
+  }
+
+  function needsCorrection(answer) {
+    if (typeof answer !== 'string') { return false; }
+    return correctIdentity(answer) !== answer;
+  }
+
+  return {
+    correctIdentity: correctIdentity,
+    needsCorrection: needsCorrection
+  };
+}));
+</script>
 <script>/* SELF-UPDATE — if the server already serves a newer build than the
    one this tab is running (a tab left open across a deploy, or a browser
    that kept a cached copy), refresh once to the live version so a phone
    never stays stuck on an old layout. Fails silently when offline. */
 (function(){
-  var ME='v61-deep-triggers-4lang', lastCheck=0;
+  var ME='v62-identity', lastCheck=0;
   function check(){
     var now=Date.now(); if(now-lastCheck<20000) return; lastCheck=now;
     try{
@@ -6575,14 +9441,14 @@ function buildPrompt(query, sources, lang, deep, historyText, fresh){
     else if(fresh && fresh.stale) focus+=' HONESTY FOR THIS ANSWER: the dated news results are NOT fresh — the newest dated item is from '+fresh.newestText+'. Your FIRST line must say plainly that no fresh news was found and give that newest date; do not present those older items as today\'s news.';
     else if(fresh && fresh.newestText) focus+=' The newest dated item in the results is from '+fresh.newestText+' — lead with the newest items.';
   }
-  return 'You are ENZO AI — a highly intelligent, warm research companion. SILENT TIME MEMORY (very important): '+timeContextString(new Date())+' You always KNOW the current date, time and part of day, and every previous message below carries its own timestamp in [brackets] — but this knowledge stays SILENT. NEVER mention the time, the date, the part of day, or when a question was asked in your answer. Only speak about time if the user explicitly asks about it (for example: when did we talk about this, what time is it, ye kab bola tha) — then answer from the timestamps exactly. GROUNDING RULES — these override every other instruction: (1) Answer ONLY from the retrieved page text below. Use ONLY facts, names, numbers, dates, versions, prices and quotes that actually appear in that text. (2) EVERY factual claim must carry the citation of the page whose text contains that claim — [1], [2] and so on — placed right after the claim. Never write a factual claim without its citation, and never cite a page for something its text does not say. (3) NEVER add facts from your own memory, never guess, never merge pages into a claim none of them makes, and NEVER state a date, version number, release, price or "latest" development unless those exact details appear in the retrieved text. (4) If the retrieved text does not cover the question, or does not cover part of it, say that plainly in one short line (for example: "The pages found do not cover this.") and answer only the part the text does cover — do not fill gaps with invention. (5) Answer the exact question asked. (9) UNDERSTANDING RULE: if the question itself is ambiguous between two clear meanings and the retrieved text does not settle which one is meant, do NOT pick one silently and do NOT guess — reply with ONLY one short clarifying question naming both meanings, nothing else: no answer, no citations. This clarifying-question exception applies ONLY when the local intent classifier (classifyIntent, intent.kind) has marked this message kind \'clarify\'; for every decided kind (research, definition, conversation, general) answer directly and never reply with a lone clarifying question. (7) NEVER INVERT A SOURCE: state every change, decision or direction exactly as the cited page text states it. If the page says something is getting stronger, rising, banned, delayed, rejected or still in place, your claim must say the same — never the opposite (never "lifted" when the page says "getting even stronger", never "approved" when the page says "rejected", never "fell" when the page says "rose"). Before writing any claim about a change, a ban, an approval, a price move or a decision, check the page\'s own verbs and negations and copy their direction.'+focus+' (6) NEVER REPEAT THE QUESTION: never quote, restate, paraphrase or even mention the question anywhere in the answer — no "your question about…", no "aap ke sawal…", no "here is the answer to…", and never use the question as a heading or opening line. Your VERY FIRST line must be the answer itself — the main point, immediately, nothing before it. '+langInstrFor(lang)+' '+style+'\nQuestion type: '+analysis.type+(enQ?'\nEnglish meaning of the question (for your understanding): '+enQ:'')+'\n\nCurrent moment: '+nowTl.full+'\n\nPrevious conversation (each line starts with when it happened):\n'+historyText+'\n\nQuestion (asked now, '+nowTl.full+'): '+query+'\n\nRetrieved pages (the ONLY facts you may use):\n'+srcText+'\n\nIf the user asked for platform work (a gig, proposal, profile, post, reply draft, SEO plan or article), deliver the complete ready-to-use work step by step in full detail, state plainly the one final step that needs the user\'s own login or tap, and never claim you posted, published, sent or uploaded anything. NEVER REFUSE ORDERED WORK: never refuse an order and never give up on it — if one route is blocked, use another route; if something is genuinely impossible right now, state the exact blocker and exactly what you need from the user, and continue the moment the user provides it. Now write the answer, grounded only in those pages, with a citation after every factual claim:';
+  return EnzoIdentity.withIdentity('You are ENZO AI — a highly intelligent, warm research companion. SILENT TIME MEMORY (very important): '+timeContextString(new Date())+' You always KNOW the current date, time and part of day, and every previous message below carries its own timestamp in [brackets] — but this knowledge stays SILENT. NEVER mention the time, the date, the part of day, or when a question was asked in your answer. Only speak about time if the user explicitly asks about it (for example: when did we talk about this, what time is it, ye kab bola tha) — then answer from the timestamps exactly. GROUNDING RULES — these override every other instruction: (1) Answer ONLY from the retrieved page text below. Use ONLY facts, names, numbers, dates, versions, prices and quotes that actually appear in that text. (2) EVERY factual claim must carry the citation of the page whose text contains that claim — [1], [2] and so on — placed right after the claim. Never write a factual claim without its citation, and never cite a page for something its text does not say. (3) NEVER add facts from your own memory, never guess, never merge pages into a claim none of them makes, and NEVER state a date, version number, release, price or "latest" development unless those exact details appear in the retrieved text. (4) If the retrieved text does not cover the question, or does not cover part of it, say that plainly in one short line (for example: "The pages found do not cover this.") and answer only the part the text does cover — do not fill gaps with invention. (5) Answer the exact question asked. (9) UNDERSTANDING RULE: if the question itself is ambiguous between two clear meanings and the retrieved text does not settle which one is meant, do NOT pick one silently and do NOT guess — reply with ONLY one short clarifying question naming both meanings, nothing else: no answer, no citations. This clarifying-question exception applies ONLY when the local intent classifier (classifyIntent, intent.kind) has marked this message kind \'clarify\'; for every decided kind (research, definition, conversation, general) answer directly and never reply with a lone clarifying question. (7) NEVER INVERT A SOURCE: state every change, decision or direction exactly as the cited page text states it. If the page says something is getting stronger, rising, banned, delayed, rejected or still in place, your claim must say the same — never the opposite (never "lifted" when the page says "getting even stronger", never "approved" when the page says "rejected", never "fell" when the page says "rose"). Before writing any claim about a change, a ban, an approval, a price move or a decision, check the page\'s own verbs and negations and copy their direction.'+focus+' (6) NEVER REPEAT THE QUESTION: never quote, restate, paraphrase or even mention the question anywhere in the answer — no "your question about…", no "aap ke sawal…", no "here is the answer to…", and never use the question as a heading or opening line. Your VERY FIRST line must be the answer itself — the main point, immediately, nothing before it. '+langInstrFor(lang)+' '+style+'\nQuestion type: '+analysis.type+(enQ?'\nEnglish meaning of the question (for your understanding): '+enQ:'')+'\n\nCurrent moment: '+nowTl.full+'\n\nPrevious conversation (each line starts with when it happened):\n'+historyText+'\n\nQuestion (asked now, '+nowTl.full+'): '+query+'\n\nRetrieved pages (the ONLY facts you may use):\n'+srcText+'\n\nIf the user asked for platform work (a gig, proposal, profile, post, reply draft, SEO plan or article), deliver the complete ready-to-use work step by step in full detail, state plainly the one final step that needs the user\'s own login or tap, and never claim you posted, published, sent or uploaded anything. NEVER REFUSE ORDERED WORK: never refuse an order and never give up on it — if one route is blocked, use another route; if something is genuinely impossible right now, state the exact blocker and exactly what you need from the user, and continue the moment the user provides it. Now write the answer, grounded only in those pages, with a citation after every factual claim:');
 }
 function buildKnowledgePrompt(query, lang, deep, historyText){
   var analysis=analyzeQuestion(query);
   var enQ=romanToEnglish(query);
   var nowTl=timeLabelFor(Date.now());
   var style = deep ? 'Write a LONG, detailed report with headings: ## Introduction, ## Key Details, ## Deep Analysis, ## Examples, ## Practical Advice, ## Conclusion. Use bullets.' : 'Write a SHORT answer — the main point only, in a few lines: one short paragraph and at most 4-5 one-line bullets. No headings, no essay. Detail only when the user asks a follow-up. '+typeGuidance(analysis.type);
-  return 'You are ENZO AI — a highly intelligent, warm companion with broad knowledge of the world: science, history, Pakistan and world affairs, Islam, technology, business, health basics, education, sports, everyday life, everything. SILENT TIME MEMORY (very important): '+timeContextString(new Date())+' You always KNOW the current date, time and part of day, and every previous message below carries its timestamp in [brackets] — but keep this knowledge SILENT: NEVER mention the time, date, part of day, or when something was asked in your answer, unless the user explicitly asks about time or when a conversation happened — then answer from those timestamps exactly. GOLDEN RULES: (1) When the question is clear, answer confidently from your knowledge and reasoning — briefly, main point first. (2) UNDERSTANDING RULE — this overrides everything else: if the question is unclear, ambiguous, has two plausible meanings, names no concrete topic, or contains a typo that changes its meaning, do NOT guess and do NOT answer it — reply with ONLY one short clarifying question that names the two most likely meanings, so the user can answer in one word. This exception applies ONLY when the local intent classifier (classifyIntent, intent.kind) has marked this message kind \'clarify\'; for every decided kind (research, definition, conversation, general) answer directly and never reply with a lone clarifying question. Never fill a gap in understanding with your own knowledge presented as fact. (3) If the question is in Roman Urdu, understand its meaning (English meaning given below) and think in English, then answer in Roman Urdu. (4) For fast-changing facts (prices, scores, news, release dates, versions as of today) NEVER present invented or guessed specifics as current facts: give only the most recent picture you genuinely know, make clear it comes from your own knowledge and may have changed, and never invent a date, version number, release or price. (6) NEVER claim that you searched, browsed, researched, checked or consulted any websites, pages or sources, and NEVER state any number of websites or sources — this answer comes ONLY from your own knowledge. If the user asked for research from a certain number of websites, do NOT repeat that number as if the research happened; simply answer the topic itself, briefly. (5) NEVER REPEAT THE QUESTION: never quote, restate, paraphrase or even mention the question anywhere in the answer — no "your question about…", no "aap ke sawal…", no "here is the answer to…", and never use the question as a heading or opening line. Your VERY FIRST line must be the answer itself — the main point, immediately, nothing before it. '+langInstrFor(lang)+' '+style+'\nQuestion type: '+analysis.type+(enQ?'\nEnglish meaning of the question: '+enQ:'')+'\n\nCurrent moment: '+nowTl.full+'\n\nPrevious conversation (each line starts with when it happened):\n'+historyText+'\n\nQuestion (asked now, '+nowTl.full+'): '+query+'\n\nPLATFORM WORK RULE: when the user asks for work on any platform (Fiverr, Upwork, Freelancer, TikTok, YouTube, Instagram, Facebook, a website, or any other) — a gig, proposal, profile, post, reply draft, SEO audit, keyword plan, article prepared for upload, or anything else — produce the COMPLETE ready-to-use work, step by step and in full detail, in the user\'s language: the actual finished text they can paste and use, not advice about writing it. End by stating plainly the one final step that needs the user\'s own login or tap (such as posting or publishing it) — and NEVER claim you posted, published, sent or uploaded anything yourself.\n\nNEVER REFUSE ORDERED WORK (the most important behaviour rule): when the user orders work, never refuse, never say you will not do it, and never give up on it. Always try: if one route is blocked, find another route; if something is genuinely impossible right now, say exactly what is blocking it and exactly what you need from the user, and continue the moment the user provides it. Never stall silently and never hide behind a refusal.\n\nWrite your best, complete answer now:';
+  return EnzoIdentity.withIdentity('You are ENZO AI — a highly intelligent, warm companion with broad knowledge of the world: science, history, Pakistan and world affairs, Islam, technology, business, health basics, education, sports, everyday life, everything. SILENT TIME MEMORY (very important): '+timeContextString(new Date())+' You always KNOW the current date, time and part of day, and every previous message below carries its timestamp in [brackets] — but keep this knowledge SILENT: NEVER mention the time, date, part of day, or when something was asked in your answer, unless the user explicitly asks about time or when a conversation happened — then answer from those timestamps exactly. GOLDEN RULES: (1) When the question is clear, answer confidently from your knowledge and reasoning — briefly, main point first. (2) UNDERSTANDING RULE — this overrides everything else: if the question is unclear, ambiguous, has two plausible meanings, names no concrete topic, or contains a typo that changes its meaning, do NOT guess and do NOT answer it — reply with ONLY one short clarifying question that names the two most likely meanings, so the user can answer in one word. This exception applies ONLY when the local intent classifier (classifyIntent, intent.kind) has marked this message kind \'clarify\'; for every decided kind (research, definition, conversation, general) answer directly and never reply with a lone clarifying question. Never fill a gap in understanding with your own knowledge presented as fact. (3) If the question is in Roman Urdu, understand its meaning (English meaning given below) and think in English, then answer in Roman Urdu. (4) For fast-changing facts (prices, scores, news, release dates, versions as of today) NEVER present invented or guessed specifics as current facts: give only the most recent picture you genuinely know, make clear it comes from your own knowledge and may have changed, and never invent a date, version number, release or price. (6) NEVER claim that you searched, browsed, researched, checked or consulted any websites, pages or sources, and NEVER state any number of websites or sources — this answer comes ONLY from your own knowledge. If the user asked for research from a certain number of websites, do NOT repeat that number as if the research happened; simply answer the topic itself, briefly. (5) NEVER REPEAT THE QUESTION: never quote, restate, paraphrase or even mention the question anywhere in the answer — no "your question about…", no "aap ke sawal…", no "here is the answer to…", and never use the question as a heading or opening line. Your VERY FIRST line must be the answer itself — the main point, immediately, nothing before it. '+langInstrFor(lang)+' '+style+'\nQuestion type: '+analysis.type+(enQ?'\nEnglish meaning of the question: '+enQ:'')+'\n\nCurrent moment: '+nowTl.full+'\n\nPrevious conversation (each line starts with when it happened):\n'+historyText+'\n\nQuestion (asked now, '+nowTl.full+'): '+query+'\n\nPLATFORM WORK RULE: when the user asks for work on any platform (Fiverr, Upwork, Freelancer, TikTok, YouTube, Instagram, Facebook, a website, or any other) — a gig, proposal, profile, post, reply draft, SEO audit, keyword plan, article prepared for upload, or anything else — produce the COMPLETE ready-to-use work, step by step and in full detail, in the user\'s language: the actual finished text they can paste and use, not advice about writing it. End by stating plainly the one final step that needs the user\'s own login or tap (such as posting or publishing it) — and NEVER claim you posted, published, sent or uploaded anything yourself.\n\nNEVER REFUSE ORDERED WORK (the most important behaviour rule): when the user orders work, never refuse, never say you will not do it, and never give up on it. Always try: if one route is blocked, find another route; if something is genuinely impossible right now, say exactly what is blocking it and exactly what you need from the user, and continue the moment the user provides it. Never stall silently and never hide behind a refusal.\n\nWrite your best, complete answer now:');
 }
 function callAIOnce(prompt, model){
   /* The prompt travels in the POST BODY — never in a URL. A prompt carries
@@ -6590,7 +9456,7 @@ function callAIOnce(prompt, model){
      of that may sit in a request line where servers and proxies log it. */
   var ctl=('AbortController' in window)?new AbortController():null;
   var to=ctl?setTimeout(function(){ ctl.abort(); },45000):null;
-  return fetch('https://text.pollinations.ai/', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:model||'openai', messages:[{role:'user', content:prompt}]}), signal:ctl?ctl.signal:undefined}).then(function(r){ if(to) clearTimeout(to); if(!r.ok) throw new Error('ai'); return r.text(); }).then(function(t){
+  return fetch('https://text.pollinations.ai/', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:model||'openai', messages:EnzoIdentity.buildMessages(prompt)}), signal:ctl?ctl.signal:undefined}).then(function(r){ if(to) clearTimeout(to); if(!r.ok) throw new Error('ai'); return r.text(); }).then(function(t){
     t=(t||'').trim();
     if(!t || t.length<40) throw new Error('empty');
     if(/pollinations|powered by|🌸/i.test(t.slice(-300)) && t.length<200) throw new Error('junk');
@@ -6948,7 +9814,7 @@ function megaFallbackHtml(mega, items, lang){
 function megaAnswer(text, mega, items, lang){
   var listText=items.slice(0,160).map(function(s,i){ return (i+1)+'. '+s.title+' — '+s.url+' — '+((s.snippet||'').slice(0,130)); }).join('\n');
   var topN = items.length>40 ? 20 : 10;
-  var prompt='You are ENZO AI doing a MEGA Deep Research ranking — clean and professional, no broken lines. The user asked for '+mega.count+' '+mega.entity+' on this topic: "'+text+'". Across multiple search batches over the whole internet, '+items.length+' unique REAL results were collected (numbered list below). Analyze ALL of them and deliver a BEST-OF-THE-BEST ranking of the top '+topN+', ranked best first. Format: first ONE line stating exactly how many unique '+mega.entity+' were researched and analyzed ('+items.length+'). Then a heading ## Best of the Best, then the ranked list — each entry: name, its number from the list like [n], and ONE short line on why it ranks there. Then a short ## How These Were Ranked note (criteria: relevance to the topic, popularity/authority, quality). GROUNDING: rank ONLY entries from the numbered list below, describe each entry ONLY with what its list line actually says, and put its [n] citation on every entry. NEVER invent entries that are not in the list, never invent subscriber counts, dates, prices or statistics, and never claim a fact about an entry that its list line does not contain. '+langInstrFor(lang)+'\n\nCollected results:\n'+listText+'\n\nNow write the ranking:';
+  var prompt=EnzoIdentity.withIdentity('You are ENZO AI doing a MEGA Deep Research ranking — clean and professional, no broken lines. The user asked for '+mega.count+' '+mega.entity+' on this topic: "'+text+'". Across multiple search batches over the whole internet, '+items.length+' unique REAL results were collected (numbered list below). Analyze ALL of them and deliver a BEST-OF-THE-BEST ranking of the top '+topN+', ranked best first. Format: first ONE line stating exactly how many unique '+mega.entity+' were researched and analyzed ('+items.length+'). Then a heading ## Best of the Best, then the ranked list — each entry: name, its number from the list like [n], and ONE short line on why it ranks there. Then a short ## How These Were Ranked note (criteria: relevance to the topic, popularity/authority, quality). GROUNDING: rank ONLY entries from the numbered list below, describe each entry ONLY with what its list line actually says, and put its [n] citation on every entry. NEVER invent entries that are not in the list, never invent subscriber counts, dates, prices or statistics, and never claim a fact about an entry that its list line does not contain. '+langInstrFor(lang)+'\n\nCollected results:\n'+listText+'\n\nNow write the ranking:');
   return callAI(prompt).then(function(aiText){
     /* The ranking's [n] citations point into the collected list — keep exactly the
        cited entries, renumbered in citation order, as this answer's sources, so a
@@ -7112,6 +9978,21 @@ function askQuestion(text, viaVoice, forcedDeep){
   if(!chat){ chat=createChat(text.slice(0,42)); }
   if(chat.messages.length===0) chat.title=text.slice(0,42);
   var lang = detectLang(text);
+  /* Identity fast path (piece 31): a whole-message name question is
+     answered locally as ENZO and never reaches the model. */
+  if (typeof EnzoIdentity !== 'undefined' && EnzoIdentity.answerNameQuestion) {
+    var nameReply = EnzoIdentity.answerNameQuestion(text, lang);
+    if (nameReply) {
+      state.usage++; $('usageText').textContent = state.usage;
+      var nmTl = timeLabelFor(Date.now());
+      var nmMsg = {role:'ai', html:mdToHtml(nameReply), plain:nameReply, viaVoice:askViaVoice, question:text, sources:[], deep:false, modeWhy:'Instant reply — name question, answered as ENZO without a web search', auto:false, followups:[], lang:lang, ts:Date.now(), daypart:nmTl.daypart, daypartRoman:nmTl.daypartRoman, timeLabel:nmTl.full};
+      chat.messages.push(nmMsg); renderMessages(); saveChats();
+      setCentreEnzo('success');
+      setTimeout(function(){ if(!state.isGenerating) setCentreEnzo('idle'); }, 2800);
+      (window.EnaoV54Voice ? window.EnaoV54Voice.patchDirectSpeak(nmMsg, answersMode()) : maybeSpeak(nmMsg));
+      return;
+    }
+  }
   /* v57-universal-intel: ONE central pipeline. Every input is funnelled
      through normalize -> context -> reasoning -> routing BEFORE any old
      gate answers it. Advisory only in v57: records chat.uniAnalysis;
@@ -7484,6 +10365,9 @@ function flushVoiceQueue(){
   setTimeout(function(){ sendCurrent(); }, 200);
 }
 function maybeSpeak(msg){
+  if (msg && msg.plain && window.EnzoIdentityGuard) {
+    msg.plain = window.EnzoIdentityGuard.correctIdentity(msg.plain);
+  }
   if(msg && msg.viaVoice && msg.question && wantsTextReply(msg.question)){
     if(state.voiceLive) setVoiceState('on');
     flushVoiceQueue();
@@ -7574,6 +10458,8 @@ function stopLevelMeter(){
 
 /* Speaking — while ENZO talks, the speaking state shows only on the mic button (teal pulsing rings + speaker icon) */
 function speakText(text, lang){
+  text = (window.EnzoIdentityGuard
+    ? window.EnzoIdentityGuard.correctIdentity(text) : text);
   if(!('speechSynthesis' in window) || !text) { afterSpeaking(); return; }
   try{
     window.speechSynthesis.cancel();
@@ -8272,7 +11158,7 @@ function fileToScaledDataUrl(file, maxDim){
   });
 }
 function describeImage(dataUrl){
-  return fetch('https://text.pollinations.ai/', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:'openai', messages:[{role:'user', content:[{type:'text', text:'Describe this image in detail — what is shown, any visible text, objects, people, colors and the overall scene. Be accurate and specific.'},{type:'image_url', image_url:{url:dataUrl}}]}]})})
+  return fetch('https://text.pollinations.ai/', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:'openai', messages:[{role:'system', content:EnzoIdentity.ENZO_IDENTITY},{role:'user', content:[{type:'text', text:'Describe this image in detail — what is shown, any visible text, objects, people, colors and the overall scene. Be accurate and specific.'},{type:'image_url', image_url:{url:dataUrl}}]}]})})
     .then(function(r){ if(!r.ok) throw new Error('vision'); return r.text(); })
     .then(function(t){ try{ var j=JSON.parse(t); if(j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) return j.choices[0].message.content; }catch(e){} return t; });
 }
@@ -15821,7 +18707,7 @@ function urduCharRatio(t){
 function rewritePassage(text, lang){
   var target = lang==='urdu' ? 'Urdu script (Nastaliq Urdu)' : 'Roman Urdu (Urdu written in Latin letters only)';
   var prompt='Rewrite the following text in '+target+'. STRICT RULES: keep every fact, name, number, date and price exactly the same; keep every citation marker like [1] or [2] exactly where it is; do not add, remove or explain anything; do not mix scripts; output ONLY the rewritten text.\n\n'+text;
-  return fetch('https://text.pollinations.ai/', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:'openai', messages:[{role:'user', content:prompt}]})})
+  return fetch('https://text.pollinations.ai/', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:'openai', messages:EnzoIdentity.buildMessages(prompt)})})
     .then(function(r){ if(!r.ok) throw new Error('ai'); return r.text(); })
     .then(function(t){
       t=(t||'').trim();
@@ -15885,6 +18771,21 @@ function localizeAnswer(text, lang){
 /* ---------------- delivering answers ---------------- */
 function deliverAnswer(ctx, rawText, sources, backendMode, taskId){
   return localizeAnswer(rawText, ctx.lang).then(function(text2){
+    text2 = (window.EnzoIdentityGuard
+      ? window.EnzoIdentityGuard.correctIdentity(text2) : text2);
+    /* v62-learning: pre-delivery correction guard (piece 44). A draft that
+       only repeats a corrected mistake is never delivered; other drafts
+       have the offending sentence removed. */
+    try{
+      if(window.CorrectionGuard && window.EnzoTeaching && typeof enzoLearningDeliverBlocked==='function'){
+        var gCheck=CorrectionGuard.checkAnswer(text2, EnzoTeaching.createLearnedStore().getItems());
+        if(gCheck && gCheck.violations && gCheck.violations.length){
+          var gFix=CorrectionGuard.fixAnswer(text2, gCheck);
+          if(gFix && gFix.blocked) return enzoLearningDeliverBlocked(ctx, gCheck.violations);
+          if(gFix && gFix.fixed) text2=gFix.fixed;
+        }
+      }
+    }catch(e){}
     ctx.delivered=true;
     var isResearch=backendMode==='research';
     var msg=aiMsgShell(ctx, text2, {
@@ -16354,7 +19255,7 @@ var learned=learnedLoad();
 function learnedSave(){ try{ localStorage.setItem(LEARN_KEY, JSON.stringify(learned)); }catch(e){} }
 function dominantLang(){ var best='', n=0; for(var k in learned.langs){ if(learned.langs[k]>n){ n=learned.langs[k]; best=k; } } return n>=3?best:''; }
 function learnedTopTopics(n){ return Object.keys(learned.topics).sort(function(a,b){ return learned.topics[b]-learned.topics[a]; }).slice(0,n); }
-function learnedPrefs(){ return {language:dominantLang()||'auto', length:learned.lengthPref||'auto', topics:learnedTopTopics(5)}; }
+function learnedPrefs(){ var p={language:dominantLang()||'auto', length:learned.lengthPref||'auto', topics:learnedTopTopics(5)}; try{ var ln=(typeof enzoLearningNoteBlocks==='function')?enzoLearningNoteBlocks():''; if(ln) p.learned_note=ln; }catch(e){} return p; }
 function learnedNote(){
   var bits=[];
   var dom=dominantLang();
@@ -16362,6 +19263,8 @@ function learnedNote(){
   if(learned.lengthPref) bits.push('prefers '+learned.lengthPref+' answers');
   var tops=learnedTopTopics(6); if(tops.length) bits.push('interests: '+tops.join(', '));
   if(learned.corrections.length) bits.push('past corrections from the user (never repeat these mistakes): '+learned.corrections.slice(0,3).map(function(c){ return '"'+c.text+'"'; }).join('; '));
+  /* v62-learning: taught items + active corrections (pieces 41/44) reach every legacy prompt too. */
+  try{ var lb=(typeof enzoLearningNoteBlocks==='function')?enzoLearningNoteBlocks():''; if(lb) bits.push(lb); }catch(e){}
   if(!bits.length) return '';
   return '\n\n[Learned from this user across all chats — apply silently: '+bits.join('. ')+'.]';
 }
@@ -16410,6 +19313,18 @@ function renderLearned(){
   });
   var clr=$('learnedClear');
   if(clr) clr.onclick=function(){ learned={langs:{en:0,roman:0,urdu:0}, lengthPref:'', topics:{}, corrections:[]}; learnedSave(); renderLearned(); toast('Everything ENZO learned has been deleted'); };
+  /* v62-learning: explicit learned items (pieces 41/43) under the existing rows. */
+  try{
+    if(window.EnzoSettingsLearned && window.EnzoTeaching && typeof document!=='undefined'){
+      var lrnBox=document.createElement('div'); lrnBox.id='learnedItemsBox';
+      box.appendChild(lrnBox);
+      var lrnStore=EnzoTeaching.createLearnedStore();
+      /* Adapter: piece 44 stores a correction's detail as {wrong,right};
+         piece 43 renders detail as a string, so it gets the wrong part. */
+      var lrnAdapter={ getItems:function(){ return lrnStore.getItems().map(function(it){ var d=it.detail; if(d && typeof d==='object'){ var c={}; for(var k in it) c[k]=it[k]; c.detail=d.wrong||''; return c; } return it; }); }, deleteItem:function(id){ return lrnStore.deleteItem(id); }, clearAll:function(){ return lrnStore.clearAll(); } };
+      EnzoSettingsLearned.renderLearnedItems(lrnBox, lrnAdapter, { onItemsChanged:function(){ try{ renderLearned(); }catch(e){} } });
+    }
+  }catch(e){}
 }
 
 /* ---------------- reminders ----------------
@@ -18335,6 +21250,11 @@ window.askQuestion=function(text, viaVoice, forcedDeep){
   if(raw.trim() && typeof forcedDeep!=='boolean'
      && !(typeof state!=='undefined' && state.pendingFiles && state.pendingFiles.length)
      && !(chat && (chat.pendingConfirm || chat.pendingClarify || chat.pendingReminder))){
+    /* v62-learning: teaching / directed-learning / forget orders are handled
+       BEFORE intent routing (shouldClarify / classifyIntent). When handled,
+       the reply is delivered here and the message never enters the
+       research pipeline. */
+    try{ if(typeof enzoLearningIntercept==='function' && enzoLearningIntercept(raw, chat, viaVoice)) return; }catch(e){}
     /* v59-live-research-fix (Piece 31 [2]): EnzoResearchTriggers.shouldClarify runs FIRST, before vagueCheck / classifyIntent. clarify === false skips this gate entirely; a research order proceeds as Deep Research so it never receives the Normal badge (the kind is derived from the trigger result). clarify === true asks result.question, already in the user's language (clarifyQuestion() is the fallback). */
     var trig59b=null;
     try{ if(window.EnzoResearchTriggers) trig59b=window.EnzoResearchTriggers.shouldClarify(raw); }catch(e){}
@@ -26680,7 +29600,7 @@ var CV_ENZO_URDU = ['کیا حال ہے', 'کیا حال ہیں', 'کیا حال
   'کتنے ٹائم میں ہو جائے گا', 'کتنا ٹائم لگے گا',
   'یہ کام کب ہو جائے گا', 'کب تک ہو جائے گا',
   'کتنی دیر میں ہو جائے گا', 'کتنا ٹائم اور لگے گا', 'تم کون ہو',
-  'آپ کون ہو'];
+  'آپ کون ہو', 'توں کون ایں', 'توں کون اے', 'تسی کون او'];
 function cvIsAboutEnzo(text) {
   var raw = String(text || '');
   if (!cvTrim(raw)) return false;
@@ -48191,6 +51111,9 @@ function vrConversationKind(text) {
   if (/کتنا ٹائم اور لگے گا/.test(raw)) return 'done';
   if (/تم کون ہو/.test(raw)) return 'who';
   if (/آپ کون ہو/.test(raw)) return 'who';
+  if (/توں کون ایں/.test(raw)) return 'who';
+  if (/توں کون اے/.test(raw)) return 'who';
+  if (/تسی کون او/.test(raw)) return 'who';
   if (words <= 8 && /کیا ہو رہا ہے/.test(raw)) return 'howru';
   return null;
 }
@@ -48215,6 +51138,7 @@ function vrReplyLang(text, lang) {
   }
   if (vrHasUrdu(text)) return 'urdu';
   if (/\b(kya|kia|kar|rahe|rahe ho|ho|hai|kaam|kidhar|kahan|kab|kitne|tum|aap|abhi|kaunsa|konsa|kis|kaise|kesay)\b/i.test(String(text || ''))) return 'roman';
+  if (/[\u0600-\u06FF]/.test(String(text || '')) && /(\u0646\u0627\u06ba|\u062a\u0648\u06ba|\u062a\u0633\u06cc|\u062a\u0648\u0627\u0688\u0627|\u062a\u06cc\u0646\u0648\u06ba|\u06a9\u0648\u0646 \u0627\u06cc\u06ba|\u06a9\u0648\u0646 \u0627\u06d2)/.test(String(text || ''))) return 'punjabi';
   return 'en';
 }
 function vrCleanTask(task) {
@@ -48270,6 +51194,18 @@ function conversationReply(text, lang, ctx) {
       done: 'This will be finished soon, I am working on it.',
       who: 'I am ENZO, your assistant. I am right here to help you.',
       general: 'I am right here, talking with you.'
+    },
+    punjabi: {
+      howru: 'میں بالکل ٹھیک آں، پچھن دا شکریہ۔ تسی دسو، میں تواڈی کی مدد کر سکدا آں۔',
+      doing: busy ? 'میں ایتھے آں، تواڈے نال گل کر ریا آں۔' : 'میں ایتھے آں، تواڈے نال گل کر ریا آں۔ کوئی کم ہووے تے دسو۔',
+      going: 'میں کتے نئیں جا ریا، ایتھے آں تواڈے نال۔',
+      where: 'میں ایتھے آں، تواڈے نال گل کر ریا آں۔',
+      whichwork: busy ? 'ایس ویلے میں ' + task + ' کر ریا آں۔' : 'ایس ویلے میں کسے خاص کم تے نئیں آں۔ تسی دسو، کی کرنا اے۔',
+      how: 'میں کم قدم بہ قدم کردا آں، آرام نال تے پوری توجہ نال۔',
+      started: 'میں ایس کم تے کم شروع کر دتا اے، تے ایسے تے لگیا ہویا آں۔',
+      done: 'ایہ کم جلدی مکمل ہو جاوے گا، میں ایس تے لگیا ہویا آں۔',
+      who: 'میں اینزو آں، تواڈا اسسٹنٹ۔ میں ایتھے آں تواڈی مدد لئی۔',
+      general: 'میں ایتھے آں، تواڈے نال گل کر ریا آں۔'
     }
   };
   var set = R[L] || R.en;
