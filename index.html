@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<meta name="enao-build" content="v63-voice-lang">
+<meta name="enao-build" content="v64-voice-live">
 <meta name="enao-build" content="v63-fixes">
 <meta name="enao-build" content="v62-backend-fix">
 <meta name="enao-build" content="v62-learning">
@@ -9390,7 +9390,7 @@ var state = {
   chats: [], activeId: null, deep: false, pendingMode: 'auto', alwaysDeep: false, voiceReply: true, sourcesOn: true,
   usage: 0, renameId: null, langPref: 'auto', isListening: false, isGenerating: false,
   voiceLive: false, voiceState: 'off', isSpeaking: false, recogWanted: false,
-  nextAskViaVoice: false, currentAskViaVoice: false, voiceQueue: '',
+  nextAskViaVoice: false, currentAskViaVoice: false, voiceQueue: '', voiceQueuePosted: false,
   folderFilter: 'all', pendingFiles: [], streamTimer: null, stopRequested: false,
   voiceVolume: 1, notifOn: true, nearBottom: true, menuChatId: null,
   lastTypeAt: 0, speechOwner: 'none'
@@ -11634,7 +11634,7 @@ function sendCurrent(){
   }
 }
 
-function askQuestion(text, viaVoice, forcedDeep){
+function askQuestion(text, viaVoice, forcedDeep, opts){
   var askViaVoice=!!viaVoice;
   state.currentAskViaVoice=askViaVoice;
   state.stopRequested=false;
@@ -11645,6 +11645,7 @@ function askQuestion(text, viaVoice, forcedDeep){
   if(chat.messages.length===0) chat.title=text.slice(0,42);
   var lang = (window.EnzoLang45 ? window.EnzoLang45.askLang(text, state.langPref, detectLang) : detectLang(text));
   state.lastAnswerLang = lang;
+  try{ if(window.EnzoVoiceFix42 && window.EnzoVoiceFix42.resetSayAgainLoop) window.EnzoVoiceFix42.resetSayAgainLoop(); }catch(e){}
   try{ if(typeof recognition!=='undefined' && recognition && state.voiceLive && window.EnzoLang46) recognition.lang = window.EnzoLang46.recognitionLangFor(lang); }catch(e){}
   /* Identity fast path (piece 31): a whole-message name question is
      answered locally as ENZO and never reaches the model. */
@@ -11678,7 +11679,16 @@ function askQuestion(text, viaVoice, forcedDeep){
   try{ chat.uniAnalysis={funnel:uniFun57, normalized:uniNorm57, reason:uniReason57, route:uniRoute57, tool:uniTool57, knowledge:uniKnow57, outputType:uniGen57, at:Date.now()}; }catch(e){}
   var askNow=new Date(); var askTl=timeLabelFor(askNow.getTime());
   var fileCtx=files.map(function(f){ return f.text?('\n\n--- Attached file: '+f.name+' ---\n'+f.text.slice(0,6000)):'\n\n[Attached file: '+f.name+' ('+f.kind+') — no readable text could be extracted from it]'; }).join('');
-  chat.messages.push({role:'user', text:text, lang:lang, viaVoice:askViaVoice, ts:askNow.getTime(), daypart:askTl.daypart, daypartRoman:askTl.daypartRoman, timeLabel:askTl.full, files:files.map(function(f){return {name:f.name, kind:f.kind, dataUrl:f.dataUrl||''};})});
+  var userMsg={role:'user', text:text, lang:lang, viaVoice:askViaVoice, ts:askNow.getTime(), daypart:askTl.daypart, daypartRoman:askTl.daypartRoman, timeLabel:askTl.full, files:files.map(function(f){return {name:f.name, kind:f.kind, dataUrl:f.dataUrl||''};})};
+  if(askViaVoice) userMsg.status='sent'; /* P48: a mic/call message is a SENT message. The double-tick foot is rendered for every role:'user' message by buildMessageEl (L9908); status:'sent' records it explicitly. Typed messages (viaVoice false) get no status key — unchanged. */
+  if(opts && opts.alreadyPosted){
+    /* P48: this text was already posted as a sent message by postMicSentMessage while ENZO was busy — do not push a duplicate; just clear the pending-answer mark on every posted-but-unanswered mic message. */
+    var _pmFound=false;
+    for(var _pi=chat.messages.length-1; _pi>=0; _pi--){ if(chat.messages[_pi].role==='user' && chat.messages[_pi].pendingAnswer){ delete chat.messages[_pi].pendingAnswer; _pmFound=true; } }
+    if(!_pmFound) chat.messages.push(userMsg);
+  } else {
+    chat.messages.push(userMsg);
+  }
   renderChatList(); renderMessages(true); saveChats();
   /* Greetings and small talk: instant friendly reply from ENZO's own
      knowledge — NO live search, NO Wikipedia, NO generating pipeline. Only
@@ -12022,7 +12032,7 @@ function wantsTextReply(text){
    message; nothing waits unsent in the box and nothing is lost. */
 function flushVoiceQueue(){
   if(window.EnzoVoiceFix42 && window.EnzoVoiceFix42.flushVoiceQueueFixed){
-    window.EnzoVoiceFix42.flushVoiceQueueFixed(state, {send:function(q){ $('input').value=q; autoGrow(); syncSendBtn(); if(!state.voiceLive) return; state.nextAskViaVoice=true; setTimeout(function(){ sendCurrent(); }, 200); }});
+    window.EnzoVoiceFix42.flushVoiceQueueFixed(state, {send:function(q){ sendQueuedMicDirect(q); }, lang:(window.EnzoLang45 ? window.EnzoLang45.askLang(state.voiceQueue, state.langPref, detectLang) : detectLang(state.voiceQueue))});
     return;
   }
   var q=(state.voiceQueue||'').trim();
@@ -12031,10 +12041,62 @@ function flushVoiceQueue(){
   state.voiceQueue='';
   /* v55 P7: queued voice text may only be sent if the gate already accepted it (or allowed it as guest chat). */
   if(window.EnzoVoiceID && !window.EnzoVoiceID.allowQueued(q)){ return; }
-  $('input').value=q; autoGrow(); syncSendBtn();
-  if(!state.voiceLive) return; /* call ended — the words stay in the box, ready to send */
-  state.nextAskViaVoice=true;
-  setTimeout(function(){ sendCurrent(); }, 200);
+  sendQueuedMicDirect(q);
+}
+/* PIECE 48 — FIX B live chat delivery helpers (enao-hear-fix, v64-voice-live). Mic-originated transcripts only; typed path untouched. */
+function clearMicComposer(){ var inp=$('input'); if(inp) inp.value=''; autoGrow(); syncSendBtn(); }
+function sendMicDirect(text){
+  /* Free path: final mic transcript -> sent user message + answer pipeline
+     with voice=true, immediately. No composer fill, no setTimeout. */
+  var heard=String(text||'').trim();
+  if(!heard) return false;
+  clearMicComposer();
+  try{ askQuestion(heard, true); }
+  catch(e){
+    /* Same failure safety as sendCurrent: put the text back so nothing is lost. */
+    $('input').value=heard; autoGrow(); syncSendBtn();
+    toast('Sending failed — your text is back in the box. Tap Send to try again.');
+    return false;
+  }
+  return true;
+}
+function postMicSentMessage(text){
+  /* Busy path: post the mic transcript as a sent user message RIGHT NOW
+     (role:'user', status:'sent', viaVoice:true — the double-tick foot is
+     rendered by buildMessageEl for every user message, base L9908). The
+     answer pipeline is deliberately NOT started here (ENZO is busy);
+     pendingAnswer marks it for sendQueuedMicDirect via the flush. Text is
+     EXACTLY the transcript — never edited, translated or "cleaned". */
+  var heard=String(text||'').trim();
+  if(!heard) return null;
+  var chat=activeChat();
+  if(!chat){ chat=createChat(heard.slice(0,42)); }
+  if(chat.messages.length===0) chat.title=heard.slice(0,42);
+  var lang=(window.EnzoLang45 ? window.EnzoLang45.askLang(heard, state.langPref, detectLang) : detectLang(heard));
+  var tl=timeLabelFor(Date.now());
+  var msg={role:'user', text:heard, lang:lang, viaVoice:true, status:'sent', pendingAnswer:true, ts:Date.now(), daypart:tl.daypart, daypartRoman:tl.daypartRoman, timeLabel:tl.full, files:[]};
+  chat.messages.push(msg);
+  clearMicComposer();
+  renderChatList(); renderMessages(true); saveChats();
+  return msg;
+}
+function sendQueuedMicDirect(q){
+  /* Flush path: a queued mic transcript (already posted as sent by
+     postMicSentMessage) gets its answer pipeline now — direct askQuestion
+     with alreadyPosted so no duplicate user message is pushed. */
+  var text=String(q||'').trim();
+  if(!text) return false;
+  clearMicComposer();
+  if(!state.voiceLive){ state.voiceQueue=text; state.voiceQueuePosted=true; return false; } /* Call ended — the sent message stays in chat, pending; the queue is kept so a later flush can still answer it. */
+  state.voiceQueue=''; state.voiceQueuePosted=false;
+  try{ askQuestion(text, true, undefined, {alreadyPosted:true}); }
+  catch(e){
+    state.voiceQueue=text; state.voiceQueuePosted=true;
+    $('input').value=text; autoGrow(); syncSendBtn();
+    toast('Sending failed — your text is back in the box. Tap Send to try again.');
+    return false;
+  }
+  return true;
 }
 function maybeSpeak(msg){
   if (msg && msg.plain && window.EnzoIdentityGuard) {
@@ -12328,7 +12390,18 @@ function buildRecognition(){
       recogRestartTimer=setTimeout(function(){ if(state.voiceLive && state.recogWanted && !state.isSpeaking){ try{ recognition.start(); }catch(e){} } }, 300);
     }
   };
+  function hearFix46Opts(){
+    var lang = window.EnzoHearFix46 ? window.EnzoHearFix46.sayAgainLangFor(state) : undefined;
+    return {
+      lang: lang,
+      toast: (typeof toast === 'function' ? toast : null),
+      speakText: (typeof speakText === 'function' ? speakText : null),
+      live: function(){ return !!state.voiceLive; },
+      currentInput: function(){ try{ return $('input').value; }catch(e){ return null; } }
+    };
+  }
   r.onerror=function(e){
+    try{ if(window.EnzoHearDebug47) window.EnzoHearDebug47.recordError(e && e.error ? e.error : 'unknown'); }catch(e){}
     if(e.error==='not-allowed' || e.error==='service-not-allowed'){
       showMicBlocked();
     }
@@ -12336,7 +12409,12 @@ function buildRecognition(){
       turnMicOff();
       toast('No microphone was found on this device — typing works normally');
     }
-    /* 'network' / 'no-speech' / 'aborted' are transient — the live loop restarts listening on its own */
+    else if(e.error==='no-speech' || e.error==='network'){
+      // P46: no longer silent. Interim text heard -> honest partial
+      // message; nothing heard at all -> the normal say-again prompt.
+      try{ if(window.EnzoHearFix46) window.EnzoHearFix46.onRecognitionError(e.error, hearFix46Opts()); }catch(err){}
+    }
+    /* 'aborted' is transient — the live loop restarts listening on its own */
   };
   r.onresult=function(ev){
     var interim='', finalTxt='';
@@ -12346,31 +12424,57 @@ function buildRecognition(){
     }
     /* Live transcription fills the box as you speak — but never overwrites text the user is typing right now */
     if(interim && (Date.now()-(state.lastTypeAt||0)>2500)){ $('input').value=interim; autoGrow(); syncSendBtn(); }
+    try{ if(window.EnzoHearDebug47) window.EnzoHearDebug47.recordInterim(interim, r ? r.lang : null); }catch(e){}
+    if(interim){
+      // P46: remember the partial text and arm the honest-message timer.
+      // If no final result ever arrives, the timer surfaces what was
+      // partially heard instead of leaving silence.
+      try{ if(window.EnzoHearFix46) window.EnzoHearFix46.recordInterim(interim, hearFix46Opts()); }catch(err){}
+    }
+    if(finalTxt.trim()){
+      // P46: a final result arrived, so the partial timer is not needed.
+      try{ if(window.EnzoHearFix46) window.EnzoHearFix46.clearInterim(); }catch(err){}
+    }
     if(finalTxt.trim()){
       var heard=finalTxt.trim();
       /* v55 P7 voice-id gate: final text is gated BEFORE anything is
          queued or sent. proceed:false means a refusal was already
          spoken by the gate (or the sound was low-energy noise). The
          interim transcription above is display-only and NOT gated. */
-      var gateRes55 = window.EnzoVoiceFix42 ? window.EnzoVoiceFix42.gateMicQuestion(heard, {source:'call'}) : (window.EnzoVoiceID ? window.EnzoVoiceID.gateAndRoute(heard, {source:'call'}) : {proceed:true});
+      var gateRes55 = window.EnzoVoiceFix42 ? window.EnzoVoiceFix42.gateMicQuestion(heard, {source:'call', lang:(window.EnzoLang45 ? window.EnzoLang45.askLang(heard, state.langPref, detectLang) : detectLang(heard))}) : (window.EnzoVoiceID ? window.EnzoVoiceID.gateAndRoute(heard, {source:'call'}) : {proceed:true});
+      try{ if(window.EnzoHearDebug47) window.EnzoHearDebug47.recordFinal(heard, r ? r.lang : null, gateRes55); }catch(e){}
       if(!gateRes55.proceed){
 if(gateRes55.decision && gateRes55.decision.decision==='refuse' && gateRes55.decision.speak && gateRes55.decision.refusal && !gateRes55.refusalSpoken){
   try{ maybeSpeak({plain: gateRes55.decision.refusal, viaVoice:true, lang: (window.EnzoLang47?window.EnzoLang47.normaliseRefusalLang(gateRes55.decision.refusalLang):(gateRes55.decision.refusalLang==='ur' ? 'urdu' : gateRes55.decision.refusalLang))}); }catch(e){}
 }
         return;
       }
+      /* fix43 (piece 43): transliteration-gibberish retry. Runs AFTER the
+         voice-ID gate passes and BEFORE the busy-queue / send branches, so
+         a decoded transcript is queued/sent exactly like a normal one.
+         onHeard() switches recognition.lang to en-US immediately and
+         returns the decoded English when the whole transcript decodes;
+         otherwise it returns the original text unchanged. */
+      if(window.EnzoHearFix43){
+        try{
+          var fix43 = window.EnzoHearFix43.onHeard(heard, { recognition: (typeof recognition !== 'undefined' ? recognition : null), state: state, langFor: (window.EnzoLang46 ? window.EnzoLang46.recognitionLangFor : null) });
+          if(fix43 && fix43.retried){ heard = fix43.text; }
+        }catch(e){}
+      }
       if(state.isGenerating || state.isSpeaking){
-        /* ENZO is still busy with the previous answer: the words are NOT
-           thrown away and NOT left waiting in the box — they queue and are
-           sent as a chat message the moment that answer finishes. */
+        /* P48: ENZO is still busy — the words are NOT left waiting in the box.
+           They go into the chat NOW as a sent message (double tick), and the
+           answer pipeline runs for them the moment ENZO is free (flushVoiceQueue
+           -> sendQueuedMicDirect -> askQuestion alreadyPosted). The pipeline is
+           NOT started here: askQuestion would begin a second concurrent run
+           (setGenerating/beginSearchRun, L11764-11765). */
         state.voiceQueue=((state.voiceQueue||'')+' '+heard).trim().slice(0,4000);
-        $('input').value=state.voiceQueue; autoGrow(); syncSendBtn();
+        state.voiceQueuePosted=true;
+        postMicSentMessage(heard);
         return;
       }
-      $('input').value=heard; autoGrow();
-      state.nextAskViaVoice=true;
       setVoiceState('processing','Heard you: “'+heard.slice(0,60)+'” — preparing your answer…');
-      setTimeout(function(){ sendCurrent(); }, 300);
+      sendMicDirect(heard); /* P48: straight into chat as a sent message with voice=true — no composer fill, no 300 ms wait, no sendCurrent round-trip. askQuestion pushes the user message (status:'sent', double tick via buildMessageEl) and viaVoice:true makes maybeSpeak speak the answer at once (voice-in -> voice-out). */
     }
   };
   return r;
@@ -12418,7 +12522,7 @@ function turnMicOn(){
   });
 }
 function turnMicOff(reason){
-  if(state.voiceQueue){ $('input').value=state.voiceQueue; state.voiceQueue=''; autoGrow(); syncSendBtn(); }
+  if(state.voiceQueue){ if(state.voiceQueuePosted){ /* P48: already posted as a sent message — never put it back in the composer; the queue stays for the next flush. */ } else { $('input').value=state.voiceQueue; state.voiceQueue=''; } autoGrow(); syncSendBtn(); }
   state.voiceLive=false; state.recogWanted=false; state.isListening=false;
   clearTimeout(recogRestartTimer);
   if(recognition){ try{ recognition.stop(); }catch(e){} }
@@ -20802,6 +20906,7 @@ function backendAsk(text, viaVoice, forcedDeep){
   try{ if(window.EnzoMonitor){ var bid59ba=window.EnzoPollingFix?window.EnzoPollingFix.resolveBackendId(chat.id):null; if(bid59ba){ EnzoMonitor.setChatId(bid59ba); EnzoMonitor.start(); } EnzoMonitor.noteFrontendStep({title:'Question sent', detail:'Question sent to ENZO for research.'}); } }catch(e){}
   var lang=(window.EnzoLang45 ? window.EnzoLang45.askLang(text, state.langPref, detectLang) : detectLang(text));
   state.lastAnswerLang = lang;
+  try{ if(window.EnzoVoiceFix42 && window.EnzoVoiceFix42.resetSayAgainLoop) window.EnzoVoiceFix42.resetSayAgainLoop(); }catch(e){}
   try{ if(typeof recognition!=='undefined' && recognition && state.voiceLive && window.EnzoLang46) recognition.lang = window.EnzoLang46.recognitionLangFor(lang); }catch(e){}
   pushUserMsg(chat, text, lang, viaVoice, files);
   renderChatList(); renderMessages(true); saveChats();
@@ -34166,6 +34271,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EnaoConver
     audioCtx: null,
     pollTimer: null,
     window: [],
+    windowEnergies: [],   /* P1: per-frame RMS energy, 1:1 with window */
     lastEnergy: 0,
     lastAt: 0,
     nudgeState: { nudgeShown: false },
@@ -34175,6 +34281,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EnaoConver
   function resetRuntime(){
     detachAnalyser();
     runtime.window = [];
+    runtime.windowEnergies = [];
     runtime.lastEnergy = 0;
     runtime.lastAt = 0;
     runtime.nudgeState = { nudgeShown: false };
@@ -34198,6 +34305,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EnaoConver
     runtime.analyser = analyser;
     runtime.audioCtx = audioCtx || null;
     runtime.window = [];
+    runtime.windowEnergies = [];
     if(runtime.pollTimer){
       try{ clearInterval(runtime.pollTimer); }catch(e){}
       runtime.pollTimer = null;
@@ -34216,6 +34324,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EnaoConver
     runtime.analyser = null;
     runtime.audioCtx = null;
     runtime.window = [];
+    runtime.windowEnergies = [];
     return { ok: true };
   }
 
@@ -34241,7 +34350,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EnaoConver
       runtime.lastAt = Date.now();
       if(f.energy >= ENERGY_THRESHOLD && f.voiced){
         runtime.window.push(f.vector);
-        if(runtime.window.length > 25) runtime.window.shift();
+        runtime.windowEnergies.push(f.energy);
+        if(runtime.window.length > 25){ runtime.window.shift(); runtime.windowEnergies.shift(); }
       }
     }catch(e){}
   }
@@ -34249,9 +34359,28 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EnaoConver
   function currentWindowFeatures(){
     if(!runtime.window.length) return null;
     if(Date.now() - runtime.lastAt > 3000) return null;
+    /* P1 (enao-hear-fix): energy is the MEAN of the kept voiced frames'
+       energies -- the utterance's energy -- NOT runtime.lastEnergy, which
+       is the single most recent 100 ms poll frame and is trailing
+       silence by the time a final transcript arrives (RC1). This
+       mirrors the enrollment path, which already reports the mean of
+       the kept frames' energies (collectSampleFeatures, base L34323).
+       windowEnergies is kept 1:1 with runtime.window; if it is ever
+       out of sync the old lastEnergy value is used as a fallback. */
+    var meanEnergy = runtime.lastEnergy, maxEnergy = runtime.lastEnergy, i;
+    if(runtime.windowEnergies && runtime.windowEnergies.length){
+      meanEnergy = 0; maxEnergy = 0;
+      for(i = 0; i < runtime.windowEnergies.length; i++){
+        meanEnergy += runtime.windowEnergies[i];
+        if(runtime.windowEnergies[i] > maxEnergy) maxEnergy = runtime.windowEnergies[i];
+      }
+      meanEnergy /= runtime.windowEnergies.length;
+    }
     return {
       vector: meanVector(runtime.window),
-      energy: runtime.lastEnergy,
+      energy: meanEnergy,
+      energyMax: maxEnergy,
+      lastEnergy: runtime.lastEnergy,
       frames: runtime.window.length
     };
   }
@@ -34262,6 +34391,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EnaoConver
   function injectFeatures(vector, energy){
     if(!isValidVector(vector)) return { ok: false, error: 'bad-vector' };
     runtime.window = [vector.slice()];
+    runtime.windowEnergies = [(typeof energy === 'number') ? energy : 0.1];
     runtime.lastEnergy = (typeof energy === 'number') ? energy : 0.1;
     runtime.lastAt = Date.now();
     return { ok: true };
@@ -53899,9 +54029,24 @@ function conversationReply(text, lang, ctx) {
 
   /* Short honest prompts for a low-energy / unheard mic result. The
      default is the English wording from the defect brief; pass
-     opts.lang 'roman' or 'ur' for the Roman Urdu wording. */
+     opts.lang to pick the user's language: 'roman' for the Roman Urdu
+     wording, 'urdu'/'ur' for Urdu script, 'punjabi'/'roman-punjabi'/
+     'pa' for Roman Punjabi. Anything else (incl. no lang) is English. */
   var SAY_AGAIN_EN = 'I couldn\'t hear that clearly — please say it again.';
   var SAY_AGAIN_ROMAN = 'Main theek se sun nahi saka — please dobara bolain.';
+
+  /* P5 loop guard (45-loop-guard.js): after SAY_AGAIN_GUARD_AFTER
+     consecutive say-again failures the spoken prompt stops repeating
+     (toast only) and a persistent typed fallback is shown instead.
+     The counter lives in the fix42 module state (site 2) and resets
+     on any successful hearing (site 5 + sites 8/9). */
+  var SAY_AGAIN_GUARD_AFTER = 2;
+  var TYPED_FALLBACK_ROMAN = 'Mic sun nahi pa raha — type karke bhej dein, wohi jawab milega.';
+  var TYPED_FALLBACK_EN = 'The mic is having trouble hearing — please type your question, it works the same.';
+  var TYPED_FALLBACK_UR = 'مائیک سن نہیں پا رہا — براہ کرم اپنا سوال ٹائپ کر کے بھیج دیں، وہی جواب ملے گا۔';
+  var TYPED_FALLBACK_PUNJABI = 'Mic theek se sun nahi sakya — type karke bhej deyo, ohi jawab milega.';
+  var SAY_AGAIN_URDU = 'میں ٹھیک سے سن نہیں سکا — براہ کرم دوبارہ بولیں۔';
+  var SAY_AGAIN_PUNJABI = 'Main theek se sun nahi sakya — please dobara bolo.';
 
   /* Last-resort fallback refusal text, used ONLY when the gate exposes
      neither a refusal string for this utterance nor its rotating
@@ -53923,7 +54068,10 @@ function conversationReply(text, lang, ctx) {
     lastRefusalSpokenAt: null,
     refusalByText: [],
     refusalRotation: { idx: { en: -1, roman: -1, ur: -1 }, lastText: '' },
-    lastQueuedNotice: null
+    lastQueuedNotice: null,
+    sayAgainCount: 0,
+    typedFallbackShown: false,
+    typedFallbackText: null
   };
 
   function nowOf(o){
@@ -53957,8 +54105,22 @@ function conversationReply(text, lang, ctx) {
 
   function pickSayAgain(o){
     var lang = o && o.lang;
-    if(lang === 'roman' || lang === 'ur') return SAY_AGAIN_ROMAN;
+    if(lang === 'roman') return SAY_AGAIN_ROMAN;
+    if(lang === 'urdu' || lang === 'ur') return SAY_AGAIN_URDU;
+    if(lang === 'punjabi' || lang === 'roman-punjabi' || lang === 'pa') return SAY_AGAIN_PUNJABI;
     return SAY_AGAIN_EN;
+  }
+
+  /* TTS voice for the say-again prompt ONLY, mirroring the live
+     TTS_LANG map (L55302-55309): English -> en-US, Urdu script /
+     Roman Urdu -> ur-PK, Punjabi / Roman Punjabi -> pa-PK. Anything
+     else (incl. 'hindi', for which no say-again variant exists)
+     falls back to en-US. Used ONLY by surfaceSayAgain below. */
+  function sayAgainTtsLang(o){
+    var lang = o && o.lang;
+    if(lang === 'roman' || lang === 'urdu' || lang === 'ur') return 'ur-PK';
+    if(lang === 'punjabi' || lang === 'roman-punjabi' || lang === 'pa') return 'pa-PK';
+    return 'en-US';
   }
 
   function toastIt(o, text){
@@ -54072,10 +54234,126 @@ function conversationReply(text, lang, ctx) {
   }
 
   /* (2) Low-energy prompt. Toast + speak the honest "say it again" line. */
+  /* P5 — typed-fallback text in the user's language. Same lang
+     vocabulary as pickSayAgain after P4: 'en'/'english' -> English,
+     'urdu'/'ur' -> Urdu script, 'punjabi'/'roman-punjabi'/'pa' ->
+     Roman Punjabi. Everything else (incl. 'roman' and NO lang at
+     all) -> Roman Urdu, which is the default: live call sites pass
+     no lang, and Raja's working language is Roman Urdu. Does NOT
+     change pickSayAgain (P4 owns the say-again line's language). */
+  function pickTypedFallback(o){
+    var lang = o && o.lang;
+    if(lang === 'en' || lang === 'english') return TYPED_FALLBACK_EN;
+    if(lang === 'urdu' || lang === 'ur') return TYPED_FALLBACK_UR;
+    if(lang === 'punjabi' || lang === 'roman-punjabi' || lang === 'pa') return TYPED_FALLBACK_PUNJABI;
+    return TYPED_FALLBACK_ROMAN;
+  }
+
+  function getDocument(o){
+    if(o && o.document) return o.document;
+    if(typeof root !== 'undefined' && root && root.document) return root.document;
+    if(typeof document !== 'undefined') return document;
+    return null;
+  }
+
+  /* P5 — show the persistent typed fallback. Visible without opening
+     any menu: a chip inserted in .composer-inner, directly above the
+     composer box, so it sits on screen next to the text field.
+     Created once, re-shown with new text only if the text changed.
+     Tapping it focuses the text field. opts.onShowTypedFallback(text),
+     when supplied (harness / assembler wiring), replaces the DOM
+     path. Returns true when the fallback is (now) visible or recorded. */
+  function showTypedFallback(o, text){
+    var already = state.typedFallbackShown && state.typedFallbackText === text;
+    state.typedFallbackShown = true;
+    state.typedFallbackText = text;
+    if(already) return true;
+    if(o && typeof o.onShowTypedFallback === 'function'){
+      try{ o.onShowTypedFallback(text); }catch(e){}
+      return true;
+    }
+    var doc = getDocument(o);
+    if(!doc) return false;
+    try{
+      var el = doc.getElementById('enaoTypedFallback');
+      if(!el){
+        el = doc.createElement('div');
+        el.id = 'enaoTypedFallback';
+        el.setAttribute('role', 'status');
+        el.style.display = 'block';
+        el.style.margin = '0 0 8px 0';
+        el.style.padding = '10px 12px';
+        el.style.borderRadius = '12px';
+        el.style.border = '1px solid var(--line, #d8d8d8)';
+        el.style.background = 'var(--surface, #ffffff)';
+        el.style.color = 'var(--ink, #111111)';
+        el.style.fontSize = '14px';
+        el.style.lineHeight = '1.5';
+        el.style.cursor = 'text';
+        el.onclick = function(){
+          try{ var inp = doc.getElementById('input'); if(inp) inp.focus(); }catch(e2){}
+        };
+        var anchor = doc.querySelector ? doc.querySelector('.composer-inner') : null;
+        var box = (anchor && anchor.querySelector) ? anchor.querySelector('.composer-box') : null;
+        if(anchor && box) anchor.insertBefore(el, box);
+        else if(anchor) anchor.appendChild(el);
+        else if(doc.body) doc.body.appendChild(el);
+        else return false;
+      }
+      el.textContent = text;
+      el.style.display = 'block';
+      return true;
+    }catch(e){ return false; }
+  }
+
+  function hideTypedFallback(o){
+    state.typedFallbackShown = false;
+    state.typedFallbackText = null;
+    if(o && typeof o.onHideTypedFallback === 'function'){
+      try{ o.onHideTypedFallback(); }catch(e){}
+      return true;
+    }
+    var doc = getDocument(o);
+    if(!doc) return false;
+    try{
+      var el = doc.getElementById('enaoTypedFallback');
+      if(el) el.style.display = 'none';
+      return true;
+    }catch(e){ return false; }
+  }
+
+  /* P5 — reset the loop guard. Called on ANY successful hearing (every
+     proceed:true return in gateMicQuestion, site 5) and on any question
+     send (askQuestion / backendAsk, sites 8/9, which covers typed sends
+     too). Hides the persistent fallback. Returns whether anything was
+     actually reset, so callers can tell a live guard from a fresh one. */
+  function resetSayAgainLoop(o){
+    if(state.sayAgainCount === 0 && !state.typedFallbackShown) return { reset: false, sayAgainCount: 0 };
+    state.sayAgainCount = 0;
+    hideTypedFallback(o);
+    return { reset: true, sayAgainCount: 0 };
+  }
+
+  /* P5 loop guard on the (2) low-energy prompt: the first
+     SAY_AGAIN_GUARD_AFTER (2) consecutive failures speak + toast
+     exactly as before. From the 3rd consecutive failure on, the
+     spoken line STOPS (toast only) and the persistent typed fallback
+     is shown instead, until a hearing succeeds. The refusal cooldown
+     is untouched — this guard is only for say-again. */
   function surfaceSayAgain(o){
     var text = pickSayAgain(o);
-    var res = deliverLine(o, text, 'en-US');
-    return { text: text, toasted: res.toasted, spoken: res.spoken };
+    state.sayAgainCount++;
+    if(state.sayAgainCount > SAY_AGAIN_GUARD_AFTER){
+      var fb = pickTypedFallback(o);
+      showTypedFallback(o, fb);
+      var toasted = toastIt(o, text);
+      return { text: text, toasted: toasted, spoken: false, guarded: true,
+        sayAgainCount: state.sayAgainCount, typedFallbackShown: true, fallbackText: fb };
+    }
+    var res = deliverLine(o, text, sayAgainTtsLang(o));
+    return { text: text, toasted: res.toasted, spoken: res.spoken, guarded: false,
+      sayAgainCount: state.sayAgainCount, typedFallbackShown: state.typedFallbackShown,
+      fallbackText: state.typedFallbackText };
   }
 
   /* Surface the honest handling for a HELD queued utterance (4).
@@ -54110,7 +54388,9 @@ function conversationReply(text, lang, ctx) {
       return { surfaced: 'refusal-fallback', refusal: FALLBACK_REFUSAL };
     }
     var again = surfaceSayAgain(o);
-    return { surfaced: 'say-again', prompt: again.text };
+    return { surfaced: 'say-again', prompt: again.text, guarded: again.guarded,
+      sayAgainCount: again.sayAgainCount, typedFallbackShown: again.typedFallbackShown,
+      fallbackText: again.fallbackText || null };
   }
 
   /* ------------------------------------------------------------------
@@ -54130,7 +54410,9 @@ function conversationReply(text, lang, ctx) {
     var out = {
       proceed: true, decision: null, voiceCheck: 'no-gate',
       surfaced: null, refusalSpoken: false, refusal: null,
-      firstRefusal: false, note: null, text: heard
+      firstRefusal: false, note: null, text: heard,
+      guarded: false, sayAgainCount: 0, typedFallbackShown: false, fallbackText: null,
+      spoken: false, toasted: false
     };
     if(!heard){
       out.proceed = false;
@@ -54141,6 +54423,7 @@ function conversationReply(text, lang, ctx) {
     if(!voiceID || (typeof voiceID.gateAndRoute !== 'function' &&
       typeof voiceID.gateVoiceText !== 'function')){
       out.voiceCheck = 'no-gate';
+      resetSayAgainLoop(o);
       return out; /* no gate installed: proceed, exactly like live L7751 */
     }
     /* Prefer gateVoiceText when the gate exposes it: it returns the
@@ -54171,12 +54454,14 @@ function conversationReply(text, lang, ctx) {
       out.proceed = true;
       out.voiceCheck = 'unmeasured';
       out.note = 'fail-open:gate-error';
+      resetSayAgainLoop(o);
       return out;
     }
     if(!res){
       out.proceed = true;
       out.voiceCheck = 'unmeasured';
       out.note = 'fail-open:no-result';
+      resetSayAgainLoop(o);
       return out;
     }
     var d = res.decision || null;
@@ -54185,15 +54470,40 @@ function conversationReply(text, lang, ctx) {
       if(d && d.decision === 'chat') out.voiceCheck = 'guest';
       else if(d && d.reason === 'no-profile') out.voiceCheck = 'no-profile';
       else out.voiceCheck = 'measured';
+      resetSayAgainLoop(o);
       return out;
     }
     /* proceed:false — decide WHY before deciding whether to block. */
     if(d && d.decision === 'ignore'){
-      /* (2) Low energy must not be silent. */
+      /* P2 (42-transcript-fails-open) + P5 loop guard: a non-empty final
+         transcript is evidence of hearing. The gate's low-energy reading
+         is taken at final-result time, i.e. on the trailing silence after
+         the user stopped speaking (AUDIT RC1), so it must not discard real
+         words. Fail OPEN: the question proceeds to normal handling. Only
+         a genuinely empty/missing transcript may still take the say-again
+         path (defensive else below; unreachable today because the empty
+         early return above already drops empty input silently — AUDIT
+         §1.6 — but kept so a future refactor of that early return cannot
+         silently reintroduce the block). A fail-open proceed IS a
+         successful hearing, so the loop guard resets (P5). */
+      if(heard){
+        out.proceed = true;
+        out.voiceCheck = 'unmeasured';
+        out.note = 'fail-open:ignore-with-transcript';
+        resetSayAgainLoop(o);
+        return out;
+      }
+      /* No transcript at all: the original low-energy prompt still applies. */
       out.proceed = false;
       out.voiceCheck = 'unmeasured';
-      surfaceSayAgain(o);
+      var again = surfaceSayAgain(o);
       out.surfaced = 'say-again';
+      out.guarded = again.guarded;
+      out.sayAgainCount = again.sayAgainCount;
+      out.typedFallbackShown = again.typedFallbackShown;
+      out.fallbackText = again.fallbackText || null;
+      out.spoken = again.spoken;
+      out.toasted = again.toasted;
       return out;
     }
     if(d && d.decision === 'refuse'){
@@ -54205,6 +54515,7 @@ function conversationReply(text, lang, ctx) {
         out.proceed = true;
         out.voiceCheck = 'unmeasured';
         out.note = 'fail-open:' + ms.cause;
+        resetSayAgainLoop(o);
         return out;
       }
       /* MEASURED non-Raja voice: fail CLOSED, varied refusal, and the
@@ -54224,8 +54535,10 @@ function conversationReply(text, lang, ctx) {
     out.proceed = true;
     out.voiceCheck = 'unmeasured';
     out.note = 'fail-open:unknown-decision';
+    resetSayAgainLoop(o);
     return out;
   }
+
 
   /* ------------------------------------------------------------------
      flushVoiceQueueFixed(stateObj, opts) — replacement for live
@@ -54254,6 +54567,21 @@ function conversationReply(text, lang, ctx) {
     if(voiceID && typeof voiceID.allowQueued === 'function'){
       var allowed = false;
       try{ allowed = !!voiceID.allowQueued(q); }catch(e){ allowed = false; }
+      /* P2 (42-transcript-fails-open): a remembered 'ignore' verdict must
+         not block a real queued transcript. gateVoiceText remembers every
+         verdict (including 'ignore', from the trailing-silence energy
+         read — AUDIT RC1/RC3), and allowQueued returns false for it, so
+         without this the speech queued while ENZO was busy would
+         re-surface the same "couldn't hear" line on flush even though
+         the words were heard. A non-empty queued transcript therefore
+         fails open here, exactly as gateMicQuestion does above. A
+         remembered 'refuse' (measured non-Raja voice) is NOT affected:
+         allowQueued stays false for it and the held-queue refusal
+         handling below still runs. (q is guaranteed non-empty here by
+         the early return above; checkQueued returns null for empty.) */
+      if(!allowed && typeof voiceID.checkQueued === 'function'){
+        try{ if(voiceID.checkQueued(q) === 'ignore') allowed = true; }catch(e){}
+      }
       if(!allowed){
         /* (4) DO NOT clear the queue: the utterance is kept, not lost. */
         st.voiceQueue = q;
@@ -54304,22 +54632,41 @@ function conversationReply(text, lang, ctx) {
     state.refusalByText = [];
     state.refusalRotation = { idx: { en: -1, roman: -1, ur: -1 }, lastText: '' };
     state.lastQueuedNotice = null;
+    state.sayAgainCount = 0;
+    state.typedFallbackShown = false;
+    state.typedFallbackText = null;
+    hideTypedFallback(null);
     return { ok: true };
   }
 
   var EnzoVoiceFix42 = {
     VERSION: VERSION,
+    LOOP_GUARD_VERSION: '45-loop-guard-v1',
     REFUSAL_COOLDOWN_MS: REFUSAL_COOLDOWN_MS,
     SAY_AGAIN_EN: SAY_AGAIN_EN,
     SAY_AGAIN_ROMAN: SAY_AGAIN_ROMAN,
+    SAY_AGAIN_URDU: SAY_AGAIN_URDU,
+    SAY_AGAIN_PUNJABI: SAY_AGAIN_PUNJABI,
+    SAY_AGAIN_GUARD_AFTER: SAY_AGAIN_GUARD_AFTER,
+    TYPED_FALLBACK_ROMAN: TYPED_FALLBACK_ROMAN,
+    TYPED_FALLBACK_EN: TYPED_FALLBACK_EN,
+    TYPED_FALLBACK_UR: TYPED_FALLBACK_UR,
+    TYPED_FALLBACK_PUNJABI: TYPED_FALLBACK_PUNJABI,
     measureStatus: measureStatus,
     gateMicQuestion: gateMicQuestion,
     flushVoiceQueueFixed: flushVoiceQueueFixed,
     discardVoiceQueue: discardVoiceQueue,
     surfaceSayAgain: surfaceSayAgain,
+    surfaceHeldQueue: surfaceHeldQueue,
     speakRefusalOnce: speakRefusalOnce,
+    showTypedFallback: showTypedFallback,
+    hideTypedFallback: hideTypedFallback,
+    resetSayAgainLoop: resetSayAgainLoop,
+    pickTypedFallback: pickTypedFallback,
+    sayAgainState: function(){ return { count: state.sayAgainCount, typedFallbackShown: state.typedFallbackShown, typedFallbackText: state.typedFallbackText }; },
     resetFix42: resetFix42
   };
+;
 
   /* Export tail (guarded): browser global for the live page, and a
      module.exports assignment so the Node harness loads this exact
@@ -54328,6 +54675,636 @@ function conversationReply(text, lang, ctx) {
   if(typeof module !== 'undefined' && module.exports) module.exports = EnzoVoiceFix42;
 
 })(typeof window !== 'undefined' ? window : this);
+/* === MODULE-START: EnzoHearFix46 (piece 46) === */
+(function(root){
+  'use strict';
+
+  var VERSION = 'hearfix46-interim-honest-v1';
+
+  /* Honest handling fires this long after the LAST interim result when no
+     final result has arrived. Chrome normally delivers a final within ~1-2 s
+     of a pause, so 4 s means the final is (almost certainly) never coming.
+     Trade-off, stated plainly: a user who pauses mid-sentence for more
+     than 4 s hears the partial message once, then can keep speaking; the
+     message never claims nothing was heard, it quotes what was heard. */
+  var PARTIAL_TIMEOUT_MS = 4000;
+  var PARTIAL_MAX_CHARS = 120;
+
+  /* Say-again wording — identical to fix42 L53903-L53904, so the
+     no-interim fallback speaks exactly the normal say-again line. */
+  var SAY_AGAIN_EN = 'I couldn\'t hear that clearly — please say it again.';
+  var SAY_AGAIN_ROMAN = 'Main theek se sun nahi saka — please dobara bolain.';
+
+  var st = { partial: '', partialAt: 0, timer: null, surfacedFor: '', lastOpts: null };
+
+  function nowOf(o){
+    if(o && typeof o.now === 'function') return o.now();
+    return Date.now();
+  }
+
+  function getToast(o){
+    if(o && typeof o.toast === 'function') return o.toast;
+    if(typeof root !== 'undefined' && root && typeof root.toast === 'function') return root.toast;
+    return null;
+  }
+
+  function getSpeak(o){
+    if(o && typeof o.speakText === 'function') return o.speakText;
+    if(o && typeof o.speak === 'function') return o.speak;
+    if(typeof root !== 'undefined' && root && typeof root.speakText === 'function') return root.speakText;
+    return null;
+  }
+
+  function getFix42(){
+    if(typeof root !== 'undefined' && root && root.EnzoVoiceFix42) return root.EnzoVoiceFix42;
+    if(typeof window !== 'undefined' && window.EnzoVoiceFix42) return window.EnzoVoiceFix42;
+    if(typeof global !== 'undefined' && global.EnzoVoiceFix42) return global.EnzoVoiceFix42;
+    return null;
+  }
+
+  function setTimer(o, fn, ms){
+    if(o && typeof o.setTimeout === 'function') return o.setTimeout(fn, ms);
+    return setTimeout(fn, ms);
+  }
+
+  function clearTimer(o, id){
+    if(id === null || id === undefined) return;
+    if(o && typeof o.clearTimeout === 'function'){ try{ o.clearTimeout(id); }catch(e){} return; }
+    clearTimeout(id);
+  }
+
+  /* Map page state to the exact two codes fix42 pickSayAgain understands
+     (L53958-L53961: 'roman' or 'ur' -> Roman Urdu wording, else English).
+     Reads state.lastAnswerLang first, then state.langPref; 'urdu' maps to
+     'ur'. Anything else (including 'auto', 'en', 'punjabi') returns
+     undefined, which is pickSayAgain's English default. */
+  function sayAgainLangFor(stateObj){
+    var s = stateObj || {};
+    var cands = [s.lastAnswerLang, s.langPref];
+    var i, c;
+    for(i = 0; i < cands.length; i++){
+      c = cands[i];
+      if(c === 'roman') return 'roman';
+      if(c === 'urdu' || c === 'ur') return 'ur';
+    }
+    return undefined;
+  }
+
+  /* The partial text is quoted verbatim, only whitespace-collapsed and
+     capped (truncation is not invention; a cut is marked with ...). */
+  function trimPartial(p){
+    var t = String(p || '').trim().replace(/\s+/g, ' ');
+    if(t.length > PARTIAL_MAX_CHARS) t = t.slice(0, PARTIAL_MAX_CHARS).trim() + '...';
+    return t;
+  }
+
+  function partialText(o, partial){
+    var shown = trimPartial(partial);
+    var lang = o && o.lang;
+    if(lang === 'roman' || lang === 'ur'){
+      return 'Main poora theek se sun nahi saka — maine sirf ye suna: \u201c' + shown + '\u201d. Please dobara bolain, ya type kar dain.';
+    }
+    return 'I heard part of that — \u201c' + shown + '\u201d — but I didn\'t catch the rest. Please say it again, or finish it by typing.';
+  }
+
+  function speechLangFor(o){
+    var lang = o && o.lang;
+    if(lang === 'roman' || lang === 'ur') return 'ur-PK';
+    return 'en-US';
+  }
+
+  /* Deliver one spoken + toasted line through the existing page paths,
+     exactly like fix42 deliverLine: toast always, speak when a speak
+     function is available (voice-in -> voice-out). */
+  function deliver(o, text, speechLang){
+    var toasted = false, spoken = false;
+    var t = getToast(o);
+    if(t && text){ try{ t(text); toasted = true; }catch(e){} }
+    var s = getSpeak(o);
+    if(s && text){ try{ s(text, speechLang); spoken = true; }catch(e){} }
+    return { toasted: toasted, spoken: spoken };
+  }
+
+  /* Shared fire path for the timer and the error event. Returns
+     {surfaced:'partial', text, partial, toasted, spoken} on delivery,
+     otherwise {surfaced:null, reason, partial?}. */
+  function firePartial(o){
+    var partial = st.partial;
+    if(!partial) return { surfaced: null, reason: 'no-partial' };
+    if(st.surfacedFor === partial) return { surfaced: null, reason: 'already-surfaced', partial: partial };
+    if(o && typeof o.live === 'function'){
+      var live = false;
+      try{ live = !!o.live(); }catch(e){ live = false; }
+      if(!live){ clearInterim(); return { surfaced: null, reason: 'not-live' }; }
+    }
+    if(o && typeof o.currentInput === 'function'){
+      var cur = null;
+      try{ cur = o.currentInput(); }catch(e){ cur = null; }
+      if(typeof cur === 'string'){
+        if(!cur.trim() || cur.indexOf(partial) === -1){
+          /* Composer no longer holds the partial (sent, cleared, or typed
+             over): the partial is stale, do not announce it. */
+          clearInterim();
+          return { surfaced: null, reason: 'composer-changed' };
+        }
+      }
+    }
+    var text = partialText(o, partial);
+    var res = deliver(o, text, speechLangFor(o));
+    st.surfacedFor = partial;
+    st.timer = null;
+    return { surfaced: 'partial', text: text, partial: partial, toasted: res.toasted, spoken: res.spoken };
+  }
+
+  /* Remember the partial text and arm (or re-arm) the honest-message
+     timer. opts: {lang, toast, speakText, live, currentInput, timeoutMs,
+     now, setTimeout, clearTimeout}. Returns {recorded, partial, armed,
+     timeoutMs}. A new interim batch resets surfacedFor so a fresh stall
+     can be announced once. */
+  function recordInterim(text, opts){
+    var o = opts || {};
+    var partial = String(text || '').trim();
+    if(!partial) return { recorded: false, partial: '' };
+    var timeoutMs = (typeof o.timeoutMs === 'number' && o.timeoutMs > 0) ? o.timeoutMs : PARTIAL_TIMEOUT_MS;
+    clearTimer(o, st.timer);
+    st.timer = null;
+    st.partial = partial;
+    st.partialAt = nowOf(o);
+    st.surfacedFor = '';
+    st.lastOpts = o;
+    var selfOpts = o;
+    st.timer = setTimer(o, function(){ firePartial(selfOpts); }, timeoutMs);
+    return { recorded: true, partial: partial, armed: true, timeoutMs: timeoutMs };
+  }
+
+  /* A final result arrived (or the utterance is otherwise complete):
+     the partial timer is no longer needed. */
+  function clearInterim(opts){
+    clearTimer(opts || st.lastOpts, st.timer);
+    st.timer = null;
+    st.partial = '';
+    st.partialAt = 0;
+    st.surfacedFor = '';
+    st.lastOpts = null;
+    return { ok: true };
+  }
+
+  /* Surface the honest partial message now (error path). */
+  function surfacePartial(opts){
+    return firePartial(opts || {});
+  }
+
+  /* The normal say-again prompt, with the same wording as fix42.
+     Used when an error fires and nothing at all was heard. */
+  function surfaceSayAgainFallback(o){
+    var lang = o && o.lang;
+    var text = (lang === 'roman' || lang === 'ur') ? SAY_AGAIN_ROMAN : SAY_AGAIN_EN;
+    var res = deliver(o, text, speechLangFor(o));
+    return { surfaced: 'say-again', text: text, toasted: res.toasted, spoken: res.spoken };
+  }
+
+  /* Recognition error handler. Only 'no-speech' and 'network' are handled
+     here — the existing code already owns 'not-allowed',
+     'service-not-allowed', 'audio-capture' (and 'aborted' stays transient).
+     With interim text: the honest partial message. Without any interim:
+     the NORMAL say-again path — fix42 surfaceSayAgain when present (same
+     wording, same language selection), otherwise the built-in fallback.
+     Never silent, never the partial message when there is no partial. */
+  function onRecognitionError(error, opts){
+    var o = opts || {};
+    if(error !== 'no-speech' && error !== 'network'){
+      return { surfaced: null, reason: 'not-handled', error: error };
+    }
+    if(st.partial){
+      var r = firePartial(o);
+      if(r.surfaced) return r;
+      if(r.reason === 'already-surfaced') return { surfaced: null, reason: 'already-surfaced', partial: st.partial };
+      return { surfaced: null, reason: r.reason, partial: null };
+    }
+    var fix42 = getFix42();
+    if(fix42 && typeof fix42.surfaceSayAgain === 'function'){
+      var res = null;
+      try{ res = fix42.surfaceSayAgain(o); }catch(e){ res = null; }
+      if(res && res.text) return { surfaced: 'say-again', text: res.text, toasted: res.toasted, spoken: res.spoken, via: 'fix42' };
+    }
+    var fb = surfaceSayAgainFallback(o);
+    fb.via = 'fallback';
+    return fb;
+  }
+
+  /* Test / harness hook: reset module state between cases. */
+  function reset(){
+    clearTimer(st.lastOpts, st.timer);
+    st.timer = null;
+    st.partial = '';
+    st.partialAt = 0;
+    st.surfacedFor = '';
+    st.lastOpts = null;
+    return { ok: true };
+  }
+
+  /* ------------------------------------------------------------------
+     ASSEMBLY_SITES — exact originals (byte-identical to the live
+     v63-voice-lang file) and exact replacements for the assembler.
+     The Node self-test verifies every `original` occurs verbatim in
+     the base file. Site 3's replacement is the four anchor lines plus
+     the module IIFE in this file (MODULE-START..MODULE-END).
+     ------------------------------------------------------------------ */
+  var ASSEMBLY_SITES = [
+    {
+      site: 1,
+      where: "buildRecognition r.onerror — live file L12331-L12340",
+      original: [
+        "  r.onerror=function(e){",
+        "    if(e.error==='not-allowed' || e.error==='service-not-allowed'){",
+        "      showMicBlocked();",
+        "    }",
+        "    else if(e.error==='audio-capture'){",
+        "      turnMicOff();",
+        "      toast('No microphone was found on this device — typing works normally');",
+        "    }",
+        "    /* 'network' / 'no-speech' / 'aborted' are transient — the live loop restarts listening on its own */",
+        "  };"
+      ].join("\n"),
+      replacement: [
+        "  function hearFix46Opts(){",
+        "    var lang = window.EnzoHearFix46 ? window.EnzoHearFix46.sayAgainLangFor(state) : undefined;",
+        "    return {",
+        "      lang: lang,",
+        "      toast: (typeof toast === 'function' ? toast : null),",
+        "      speakText: (typeof speakText === 'function' ? speakText : null),",
+        "      live: function(){ return !!state.voiceLive; },",
+        "      currentInput: function(){ try{ return $('input').value; }catch(e){ return null; } }",
+        "    };",
+        "  }",
+        "  r.onerror=function(e){",
+        "    if(e.error==='not-allowed' || e.error==='service-not-allowed'){",
+        "      showMicBlocked();",
+        "    }",
+        "    else if(e.error==='audio-capture'){",
+        "      turnMicOff();",
+        "      toast('No microphone was found on this device — typing works normally');",
+        "    }",
+        "    else if(e.error==='no-speech' || e.error==='network'){",
+        "      // P46: no longer silent. Interim text heard -> honest partial",
+        "      // message; nothing heard at all -> the normal say-again prompt.",
+        "      try{ if(window.EnzoHearFix46) window.EnzoHearFix46.onRecognitionError(e.error, hearFix46Opts()); }catch(err){}",
+        "    }",
+        "    /* 'aborted' is transient — the live loop restarts listening on its own */",
+        "  };"
+      ].join("\n")
+    },
+    {
+      site: 2,
+      where: "buildRecognition r.onresult interim/final split — live file L12341-L12348",
+      original: [
+        "  r.onresult=function(ev){",
+        "    var interim='', finalTxt='';",
+        "    for(var i=ev.resultIndex;i<ev.results.length;i++){",
+        "      if(ev.results[i].isFinal) finalTxt+=ev.results[i][0].transcript;",
+        "      else interim+=ev.results[i][0].transcript;",
+        "    }",
+        "    /* Live transcription fills the box as you speak — but never overwrites text the user is typing right now */",
+        "    if(interim && (Date.now()-(state.lastTypeAt||0)>2500)){ $('input').value=interim; autoGrow(); syncSendBtn(); }"
+      ].join("\n"),
+      replacement: [
+        "  r.onresult=function(ev){",
+        "    var interim='', finalTxt='';",
+        "    for(var i=ev.resultIndex;i<ev.results.length;i++){",
+        "      if(ev.results[i].isFinal) finalTxt+=ev.results[i][0].transcript;",
+        "      else interim+=ev.results[i][0].transcript;",
+        "    }",
+        "    /* Live transcription fills the box as you speak — but never overwrites text the user is typing right now */",
+        "    if(interim && (Date.now()-(state.lastTypeAt||0)>2500)){ $('input').value=interim; autoGrow(); syncSendBtn(); }",
+        "    if(interim){",
+        "      // P46: remember the partial text and arm the honest-message timer.",
+        "      // If no final result ever arrives, the timer surfaces what was",
+        "      // partially heard instead of leaving silence.",
+        "      try{ if(window.EnzoHearFix46) window.EnzoHearFix46.recordInterim(interim, hearFix46Opts()); }catch(err){}",
+        "    }",
+        "    if(finalTxt.trim()){",
+        "      // P46: a final result arrived, so the partial timer is not needed.",
+        "      try{ if(window.EnzoHearFix46) window.EnzoHearFix46.clearInterim(); }catch(err){}",
+        "    }"
+      ].join("\n")
+    },
+    {
+      site: 3,
+      where: "fix42 export tail + IIFE close — live file L54327-L54330",
+      original: [
+        "  if(typeof root !== 'undefined') root.EnzoVoiceFix42 = EnzoVoiceFix42;",
+        "  if(typeof module !== 'undefined' && module.exports) module.exports = EnzoVoiceFix42;",
+        "",
+        "})(typeof window !== 'undefined' ? window : this);"
+      ].join("\n"),
+      replacement: "SAME FOUR ANCHOR LINES, THEN THE WHOLE EnzoHearFix46 MODULE IIFE FROM THIS FILE (MODULE-START..MODULE-END, VERBATIM)."
+    }
+  ];
+
+  var EnzoHearFix46 = {
+    VERSION: VERSION,
+    PARTIAL_TIMEOUT_MS: PARTIAL_TIMEOUT_MS,
+    PARTIAL_MAX_CHARS: PARTIAL_MAX_CHARS,
+    SAY_AGAIN_EN: SAY_AGAIN_EN,
+    SAY_AGAIN_ROMAN: SAY_AGAIN_ROMAN,
+    sayAgainLangFor: sayAgainLangFor,
+    recordInterim: recordInterim,
+    clearInterim: clearInterim,
+    surfacePartial: surfacePartial,
+    onRecognitionError: onRecognitionError,
+    reset: reset,
+    ASSEMBLY_SITES: ASSEMBLY_SITES
+  };
+
+  /* Export tail (guarded): browser global for the live page, and a
+     module.exports assignment so the Node harness loads this exact
+     file with no copy of the logic. No dependencies either way. */
+  if(typeof root !== 'undefined') root.EnzoHearFix46 = EnzoHearFix46;
+  if(typeof module !== 'undefined' && module.exports) module.exports = EnzoHearFix46;
+
+})(typeof window !== 'undefined' ? window : this);
+/* === MODULE-END: EnzoHearFix46 (piece 46) === */
+</script>
+<script>
+/* PIECE 43 — EnzoHearFix43 transliteration retry (enao-hear-fix, v64-voice-live). Own <script>, inert until onHeard runs from onresult. Includes the top-level ORIGINAL_SITE_1 / REPLACEMENT_SITE_1 vars — the module references them. */
+var ORIGINAL_SITE_1 = `      var gateRes55 = window.EnzoVoiceFix42 ? window.EnzoVoiceFix42.gateMicQuestion(heard, {source:'call'}) : (window.EnzoVoiceID ? window.EnzoVoiceID.gateAndRoute(heard, {source:'call'}) : {proceed:true});
+      if(!gateRes55.proceed){
+if(gateRes55.decision && gateRes55.decision.decision==='refuse' && gateRes55.decision.speak && gateRes55.decision.refusal && !gateRes55.refusalSpoken){
+  try{ maybeSpeak({plain: gateRes55.decision.refusal, viaVoice:true, lang: (window.EnzoLang47?window.EnzoLang47.normaliseRefusalLang(gateRes55.decision.refusalLang):(gateRes55.decision.refusalLang==='ur' ? 'urdu' : gateRes55.decision.refusalLang))}); }catch(e){}
+}
+        return;
+      }`;
+
+/* --------------------------------------------------------------------------
+ * SITE 1 — REPLACEMENT. Identical to the original above, plus the fix43
+ * hook inserted after the gate block and before the busy-queue branch
+ * (base line 12362: `if(state.isGenerating || state.isSpeaking){`).
+ * `heard` is `var heard = finalTxt.trim()` (line 12350), so reassigning
+ * it feeds the decoded text into the existing queue/send code unchanged.
+ * The hook is fully guarded: if the module failed to load, or throws,
+ * the original flow continues with the undecoded transcript.
+ * -------------------------------------------------------------------------- */
+var REPLACEMENT_SITE_1 = `      var gateRes55 = window.EnzoVoiceFix42 ? window.EnzoVoiceFix42.gateMicQuestion(heard, {source:'call'}) : (window.EnzoVoiceID ? window.EnzoVoiceID.gateAndRoute(heard, {source:'call'}) : {proceed:true});
+      if(!gateRes55.proceed){
+if(gateRes55.decision && gateRes55.decision.decision==='refuse' && gateRes55.decision.speak && gateRes55.decision.refusal && !gateRes55.refusalSpoken){
+  try{ maybeSpeak({plain: gateRes55.decision.refusal, viaVoice:true, lang: (window.EnzoLang47?window.EnzoLang47.normaliseRefusalLang(gateRes55.decision.refusalLang):(gateRes55.decision.refusalLang==='ur' ? 'urdu' : gateRes55.decision.refusalLang))}); }catch(e){}
+}
+        return;
+      }
+      /* fix43 (piece 43): transliteration-gibberish retry. Runs AFTER the
+         voice-ID gate passes and BEFORE the busy-queue / send branches, so
+         a decoded transcript is queued/sent exactly like a normal one.
+         onHeard() switches recognition.lang to en-US immediately and
+         returns the decoded English when the whole transcript decodes;
+         otherwise it returns the original text unchanged. */
+      if(window.EnzoHearFix43){
+        try{
+          var fix43 = window.EnzoHearFix43.onHeard(heard, { recognition: (typeof recognition !== 'undefined' ? recognition : null), state: state, langFor: (window.EnzoLang46 ? window.EnzoLang46.recognitionLangFor : null) });
+          if(fix43 && fix43.retried){ heard = fix43.text; }
+        }catch(e){}
+      }`;
+
+/* --------------------------------------------------------------------------
+ * VERIFIED, NO CHANGE — askQuestion (base line 11646-11648) and backendAsk
+ * (base lines 20803-20805). Quoted here so the assembler can confirm they
+ * already do the right thing once the sent text is decoded English.
+ *   var lang = (window.EnzoLang45 ? window.EnzoLang45.askLang(text, state.langPref, detectLang) : detectLang(text));
+ *   state.lastAnswerLang = lang;
+ *   try{ if(typeof recognition!=='undefined' && recognition && state.voiceLive && window.EnzoLang46) recognition.lang = window.EnzoLang46.recognitionLangFor(lang); }catch(e){}
+ * -------------------------------------------------------------------------- */
+
+(function(root){
+  'use strict';
+
+  var VERSION = 'fix43-transliteration-retry-v1';
+
+  /* Frequent English words as the ur-PK recogniser renders them in Urdu
+     script. Deliberately small and high-confidence: every entry must be a
+     word whose Urdu-script form is (a) actually produced for that English
+     word and (b) not a genuine Urdu/Punjabi word on its own. Deliberately
+     EXCLUDED: 'ہو' (genuine "are/have" — vetoed anyway), 'گو', 'سو', 'مچ'
+     (ambiguous with genuine Urdu words). 'وائن' is Raja's reported form
+     of "want" (want without the final t); 'وانٹ' is the fuller form. */
+  var TRANSLITERATION_DICT = {
+    'ہیلو': 'hello',
+    'ہائی': 'hi',
+    'ڈو': 'do',
+    'یو': 'you',
+    'وائن': 'want',
+    'وانٹ': 'want',
+    'وونٹ': 'want',
+    'ڈونٹ': "don't",
+    'واٹ': 'what',
+    'واٹس': "what's",
+    'ہاؤ': 'how',
+    'آر': 'are',
+    'از': 'is',
+    'ایم': 'am',
+    'دی': 'the',
+    'کین': 'can',
+    'پلیز': 'please',
+    'ٹیل': 'tell',
+    'می': 'me',
+    'مائی': 'my',
+    'نیم': 'name',
+    'یور': 'your',
+    'دس': 'this',
+    'دیٹ': 'that',
+    'گڈ': 'good',
+    'مارننگ': 'morning',
+    'تھینک': 'thank',
+    'تھینکس': 'thanks',
+    'یس': 'yes',
+    'نو': 'no',
+    'اوکے': 'okay',
+    'ریسرچ': 'research',
+    'ویڈیو': 'video',
+    'چینل': 'channel',
+    'وائی': 'why',
+    'وین': 'when',
+    'ویئر': 'where',
+    'ٹوڈے': 'today',
+    'ہیلپ': 'help',
+    'گیو': 'give',
+    'شو': 'show',
+    'ایکسپلین': 'explain',
+    'اباؤٹ': 'about',
+    'بیسٹ': 'best',
+    'نیو': 'new',
+    'میک': 'make',
+    'آئی': 'I',
+    'ٹو': 'to',
+    'اینزو': 'Enzo',
+    'سٹاپ': 'stop',
+    'سٹارٹ': 'start'
+  };
+
+  /* Genuine Urdu (script) / Shahmukhi Punjabi words. VETO: if ANY token
+     is in this list, the transcript is genuine Urdu/Punjabi and NO retry
+     happens, whatever else it contains. Checked BEFORE the dictionary,
+     so a collision (e.g. 'ہو') can never fire. Covers function words
+     plus the common content words in Raja's reported genuine utterances
+     ("تسی کیدا کر رہے ہو", "کیا حال ہے") and everyday greetings
+     ("سلام", "شکریہ"). */
+  var GENUINE_WORDS = {
+    'کیا': 1, 'ہے': 1, 'ہیں': 1, 'کا': 1, 'کی': 1, 'کے': 1, 'میں': 1,
+    'مجھے': 1, 'آپ': 1, 'یہ': 1, 'وہ': 1, 'نہیں': 1, 'اور': 1, 'پر': 1,
+    'سے': 1, 'کو': 1, 'بھی': 1, 'تھا': 1, 'تھی': 1, 'کر': 1, 'کرو': 1,
+    'رہے': 1, 'رہا': 1, 'رہی': 1, 'ہو': 1, 'ہوں': 1, 'تسی': 1,
+    'مینوں': 1, 'تینوں': 1, 'کیدا': 1, 'کدھر': 1, 'کتھے': 1, 'کیوں': 1,
+    'کب': 1, 'کیسا': 1, 'کیسی': 1, 'میرا': 1, 'میری': 1, 'حال': 1,
+    'چاہیے': 1, 'بولو': 1, 'بتاؤ': 1, 'سمجھاؤ': 1, 'آج': 1, 'کل': 1,
+    'بہت': 1, 'اچھا': 1, 'ٹھیک': 1, 'کرنا': 1, 'جاؤ': 1, 'آؤ': 1,
+    'دسو': 1, 'سنو': 1, 'دیکھو': 1, 'کرتے': 1, 'کرتا': 1, 'کیتی': 1,
+    'ہور': 1, 'جانا': 1, 'آنا': 1, 'بول': 1, 'سن': 1, 'دے': 1, 'لو': 1,
+    'گیا': 1, 'گئی': 1, 'نے': 1, 'تو': 1, 'جو': 1, 'جب': 1, 'اگر': 1,
+    'پھر': 1, 'اب': 1, 'اس': 1, 'ان': 1, 'تم': 1, 'ہم': 1, 'وہاں': 1,
+    'یہاں': 1, 'کس': 1, 'کون': 1, 'کہاں': 1, 'کتنا': 1, 'کیسے': 1,
+    'سلام': 1, 'شکریہ': 1, 'اللہ': 1, 'خدا': 1, 'جانتا': 1, 'کرو؟': 1
+  };
+
+  /* Per page load. switchedFor: the transcript text a switch was already
+     done for (one switch per distinct transcript). switches: how many
+     lang switches actually happened (test hook: must stay <= 1 while
+     recognition.lang is already the target). decodes: full decodes done. */
+  var retryState = { switchedFor: null, switches: 0, decodes: 0 };
+
+  function hasArabicScript(text){
+    return /[\u0600-\u06FF]/.test(String(text || ''));
+  }
+
+  /* Normalise one token: strip Arabic diacritics/tatweel, unify Arabic
+     Yeh/Kaf/Heh to their Urdu forms (Chrome's ur-PK output varies). */
+  function normaliseToken(tok){
+    return String(tok || '')
+      .replace(/[\u064B-\u0652\u0670\u0640]/g, '')
+      .replace(/\u064A/g, '\u06CC')
+      .replace(/\u0643/g, '\u06A9')
+      .replace(/\u0647/g, '\u06C1')
+      .replace(/[^\u0600-\u06FF]/g, '');
+  }
+
+  function tokenize(text){
+    var out = [];
+    String(text || '').split(/\s+/).forEach(function(raw){
+      var t = normaliseToken(raw);
+      if(t) out.push(t);
+    });
+    return out;
+  }
+
+  /* Conservative detector. Fires ONLY when: the text is Urdu-script AND
+     no token is a genuine Urdu/Punjabi word AND the dictionary covers
+     the transcript (single token: that token is in the dictionary;
+     multi-token: >= 2 dictionary hits and >= 50% coverage). A genuine
+     Urdu sentence that happens to contain one transliterated loanword
+     therefore never fires (veto, or < 2 hits, or < 50% coverage). */
+  function isTransliteratedEnglish(text){
+    if(!hasArabicScript(text)) return false;
+    var toks = tokenize(text);
+    if(!toks.length) return false;
+    var i, hits = 0;
+    for(i = 0; i < toks.length; i++){
+      if(GENUINE_WORDS[toks[i]]) return false;
+      if(TRANSLITERATION_DICT[toks[i]]) hits++;
+    }
+    if(toks.length === 1) return hits === 1;
+    return hits >= 2 && (hits / toks.length) >= 0.5;
+  }
+
+  /* Full decode only: every token must map, otherwise null (never invent
+     words for unknown tokens — the caller then sends the original). */
+  function decodeTransliteratedEnglish(text){
+    if(!isTransliteratedEnglish(text)) return null;
+    var toks = tokenize(text);
+    var i;
+    for(i = 0; i < toks.length; i++){
+      if(!TRANSLITERATION_DICT[toks[i]]) return null;
+    }
+    return toks.map(function(t){ return TRANSLITERATION_DICT[t]; }).join(' ');
+  }
+
+  /* Wiring entry point, called from onresult after the gate passes.
+     ctx: { recognition, state, langFor } — langFor is
+     EnzoLang46.recognitionLangFor when present, else the 'en-US'
+     fallback is used directly (the map is proven correct; this piece
+     never re-implements it). Returns { text, retried, decoded,
+     fromLang, toLang, switched } where `text` is what onresult should
+     use as `heard` from here on. Never throws. */
+  function onHeard(heard, ctx){
+    ctx = ctx || {};
+    var result = { text: heard, retried: false, decoded: null,
+      fromLang: null, toLang: null, switched: false };
+    try{
+      if(!isTransliteratedEnglish(heard)) return result;
+      var rec = ctx.recognition || null;
+      var fromLang = (rec && rec.lang) ? rec.lang : 'ur-PK';
+      var target = 'en-US';
+      if(typeof ctx.langFor === 'function'){
+        try{ target = ctx.langFor('en') || 'en-US'; }catch(e){ target = 'en-US'; }
+      }
+      result.fromLang = fromLang;
+      result.toLang = target;
+      result.retried = true;
+      /* ONE retry: switch at most once per distinct transcript, and
+         only when the recogniser is not already on the target language.
+         No stop()/start() — see header: the continuous loop's natural
+         restart picks the new lang up, and the send path re-asserts it. */
+      if(rec && rec.lang !== target && retryState.switchedFor !== heard){
+        try{
+          rec.lang = target;
+          retryState.switchedFor = heard;
+          retryState.switches++;
+          result.switched = true;
+        }catch(e){}
+      }
+      /* Record the outcome so the switch sticks, via the existing
+         lastAnswerLang path — but only in Auto mode. With a fixed
+         language setting the send path recomputes from the setting
+         anyway, and this piece must not fight the user's setting. */
+      if(ctx.state && (!ctx.state.langPref || ctx.state.langPref === 'auto')){
+        try{ ctx.state.lastAnswerLang = 'en'; }catch(e){}
+      }
+      var decoded = decodeTransliteratedEnglish(heard);
+      if(decoded){
+        retryState.decodes++;
+        result.decoded = decoded;
+        result.text = decoded;
+      }
+      /* Partial decode (decoded === null): text stays the original
+         gibberish — never invent words — but the lang switch above
+         still applies to the next listen. */
+      return result;
+    }catch(e){
+      return { text: heard, retried: false, decoded: null,
+        fromLang: null, toLang: null, switched: false };
+    }
+  }
+
+  function resetForTest(){
+    retryState.switchedFor = null;
+    retryState.switches = 0;
+    retryState.decodes = 0;
+  }
+
+  var api = {
+    VERSION: VERSION,
+    TRANSLITERATION_DICT: TRANSLITERATION_DICT,
+    GENUINE_WORDS: GENUINE_WORDS,
+    retryState: retryState,
+    hasArabicScript: hasArabicScript,
+    tokenize: tokenize,
+    isTransliteratedEnglish: isTransliteratedEnglish,
+    decodeTransliteratedEnglish: decodeTransliteratedEnglish,
+    onHeard: onHeard,
+    resetForTest: resetForTest,
+    ORIGINAL_SITE_1: ORIGINAL_SITE_1,
+    REPLACEMENT_SITE_1: REPLACEMENT_SITE_1
+  };
+
+  if(typeof root !== 'undefined') root.EnzoHearFix43 = api;
+  if(typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof window !== 'undefined' ? window : globalThis);
 </script>
 
 <!-- v62-voice-lang piece 43-voice-flag-and-volume.js sha256:c883b6abc077e1bf18a83105a6d441e457a87ebc93a7e417b23666d824e9acea -->
@@ -57440,6 +58417,340 @@ function conversationReply(text, lang, ctx) {
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', boot56); else boot56();
   document.addEventListener('click', function(){ setTimeout(mountRulesSettings56, 80); });
 })();
+</script>
+
+<script>
+/* PIECE 47 — EnzoHearDebug47 on-device mic debug readout (enao-hear-fix, v64-voice-live). Settings-only, read-only. */
+// ===== BEGIN MODULE — insert whole block as a new <script> before </body> =====
+(function(root){
+  'use strict';
+  /* Read-only, on-device-only. No network, no storage writes, no new
+     permissions (permissions.query never prompts), no TTS, no gate change.
+     ES5, guarded everywhere: any failure here must never break the mic path. */
+  var STORAGE_PROFILES = 'enao_voiceid_profiles_v1';
+  var STORAGE_LANG = 'enao_lang';
+  var ENERGY_DEFAULT = 0.015;
+  var last = freshLast();
+  var boxEl = null, bodyEl = null, installed = false, permQueryInFlight = false;
+
+  function freshLast(){
+    return {
+      at: null, recognitionLang: null, interim: '', finalTxt: '',
+      gateEnergy: null, gateFrames: null,
+      gateDecision: null, gateReason: null, gateScore: null,
+      gateMatchedProfile: null, gateVoiceCheck: null, gateSurfaced: null,
+      lastError: null, lastErrorAt: null,
+      micPermission: 'unknown — not checked yet'
+    };
+  }
+  function safeGet(k){
+    try{
+      if(typeof localStorage !== 'undefined'){
+        var v = localStorage.getItem(k);
+        return v === null ? null : v;
+      }
+    }catch(e){}
+    return null;
+  }
+  function srSupported(){
+    try{ return !!(root.SpeechRecognition || root.webkitSpeechRecognition); }
+    catch(e){ return false; }
+  }
+  function energyThreshold(){
+    try{
+      if(root.EnzoVoiceID && typeof root.EnzoVoiceID.ENERGY_THRESHOLD === 'number')
+        return root.EnzoVoiceID.ENERGY_THRESHOLD;
+    }catch(e){}
+    return ENERGY_DEFAULT;
+  }
+  /* Energy/frames re-read just after the gate ran — the value the gate
+     judged (RC1: trailing silence vs speech). Null when the window is
+     empty/stale, exactly as currentWindowFeatures() reports it. */
+  function windowFeatures(){
+    try{
+      if(root.EnzoVoiceID && typeof root.EnzoVoiceID.currentWindowFeatures === 'function'){
+        var w = root.EnzoVoiceID.currentWindowFeatures();
+        if(w) return {
+          energy: (typeof w.energy === 'number' ? w.energy : null),
+          frames: (typeof w.frames === 'number' ? w.frames : null)
+        };
+      }
+    }catch(e){}
+    return { energy: null, frames: null };
+  }
+  /* Prefer the voice-ID module's own list; fall back to a read-only parse
+     of its localStorage key (same key the audit names, L33358). */
+  function readProfiles(){
+    var out = { enrolled: false, count: 0, rajaEnrolled: false, entries: [] };
+    var i, list, en;
+    try{
+      if(root.EnzoVoiceID && typeof root.EnzoVoiceID.listAuthorizedVoices === 'function'){
+        list = root.EnzoVoiceID.listAuthorizedVoices();
+        for(i = 0; i < list.length; i++){
+          out.entries.push({
+            name: list[i].name, isRaja: !!list[i].isRaja,
+            sampleCount: (typeof list[i].sampleCount === 'number' ? list[i].sampleCount : null)
+          });
+          if(list[i].isRaja) out.rajaEnrolled = true;
+        }
+        out.count = out.entries.length;
+        out.enrolled = out.count > 0;
+        return out;
+      }
+    }catch(e){}
+    try{
+      var raw = safeGet(STORAGE_PROFILES);
+      if(raw){
+        var arr = JSON.parse(raw);
+        for(i = 0; i < arr.length; i++){
+          en = arr[i];
+          if(en && typeof en.name === 'string'){
+            out.entries.push({
+              name: en.name, isRaja: !!en.isRaja,
+              sampleCount: (en.profile && typeof en.profile.count === 'number' ? en.profile.count : null)
+            });
+            if(en.isRaja) out.rajaEnrolled = true;
+          }
+        }
+        out.count = out.entries.length;
+        out.enrolled = out.count > 0;
+      }
+    }catch(e2){}
+    return out;
+  }
+  function langSetting(){
+    var stored = safeGet(STORAGE_LANG);
+    if(stored === null || stored === '') stored = 'auto';
+    var pref = null;
+    try{ if(root.state && typeof root.state.langPref === 'string') pref = root.state.langPref; }
+    catch(e){}
+    return { stored: stored, statePref: pref };
+  }
+  function voiceVerdict(){
+    var d = last.gateDecision, r = last.gateReason;
+    if(!d) return 'no gate verdict recorded yet';
+    if(d === 'ignore') return 'ignore — blocked as low-energy (' + (r || 'no reason') + ')';
+    if(d === 'accept' && r === 'no-profile')
+      return 'accept — no voice profile enrolled, so the gate never blocks';
+    if(d === 'accept') return 'accept — voice matched (' + (r || 'matched') + ')';
+    if(d === 'refuse') return 'refuse — measured non-Raja voice (' + (r || 'no reason') + ')';
+    if(d === 'chat') return 'chat — guest conversation, proceeds';
+    return d + ' (' + (r || 'no reason') + ')';
+  }
+  /* permissions.query() only READS the state; it never prompts. Deliberately
+     does NOT set p.onchange — the live watcher (base L12452-L12457) owns it. */
+  function refreshMicPermission(){
+    try{
+      if(typeof navigator === 'undefined' || !navigator.permissions ||
+         !navigator.permissions.query){
+        if(last.micPermission === 'unknown — not checked yet')
+          last.micPermission = 'unavailable — Permissions API not supported in this browser';
+        return;
+      }
+      if(permQueryInFlight) return;
+      permQueryInFlight = true;
+      navigator.permissions.query({ name: 'microphone' }).then(function(p){
+        permQueryInFlight = false;
+        if(p.state !== last.micPermission){
+          last.micPermission = p.state;
+          if(bodyEl) render();
+        }
+      }).catch(function(){
+        permQueryInFlight = false;
+        last.micPermission = 'unavailable — permission query failed';
+      });
+    }catch(e){ permQueryInFlight = false; }
+  }
+  function recordInterim(interim, lang){
+    try{
+      if(interim) last.interim = String(interim).slice(0, 500);
+      if(lang) last.recognitionLang = lang;
+    }catch(e){}
+    return snapshot();
+  }
+  function recordFinal(heard, lang, gateRes){
+    try{
+      last.finalTxt = String(heard || '').slice(0, 500);
+      if(lang) last.recognitionLang = lang;
+      last.at = new Date().toISOString();
+      var w = windowFeatures();
+      last.gateEnergy = w.energy;
+      last.gateFrames = w.frames;
+      var d = gateRes ? gateRes.decision : null;
+      last.gateDecision = d ? d.decision : null;
+      last.gateReason = d ? d.reason : null;
+      last.gateScore = (d && typeof d.score === 'number') ? d.score : null;
+      last.gateMatchedProfile = d ? (d.matchedProfile || null) : null;
+      last.gateVoiceCheck = gateRes ? (gateRes.voiceCheck || null) : null;
+      last.gateSurfaced = gateRes ? (gateRes.surfaced || null) : null;
+      refreshMicPermission();
+      render();
+    }catch(e){}
+    return snapshot();
+  }
+  function recordError(err){
+    try{
+      last.lastError = String(err || 'unknown');
+      last.lastErrorAt = new Date().toISOString();
+    }catch(e){}
+    return snapshot();
+  }
+  function snapshot(){
+    var p = readProfiles();
+    var lg = langSetting();
+    var th = energyThreshold();
+    var verdict;
+    if(last.gateEnergy === null) verdict = 'not measured (no feature window at gate time)';
+    else verdict = (last.gateEnergy < th ? 'below' : 'at/above') + ' threshold ' + th;
+    return {
+      at: last.at,
+      recognitionLang: last.recognitionLang,
+      speechRecognitionSupported: srSupported(),
+      /* Honest unknown: the Web Speech API exposes no per-language
+         support check, so this is never guessed. The lang actually used
+         (recognitionLang above) is the evidence instead. */
+      urPkSupported: 'unknown — the Web Speech API has no per-language support check; this readout shows the language actually used instead',
+      interimTranscript: last.interim,
+      finalTranscript: last.finalTxt,
+      gateEnergy: last.gateEnergy,
+      gateEnergyThreshold: th,
+      gateEnergyVerdict: verdict,
+      gateFrames: last.gateFrames,
+      gateDecision: last.gateDecision,
+      gateReason: last.gateReason,
+      gateScore: last.gateScore,
+      gateMatchedProfile: last.gateMatchedProfile,
+      gateVoiceCheck: last.gateVoiceCheck,
+      gateSurfaced: last.gateSurfaced,
+      voiceVerdict: voiceVerdict(),
+      micPermission: last.micPermission,
+      enaoLangStored: lg.stored,
+      enaoLangStatePref: lg.statePref,
+      profilesEnrolled: p.enrolled,
+      profileCount: p.count,
+      rajaEnrolled: p.rajaEnrolled,
+      profileEntries: p.entries,
+      lastError: last.lastError,
+      lastErrorAt: last.lastErrorAt
+    };
+  }
+  function rows(){
+    var s = snapshot();
+    var prof;
+    if(!s.profilesEnrolled) prof = 'none enrolled';
+    else prof = s.profileCount + ' enrolled' +
+      (s.rajaEnrolled ? ' — Raja enrolled' : ' — Raja NOT enrolled') +
+      ', samples: ' + s.profileEntries.map(function(e){
+        return e.name + ' (' + (e.sampleCount === null ? '?' : e.sampleCount) + ')';
+      }).join(', ');
+    return [
+      { label: 'Recognition language in use', value: s.recognitionLang || '— none yet' },
+      { label: 'Last final transcript', value: s.finalTranscript || '— none yet' },
+      { label: 'Last interim transcript', value: s.interimTranscript || '— none yet' },
+      { label: 'Gate energy at gate time',
+        value: (s.gateEnergy === null ? 'not measured' : String(s.gateEnergy)) +
+          ' (threshold ' + s.gateEnergyThreshold + ' — ' + s.gateEnergyVerdict + ')' },
+      { label: 'Gate frames in window', value: (s.gateFrames === null ? 'not measured' : String(s.gateFrames)) },
+      { label: 'Gate decision', value: (s.gateDecision || '— none yet') + (s.gateReason ? ' — ' + s.gateReason : '') },
+      { label: 'Gate score / matched profile',
+        value: (s.gateScore === null ? 'no score' : String(s.gateScore)) + ' / ' + (s.gateMatchedProfile || 'none') },
+      { label: 'Voice-ID verdict', value: s.voiceVerdict },
+      { label: 'Mic permission (this browser)', value: s.micPermission },
+      { label: 'Answer language setting (enao_lang)',
+        value: s.enaoLangStored + ((s.enaoLangStatePref && s.enaoLangStatePref !== s.enaoLangStored)
+          ? ' (live state: ' + s.enaoLangStatePref + ')' : '') },
+      { label: 'Voice profile enrolled', value: prof },
+      { label: 'Speech recognition available',
+        value: s.speechRecognitionSupported ? 'yes (SpeechRecognition present)' : 'no — voice needs Chrome or Edge' },
+      { label: 'ur-PK recognition supported', value: s.urPkSupported },
+      { label: 'Last recognition error',
+        value: s.lastError ? s.lastError + ' at ' + s.lastErrorAt : 'none recorded' },
+      { label: 'Last update', value: s.at || '— no mic utterance recorded yet' }
+    ];
+  }
+  /* Settings-only rendering, reusing the existing .setsec / .lrn-note /
+     .lrn-row styles. Transcript text goes through textContent, never
+     innerHTML, so Urdu script or quotes in it cannot break the page. */
+  function render(){
+    try{
+      if(typeof document === 'undefined') return false;
+      var card = document.querySelector('#settingsModal .modal-card');
+      if(!card) return false;
+      if(!boxEl){
+        boxEl = document.createElement('div');
+        boxEl.id = 'hearDebug47Box';
+        var h = document.createElement('h4');
+        h.className = 'setsec';
+        h.textContent = 'Mic debug — on-device only';
+        boxEl.appendChild(h);
+        var note = document.createElement('p');
+        note.className = 'lrn-note';
+        note.textContent = 'Read-only. Last mic utterance only — nothing here is sent anywhere, and nothing here changes how ENZO hears you.';
+        boxEl.appendChild(note);
+        bodyEl = document.createElement('div');
+        bodyEl.id = 'hearDebug47Body';
+        boxEl.appendChild(bodyEl);
+        card.appendChild(boxEl);
+      }
+      if(!bodyEl) return false;
+      while(bodyEl.firstChild) bodyEl.removeChild(bodyEl.firstChild);
+      var rs = rows();
+      for(var i = 0; i < rs.length; i++){
+        var row = document.createElement('div');
+        row.className = 'lrn-row';
+        var sp = document.createElement('span');
+        sp.textContent = rs[i].label;
+        var b = document.createElement('b');
+        b.textContent = rs[i].value;
+        row.appendChild(sp);
+        row.appendChild(b);
+        bodyEl.appendChild(row);
+      }
+      refreshMicPermission();
+      return true;
+    }catch(e){ return false; }
+  }
+  /* Chain onto refreshSettingsUI (same pattern as the learned wrapper,
+     base L21348-L21351): the original still runs first, then we render. */
+  function install(){
+    if(installed) return true;
+    installed = true;
+    try{
+      if(typeof root.refreshSettingsUI === 'function'){
+        var orig = root.refreshSettingsUI;
+        root.refreshSettingsUI = function(){
+          var r = orig.apply(this, arguments);
+          try{ render(); }catch(e){}
+          return r;
+        };
+      }
+    }catch(e){}
+    try{ render(); }catch(e2){}
+    return true;
+  }
+  function reset(){
+    last = freshLast();
+    boxEl = null;
+    bodyEl = null;
+    return { ok: true };
+  }
+  var EnzoHearDebug47 = {
+    VERSION: '47-debug-readout-v1',
+    recordInterim: recordInterim,
+    recordFinal: recordFinal,
+    recordError: recordError,
+    snapshot: snapshot,
+    rows: rows,
+    render: render,
+    refreshMicPermission: refreshMicPermission,
+    install: install,
+    reset: reset
+  };
+  if(typeof root !== 'undefined') root.EnzoHearDebug47 = EnzoHearDebug47;
+  if(typeof module !== 'undefined' && module.exports) module.exports = EnzoHearDebug47;
+  if(typeof document !== 'undefined'){ try{ install(); }catch(e){} }
+})(typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : this));
+// ===== END MODULE =====
 </script>
 
 </body>
