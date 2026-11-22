@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
+<meta name="enao-build" content="v63-fixes">
 <meta name="enao-build" content="v62-backend-fix">
 <meta name="enao-build" content="v62-learning">
 <meta name="enao-build" content="v62-identity">
@@ -1087,6 +1088,7 @@ function extractTopic(text) {
   t = t.replace(/\b(please|braah|baraah)\b/gi, ' ');
   t = t.replace(/\b(deep\s+)?research\s+(on|about|par|ke\s+baare\s+mein)\s+/gi, ' ');
   t = t.replace(/^\s*(is\s+par|us\s+par|is\s+ke\s+baare\s+mein|اس\s+پر|اس\s+کے\s+بارے\s+میں)\s*(research|ریسرچ|تحقیق)\s*(karo|kar|karke|kar\s+ke\s+do|کرو|کر|کریں|کر\s*کے)?\s*/gi, ' ');
+  t = t.replace(/^\s*find\s+out\s+(about\s+)?/gi, ' ');
   t = t.replace(/^\s*(research|investigate|investigation|find|search|explore|look\s+up|google|dhoond\w*|dhund\w*|khoj|shodh|tehqeeq|tahqeeq|jaanch|taftish|talaash|talash|ریسرچ|تحقیق|ڈھونڈ\S*|تلاش|گوگل|शोध|खोज|ढूंढ)\s*(karo|kar|karke|do|ke\s+do|kar\s+ke\s+do|کرو|کر|کریں|کر\s*کے|دو|کے|بتاؤ|دے|لو|करो|कर|करें|दो)?\s*/gi, ' ');
   t = t.replace(/\b(per|par|pe)\s+(dakho|dikhao|dekho|dekh|دیکھو|دکھاؤ)\b/gi, ' ');
   t = t.replace(/\b(kasy|kaise|kaisy|kesay|kese)\s+(karty|karte)\s+(han|hain)\b/gi, ' ');
@@ -5772,7 +5774,7 @@ window.__enzoGetTransport59 = function () {
    that kept a cached copy), refresh once to the live version so a phone
    never stays stuck on an old layout. Fails silently when offline. */
 (function(){
-  var ME='v62-backend-fix', lastCheck=0;
+  var ME='v63-fixes', lastCheck=0;
   function check(){
     var now=Date.now(); if(now-lastCheck<20000) return; lastCheck=now;
     try{
@@ -10454,6 +10456,68 @@ function ddgSearchP(query){
   }));
 }
 
+var PLATFORM_QUERY_WORDS={
+  youtube:['youtube','yt','یوٹیوب'],
+  instagram:['instagram','انسٹاگرام'],
+  facebook:['facebook','fb','فیسبک','فیس بک'],
+  tiktok:['tiktok','ٹکٹاک','ٹک ٹاک'],
+  x:['twitter','x','ٹویٹر','ایکس'],
+  reddit:['reddit','ریڈٹ'],
+  linkedin:['linkedin','لنکڈ ان'],
+  pinterest:['pinterest','پنٹرسٹ'],
+  snapchat:['snapchat','سنیپ چیٹ'],
+  telegram:['telegram','ٹیلی گرام'],
+  threads:['threads','تھریڈز'],
+  vimeo:['vimeo','ویمیو'],
+  dailymotion:['dailymotion','ڈیلی موشن'],
+  wikipedia:['wikipedia','wiki','وکیپیڈیا']
+};
+/* Strip surrounding punctuation for comparison only (same punctuation
+   set as piece-31 cleanTok): "YouTube," matches "youtube", while
+   "youtubers" never does. The original token is kept when it is not
+   dropped, punctuation included. */
+function cleanPlaceTok(tok){
+  return String(tok||'').toLowerCase().replace(/^[?!.,;:'"()\[\]{}_\/\\\-–—~…؟۔،؛]+/g,'').replace(/[?!.,;:'"()\[\]{}_\/\\\-–—~…؟۔،؛]+$/g,'');
+}
+/* stripPlaceWordFromQuery(query, source) -> query without the tokens
+   naming the detected platform place. source is a detectSource canon
+   ('youtube', 'instagram', ...) or null/anything else. Returns the
+   query unchanged when source is not a platform (google, internet,
+   web, news, social, video, null). Whole tokens only, case-insensitive.
+   Multi-word forms are matched first, as consecutive whole tokens. */
+function stripPlaceWordFromQuery(query, source){
+  var forms=PLATFORM_QUERY_WORDS[source];
+  if(!forms) return query;
+  var toks=String(query||'').split(/\s+/).filter(Boolean);
+  if(!toks.length) return query;
+  var singles={}, phrases=[], i, f, parts;
+  for(i=0;i<forms.length;i++){
+    f=forms[i]; parts=String(f).toLowerCase().split(/\s+/);
+    if(parts.length>1) phrases.push(parts); else singles[parts[0]]=1;
+  }
+  var out=[], j, k, len, ok;
+  for(i=0;i<toks.length;i++){
+    len=0;
+    for(j=0;j<phrases.length;j++){
+      if(i+phrases[j].length>toks.length) continue;
+      ok=true;
+      for(k=0;k<phrases[j].length;k++){ if(cleanPlaceTok(toks[i+k])!==phrases[j][k]){ ok=false; break; } }
+      if(ok){ len=phrases[j].length; break; }
+    }
+    if(len){ i+=len-1; continue; }
+    if(!singles[cleanPlaceTok(toks[i])]) out.push(toks[i]);
+  }
+  return out.join(' ');
+}
+/* stripPlaceWordFromKeywords(keywords, source) -> keywords without the
+   tokens naming the detected platform place. Same rule as
+   stripPlaceWordFromQuery, applied to a keyword array. */
+function stripPlaceWordFromKeywords(keywords, source){
+  if(!PLATFORM_QUERY_WORDS[source] || !keywords || !keywords.length) return keywords||[];
+  var cleaned=stripPlaceWordFromQuery(keywords.join(' '), source);
+  return cleaned?cleaned.split(/\s+/):[];
+}
+
 /* --- Deep question understanding: type, intent, keywords --- */
 function analyzeQuestion(query){
   var q=(query||'').toLowerCase();
@@ -10469,6 +10533,12 @@ function analyzeQuestion(query){
   // core keywords: drop filler, keep meaningful words
   var stop={kya:1,hai:1,hain:1,ka:1,ki:1,ke:1,mein:1,me:1,aur:1,par:1,se:1,ko:1,bhi:1,yeh:1,woh:1,aap:1,mujhe:1,batao:1,bataein:1,samjhao:1,please:1,the:1,is:1,of:1,to:1,in:1,what:1,how:1,why:1,about:1,tell:1,give:1,explain:1};
   var words=q.replace(/[^a-z0-9\u0600-\u06FF\s]/g,' ').split(/\s+/).filter(function(w){ return w.length>2 && !stop[w]; });
+  /* FIX 2 (v63): place-word-aware keywords. The platform word is the
+     place, not the topic, so it must not reach the proxy as a keyword.
+     google / internet / news / null sources change nothing. */
+  var src=null;
+  try{ src=detectSource(query).source; }catch(e){}
+  words=stripPlaceWordFromKeywords(words, src);
   return {type:type, keywords:words.slice(0,6), original:query};
 }
 var ROMAN_MAP={mehengai:'inflation',badh:'increase',wajah:'reason',wajoohat:'reasons',asal:'real',tareekh:'history',adab:'literature',mausam:'weather',khabar:'news',khabrein:'news',konsa:'which',behtar:'best',behtareen:'best',sasta:'cheap',mehenga:'expensive',qemat:'price',keemat:'price',paise:'money',karobar:'business',talim:'education',sehat:'health',bimari:'disease',ilaj:'treatment',dawai:'medicine',khel:'sports',kitaab:'book',kahan:'where',kidhar:'where',kab:'when',kyun:'why',kyu:'why',kaise:'how',kaisa:'how',kitna:'how much',kitne:'how many',zindagi:'life',duniya:'world',mulk:'country',sheher:'city',gaon:'village',khaana:'food',khaanaa:'food',paani:'water',bijli:'electricity',safar:'travel',nokri:'job',kaam:'work',waqt:'time',din:'day',raat:'night',saal:'year',mahina:'month',hafta:'week',bacha:'child',larka:'boy',larki:'girl',aadmi:'man',aurat:'woman',dost:'friend',ghar:'home',school:'school',computer:'computer',mobile:'mobile phone',internet:'internet',aazadi:'freedom',jang:'war',aman:'peace',mazhab:'religion',siyasat:'politics',hukumat:'government',awaam:'people',kamyabi:'success',nakami:'failure',khushi:'happiness',pareshani:'problem',masla:'problem',hal:'solution',madad:'help',samajh:'understanding',mushkil:'difficult',aasaan:'easy',asaan:'easy',naya:'new',purana:'old',bara:'big',chota:'small',lamba:'long',tez:'fast',ahista:'slow',garmi:'heat',sardi:'cold',barish:'rain',zameen:'earth',aasmaan:'sky',sooraj:'sun',chaand:'moon',sitara:'star',samandar:'sea',darya:'river',pahari:'mountain',jangal:'forest',jaanwar:'animal',parinda:'bird',phool:'flower',darakht:'tree',sabzi:'vegetable',phal:'fruit'};
@@ -10479,20 +10549,24 @@ function romanToEnglish(query){
   return changed||out.join(' ')!==query.toLowerCase() ? out.join(' ').trim() : '';
 }
 function expandQueries(query, analysis){
-  var qs=[query];
-  var enQ=romanToEnglish(query);
+  var src=null;
+  try{ src=detectSource(query).source; }catch(e){}
+  var cleanQ=stripPlaceWordFromQuery(query, src);
+  if(!cleanQ) cleanQ=query;
+  var qs=[cleanQ];
+  var enQ=stripPlaceWordFromQuery(romanToEnglish(query), src);
   if(enQ && qs.indexOf(enQ)===-1) qs.unshift(enQ); // English version FIRST for Roman Urdu — best search results
-  var kw=(analysis.keywords||[]).join(' ');
-  var enKw=romanToEnglish(kw);
+  var kw=stripPlaceWordFromQuery((analysis.keywords||[]).join(' '), src);
+  var enKw=stripPlaceWordFromQuery(romanToEnglish(kw), src);
   if(enKw && qs.indexOf(enKw)===-1) qs.push(enKw);
-  if(kw && kw.toLowerCase()!==query.toLowerCase() && qs.indexOf(kw)===-1) qs.push(kw);
+  if(kw && kw.toLowerCase()!==cleanQ.toLowerCase() && qs.indexOf(kw)===-1) qs.push(kw);
   if(analysis.type==='definition' && (enKw||kw)) qs.push((enKw||kw)+' definition explained simply');
   if(analysis.type==='howto' && (enKw||kw)) qs.push((enKw||kw)+' step by step guide');
   if(analysis.type==='comparison' && (enKw||kw)) qs.push((enKw||kw)+' comparison pros cons best');
-  if(analysis.type==='current') qs.push((enQ||query)+' latest news today');
+  if(analysis.type==='current') qs.push((enQ||cleanQ)+' latest news today');
   if(analysis.type==='why' && (enKw||kw)) qs.push((enKw||kw)+' reasons causes explained');
   if(analysis.type==='writing' && (enKw||kw)) qs.push((enKw||kw)+' example format');
-  var shortQ=(enQ||query).split(/\s+/).slice(0,4).join(' ');
+  var shortQ=(enQ||cleanQ).split(/\s+/).slice(0,4).join(' ');
   if(shortQ && qs.indexOf(shortQ)===-1) qs.push(shortQ);
   return qs.slice(0,5);
 }
@@ -10920,16 +10994,19 @@ function aggregateFailKind(fails){
    or finds nothing, the browser fallbacks run in order and their real results
    are merged. Resolves {results, fails} — rejects only when aborted. */
 function searchOneQuery(query, limit, withUrdu){
-  return serverSearch(query, limit).then(function(so){
+  var cleanQ=query;
+  try{ cleanQ=stripPlaceWordFromQuery(query, detectSource(query).source); }catch(e){}
+  if(!cleanQ) cleanQ=query;
+  return serverSearch(cleanQ, limit).then(function(so){
     if(so.results.length){
       return enrichFromServer(so.results).then(function(rs){ return {results:rs, fails:[]}; });
     }
     var fails=[so.fail];
     var results=[];
-    var providers=[function(){ return wikiSearchP(query,'en',limit); }];
-    if(withUrdu) providers.push(function(){ return wikiSearchP(query,'ur',Math.ceil(limit/2)); });
-    providers.push(function(){ return ddgLiteSearchP(query); });
-    providers.push(function(){ return ddgSearchP(query); });
+    var providers=[function(){ return wikiSearchP(cleanQ,'en',limit); }];
+    if(withUrdu) providers.push(function(){ return wikiSearchP(cleanQ,'ur',Math.ceil(limit/2)); });
+    providers.push(function(){ return ddgLiteSearchP(cleanQ); });
+    providers.push(function(){ return ddgSearchP(cleanQ); });
     var chain=Promise.resolve();
     providers.forEach(function(p){
       chain=chain.then(function(){
@@ -11339,6 +11416,11 @@ function megaTopic(text, mega){
   topic=topic.replace(/\b(mujhe|chahiye|do|dein|batao|bataein|dhoondh\w*|search|find|research|karo|kar|ke|ka|ki|par|pe|is|the|of|for|me|give|list|top|best)\b/gi,' ').replace(/\s+/g,' ').trim();
   if(topic.length<3) topic=analyzeQuestion(text).keywords.join(' ');
   if(!topic) topic=text;
+  /* FIX 2 (v63): drop the named platform place word from the mega topic. */
+  var src=null;
+  try{ src=detectSource(text).source; }catch(e){}
+  var cleaned=stripPlaceWordFromQuery(topic, src);
+  if(cleaned) topic=cleaned;
   return topic;
 }
 function megaQueries(topic, entity){
@@ -48027,7 +48109,12 @@ function socResolveFetcher(opts) {
 function socSearchOnePlatform(platformId, query, fetcher) {
   var p = getPlatform(platformId);
   if (!p) return Promise.resolve([]);
-  var siteQuery = 'site:' + p.domain + ' ' + query;
+  /* FIX 2 (v63): drop the named platform place word from the query;
+     the site: filter already scopes the search to the platform. */
+  var cleanQ = query;
+  try{ cleanQ = stripPlaceWordFromQuery(query, detectSource(query).source); }catch(e){}
+  if (!cleanQ) cleanQ = query;
+  var siteQuery = 'site:' + p.domain + ' ' + cleanQ;
   var url = window.EnzoPagesBackend.getSearchUrl('/api/search?q=' + socEncode(siteQuery));
   return fetcher(url).then(function (payload) {
     var arr = [];
@@ -48776,7 +48863,12 @@ function searchVideos(options) {
 
   /* 1) The proxy: bias the query toward video results, then keep
      only links that are actually video links. */
-  var searchQuery = /\bvideo\b/i.test(query) ? query : query + ' video';
+  /* FIX 2 (v63): the query sent to the proxy drops the named platform
+     place word; `query` itself stays unchanged for relevance below. */
+  var cleanQ = query;
+  try{ cleanQ = stripPlaceWordFromQuery(query, detectSource(query).source); }catch(e){}
+  if (!cleanQ) cleanQ = query;
+  var searchQuery = /\bvideo\b/i.test(cleanQ) ? cleanQ : cleanQ + ' video';
   var proxyP = Promise.resolve().then(function () {
     return fetchJson(window.EnzoPagesBackend.getSearchUrl('/api/search?q=' + encodeURIComponent(searchQuery)));
   }).then(function (j) {
@@ -51682,7 +51774,12 @@ if (typeof module !== 'undefined' && module.exports) {
 
   function fetchJson58(url){ if(typeof fetchJSONT==='function') return fetchJSONT(url, 15000); return fetch(url).then(function(r){ return r.json(); }); }
   function fetchText58(url){ return fetchJson58(url).then(function(j){ return (j && typeof j.text==='string') ? j.text : ''; }); }
-  function search58(query){ return fetchJson58(window.EnzoPagesBackend.getSearchUrl('/api/search?q='+encodeURIComponent(query))).then(function(j){ var arr=[]; if(Array.isArray(j)) arr=j; else if(j) arr=j.results||j.items||[]; return arr; }); }
+function search58(query){
+  var cleanQ=query;
+  try{ cleanQ=stripPlaceWordFromQuery(query, detectSource(query).source); }catch(e){}
+  if(!cleanQ) cleanQ=query;
+  return fetchJson58(window.EnzoPagesBackend.getSearchUrl('/api/search?q='+encodeURIComponent(cleanQ))).then(function(j){ var arr=[]; if(Array.isArray(j)) arr=j; else if(j) arr=j.results||j.items||[]; return arr; });
+}
   function fetch58(url){ return fetchJson58(window.EnzoPagesBackend.getSearchUrl('/api/fetch?url='+encodeURIComponent(url))); }
   window.__enzoResearchDeps={ fetchJson:fetchJson58, fetchText:fetchText58, search:search58, fetch:fetch58 };
 
