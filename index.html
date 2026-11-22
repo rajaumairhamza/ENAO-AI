@@ -4,13 +4,2478 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<meta name="enao-build" content="v58-research-live">
+<meta name="enao-build" content="v59-live-research-fix">
 <meta name="enao-build" content="v57-universal-intel">
 <meta name="enao-build" content="v55-master-intel">
 <meta name="enao-build" content="v56-universal">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
+<script>
+/* ==========================================================================
+ * Piece 33 — GitHub Pages backend fix (ENAO AI live-defect track, defect 4)
+ * File: pieces/33-pages-backend.js
+ * Exposes: window.EnzoPagesBackend
+ *
+ * PROBLEM (verified live 22 Nov 2026, see VERIFICATION-33.md in this dir):
+ *   - https://rajaumairhamza.github.io/api/v2/health  -> 404 (GitHub
+ *     Pages serves static files only; there is no backend on github.io).
+ *   - https://enzoai.cu.gy/api/v2/health              -> 200.
+ *   The live export calls the backend same-origin (V2='/api/v2' and
+ *   several API_BASE='/api/v2' definitions), so on GitHub Pages live
+ *   research can NEVER work as shipped.
+ *
+ * FIX, PART 1 — this piece (frontend, no backend change):
+ *   Resolve the backend base at runtime from window.location.hostname:
+ *     enzoai.cu.gy, enao.130.210.18.252.nip.io -> same-origin '/api/v2'
+ *     ANY other host (github.io Pages, localhost preview, file preview,
+ *     anything else) -> absolute 'https://enzoai.cu.gy/api/v2'
+ *   The same rule covers the search proxy (/api/search, /api/fetch):
+ *     same-origin hosts keep '/api/search' etc.; every other host uses
+ *     'https://enzoai.cu.gy/api/search' etc. (the proxy already sends
+ *     Access-Control-Allow-Origin: *, verified live — those calls work
+ *     cross-origin today).
+ *
+ * FIX, PART 2 — backend CORS (REQUIRED, not optional):
+ *   The platform backend (enao-platform/server/server.py) currently
+ *   sends NO Access-Control-Allow-Origin on /api/v2 responses, and
+ *   answers OPTIONS preflight with 501 Unsupported method. A browser
+ *   on github.io will therefore refuse to read ANY /api/v2 response
+ *   and refuse the POST preflight, even with the absolute URL from
+ *   Part 1. Until the backend diff in cors-diff-server-py.diff is
+ *   deployed to the Oracle VM and the service restarted, live research
+ *   from the Pages build WILL fail in a real browser — curl succeeding
+ *   proves nothing about the browser, because curl does not enforce
+ *   CORS. This piece therefore never pretends the backend is reachable
+ *   until a real in-page check succeeds (see checkBackendReachable).
+ *
+ * HONEST-UNREACHABLE CONTRACT (assembler must wire this into the ask
+ * path — see WIRING below):
+ *   Before sending an ask, call checkBackendReachable(). If it reports
+ *   reachable === false, show buildUnavailableNotice(result) in the
+ *   chat and STOP. Do NOT send the ask, do NOT fall back to a silent
+ *   normal-mode answer, and do NOT fabricate research. The notice
+ *   states the reason in plain words.
+ *
+ * STYLE: plain ES5, var + function declarations, no modules, no
+ * dependencies, no emojis. No paid service anywhere.
+ * ========================================================================== */
+(function (root) {
+  'use strict';
+
+  /* ------------------------------------------------------------------ */
+  /* Constants                                                           */
+  /* ------------------------------------------------------------------ */
+
+  /* Hosts that serve the page from the SAME origin as the backend, so
+     a relative /api/v2 base works. Only these two hosts were verified
+     live to answer /api/v2/health with 200. Anything else — including
+     www.enzoai.cu.gy, which was NOT verified — takes the absolute
+     backend URL, which is correct once the backend CORS diff is live. */
+  var SAME_ORIGIN_HOSTS = [
+    'enzoai.cu.gy',
+    'enao.130.210.18.252.nip.io'
+  ];
+
+  var ABSOLUTE_BACKEND_ORIGIN = 'https://enzoai.cu.gy';
+  var ABSOLUTE_BACKEND_BASE = 'https://enzoai.cu.gy/api/v2';
+  var RELATIVE_BACKEND_BASE = '/api/v2';
+
+  /* The search proxy lives on the same Oracle host, behind the same
+     nginx, at /api/search and /api/fetch. Same host rule as the
+     platform backend; only the path prefix differs. */
+  var RELATIVE_SEARCH_PREFIX = '/api';
+  var HEALTH_TIMEOUT_MS = 8000;
+
+  /* ------------------------------------------------------------------ */
+  /* Pure helpers (no window access — unit-testable in node)             */
+  /* ------------------------------------------------------------------ */
+
+  /* Normalise a hostname for comparison: lower-case, trim, drop a
+     trailing dot, drop any :port, and accept a full URL by taking the
+     host part. Returns '' for anything unusable (null, undefined,
+     non-string, empty) — '' never matches a same-origin host, so an
+     unusable hostname safely resolves to the absolute backend. */
+  function normaliseHostname(hostname) {
+    if (typeof hostname !== 'string') return '';
+    var h = hostname.replace(/^\s+|\s+$/g, '').toLowerCase();
+    if (h === '') return '';
+    var scheme = h.indexOf('://');
+    if (scheme !== -1) h = h.slice(scheme + 3);
+    var slash = h.indexOf('/');
+    if (slash !== -1) h = h.slice(0, slash);
+    var colon = h.indexOf(':');
+    if (colon !== -1) h = h.slice(0, colon);
+    if (h.charAt(h.length - 1) === '.') h = h.slice(0, -1);
+    return h;
+  }
+
+  /* True only for the two verified same-origin hosts. */
+  function isSameOriginHost(hostname) {
+    var h = normaliseHostname(hostname);
+    if (h === '') return false;
+    for (var i = 0; i < SAME_ORIGIN_HOSTS.length; i++) {
+      if (h === SAME_ORIGIN_HOSTS[i]) return true;
+    }
+    return false;
+  }
+
+  /* PURE, REQUIRED: the backend base for a given page hostname.
+     Same-origin hosts -> '/api/v2'. Every other host (github.io
+     Pages, localhost / 127.0.0.1 preview, file:// preview, unknown)
+     -> 'https://enzoai.cu.gy/api/v2'. */
+  function resolveBackendBase(hostname) {
+    return isSameOriginHost(hostname)
+      ? RELATIVE_BACKEND_BASE
+      : ABSOLUTE_BACKEND_BASE;
+  }
+
+  /* PURE: the origin to prefix search-proxy paths (/api/search,
+     /api/fetch) with. Same-origin hosts -> '' (relative path stays
+     relative). Every other host -> 'https://enzoai.cu.gy'. */
+  function resolveSearchOrigin(hostname) {
+    return isSameOriginHost(hostname) ? '' : ABSOLUTE_BACKEND_ORIGIN;
+  }
+
+  /* PURE: full backend URL for a path such as '/health',
+     '/chats/<id>/ask' or '/tasks/<id>/progress'. A leading slash on
+     the path is optional; a path already starting with the resolved
+     base is returned unchanged (idempotent for callers that already
+     built a full URL). */
+  function backendUrl(path, hostname) {
+    var p = (typeof path === 'string') ? path : '';
+    if (p.indexOf('http://') === 0 || p.indexOf('https://') === 0) return p;
+    if (p.charAt(0) !== '/') p = '/' + p;
+    var base = resolveBackendBase(hostname);
+    if (p === base || p.indexOf(base + '/') === 0) return p;
+    return base + p;
+  }
+
+  /* PURE: full search-proxy URL for a path such as
+     '/api/search?q=...' or '/api/fetch?url=...'. Same idempotency
+     rule as backendUrl. */
+  function searchUrl(path, hostname) {
+    var p = (typeof path === 'string') ? path : '';
+    if (p.indexOf('http://') === 0 || p.indexOf('https://') === 0) return p;
+    if (p.charAt(0) !== '/') p = '/' + p;
+    var origin = resolveSearchOrigin(hostname);
+    if (origin === '') return p;
+    if (p.indexOf(origin + '/') === 0) return p;
+    return origin + p;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Runtime helpers (read window.location when available)               */
+  /* ------------------------------------------------------------------ */
+
+  function currentHostname() {
+    try {
+      if (typeof window !== 'undefined' && window.location &&
+          typeof window.location.hostname === 'string') {
+        return window.location.hostname;
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  /* Backend base for the page actually running. */
+  function getBackendBase() {
+    return resolveBackendBase(currentHostname());
+  }
+
+  /* Search-proxy origin prefix for the page actually running
+     ('' on same-origin hosts, 'https://enzoai.cu.gy' elsewhere). */
+  function getSearchOrigin() {
+    return resolveSearchOrigin(currentHostname());
+  }
+
+  function getBackendUrl(path) {
+    return backendUrl(path, currentHostname());
+  }
+
+  function getSearchUrl(path) {
+    return searchUrl(path, currentHostname());
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Honest reachability check + unavailable notice                      */
+  /* ------------------------------------------------------------------ */
+
+  /* Human-readable reason strings. Every string states what was
+     observed, never guesses a cause the check cannot see. A browser
+     TypeError on a cross-origin fetch is reported as "could not be
+     reached" with BOTH honest possibilities named, because the page
+     cannot distinguish a down backend from a missing CORS header. */
+  function reasonFor(status, detail) {
+    if (status === 'ok') return '';
+    if (status === 'http-error') {
+      return 'The research backend answered with HTTP ' + detail +
+        ' instead of a healthy reply.';
+    }
+    if (status === 'bad-health') {
+      return 'The research backend answered, but its health reply ' +
+        'was not a healthy one.';
+    }
+    if (status === 'timeout') {
+      return 'The research backend did not answer within ' +
+        'the time allowed.';
+    }
+    if (status === 'no-fetch') {
+      return 'This browser cannot make network requests, so the ' +
+        'research backend could not be checked.';
+    }
+    /* 'unreachable' — includes CORS-blocked fetches. */
+    return 'The research backend at https://enzoai.cu.gy could not ' +
+      'be reached from this page. This usually means the backend ' +
+      'is down, or its cross-origin permission (CORS) has not been ' +
+      'deployed yet.';
+  }
+
+  /* Check whether the resolved backend answers GET <base>/health.
+     Returns a Promise that NEVER rejects; it always resolves to:
+       { reachable, base, sameOrigin, host, httpStatus, status,
+         reason, checkedAt }
+     - reachable: true only when health returned HTTP 2xx with
+       { ok: true } (or a database/search_upstream field saying ok).
+     - status: 'ok' | 'http-error' | 'bad-health' | 'timeout' |
+       'unreachable' | 'no-fetch'.
+     - reason: plain-language explanation ('' when reachable).
+     opts: { fetchFn, timeoutMs, hostname } — fetchFn defaults to
+     the page fetch; timeoutMs defaults to 8000. Pass hostname in
+     tests to resolve the base without window.location.
+     IMPORTANT: a fetch that the browser blocks for CORS rejects with
+     a TypeError; that is reported as unreachable, never as ok, and
+     never retried silently in a loop. */
+  function checkBackendReachable(opts) {
+    var o = opts || {};
+    var hostname = (typeof o.hostname === 'string')
+      ? o.hostname : currentHostname();
+    var base = resolveBackendBase(hostname);
+    var timeoutMs = (typeof o.timeoutMs === 'number' && o.timeoutMs > 0)
+      ? o.timeoutMs : HEALTH_TIMEOUT_MS;
+    var fetchFn = (typeof o.fetchFn === 'function')
+      ? o.fetchFn
+      : ((typeof fetch === 'function') ? fetch : null);
+    var startedAt = new Date().toISOString();
+    var result = {
+      reachable: false,
+      base: base,
+      sameOrigin: isSameOriginHost(hostname),
+      host: normaliseHostname(hostname),
+      httpStatus: null,
+      status: 'unreachable',
+      reason: '',
+      checkedAt: startedAt
+    };
+    function finish(status, httpStatus) {
+      result.status = status;
+      result.httpStatus = httpStatus;
+      result.reason = reasonFor(status, httpStatus);
+      result.reachable = (status === 'ok');
+      return result;
+    }
+    if (!fetchFn) {
+      return Promise.resolve(finish('no-fetch', null));
+    }
+    var url = base + '/health';
+    var ctl = null;
+    var timer = null;
+    var settled = false;
+    function settle(status, httpStatus) {
+      if (settled) return null;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      return finish(status, httpStatus);
+    }
+    var fetchOpts = {};
+    try {
+      if (typeof AbortController !== 'undefined') {
+        ctl = new AbortController();
+        fetchOpts.signal = ctl.signal;
+        timer = setTimeout(function () {
+          try { ctl.abort(); } catch (e) {}
+        }, timeoutMs);
+      } else {
+        timer = setTimeout(function () {}, timeoutMs);
+      }
+    } catch (e) {}
+    var p;
+    try {
+      p = fetchFn(url, fetchOpts);
+    } catch (e) {
+      return Promise.resolve(settle('unreachable', null));
+    }
+    return Promise.resolve(p).then(function (resp) {
+      if (!resp || typeof resp.status !== 'number') {
+        return settle('unreachable', null);
+      }
+      if (resp.status < 200 || resp.status >= 300) {
+        return settle('http-error', resp.status);
+      }
+      if (typeof resp.json === 'function') {
+        return resp.json().then(function (j) {
+          if (j && j.ok === true) return settle('ok', resp.status);
+          return settle('bad-health', resp.status);
+        }, function () {
+          /* Body unreadable but HTTP was 2xx: the backend answered,
+             but the page cannot confirm health — do not call it ok. */
+          return settle('bad-health', resp.status);
+        });
+      }
+      return settle('ok', resp.status);
+    }, function (err) {
+      var name = (err && err.name) || '';
+      if (name === 'AbortError' || name === 'TimeoutError') {
+        return settle('timeout', null);
+      }
+      return settle('unreachable', null);
+    });
+  }
+
+  /* Plain-language notice for the chat when live research cannot run.
+     Takes the object returned by checkBackendReachable (or null, in
+     which case a generic reason is used). The text names the backend
+     and the working alternative; it never invents an answer and never
+     claims research happened. No emojis. */
+  function buildUnavailableNotice(check) {
+    var reason = (check && typeof check.reason === 'string' && check.reason)
+      ? check.reason
+      : 'The research backend at https://enzoai.cu.gy could not be ' +
+        'reached from this page.';
+    var lines = 'Live research is unavailable right now. ' + reason +
+      ' No research was run and no answer was made up.' +
+      ' You can try again from https://enzoai.cu.gy/ , where live ' +
+      'research runs on the same site as the backend.';
+    if (check && check.base) {
+      lines += ' (Backend checked: ' + check.base + '/health' +
+        (check.httpStatus ? ', HTTP ' + check.httpStatus : '') + '.)';
+    }
+    return lines;
+  }
+
+  /* Assembler gate: true when the ask path must STOP and show the
+     notice instead of sending anything. */
+  function shouldBlockAsk(check) {
+    return !check || check.reachable !== true;
+  }
+
+  /* One-line monitor text for a check result, for the live panel. */
+  function describeCheck(check) {
+    if (!check) return 'Backend not checked yet.';
+    if (check.reachable === true) {
+      return 'Backend reachable at ' + check.base +
+        ' (health HTTP ' + check.httpStatus + ').';
+    }
+    return 'Backend unreachable at ' + check.base + ': ' + check.reason;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* WIRING — instructions for the assembler (read before merging).     */
+  /* Do NOT edit the export by hand: apply these replacements exactly.  */
+  /* ------------------------------------------------------------------ */
+  /*
+   * PREREQUISITE (backend, deploy separately — this file alone is NOT
+   * enough for a browser on GitHub Pages):
+   *   Apply cors-diff-server-py.diff to
+   *   enao-platform/server/server.py on the Oracle VM and restart the
+   *   platform service. Until then, checkBackendReachable() from a
+   *   github.io origin reports unreachable (CORS-blocked fetch), and
+   *   the UI correctly shows the unavailable notice instead of a
+   *   fabricated answer. Verify after deploy with the curl commands
+   *   in VERIFICATION-33.md (expect Access-Control-Allow-Origin: *
+   *   on GET /api/v2/health and HTTP 204 on OPTIONS preflight).
+   *
+   * LOAD ORDER: include this piece BEFORE every script that defines a
+   * backend base below, so window.EnzoPagesBackend exists when they run.
+   *
+   * REPLACEMENTS in the live export (enao-ai.html, 45,471 lines;
+   * line numbers below are from the export verified 22 Nov 2026):
+   *
+   *  [1] Line 12721 — P-F platform adapter (main ask path):
+   *      var V2='/api/v2';
+   *      -> var V2 = window.EnzoPagesBackend.getBackendBase();
+   *      (v2req() already does fetch(V2+path), so every ask, chat,
+   *      task, file and SEO call through v2req follows the fix.)
+   *
+   *  [2] Line 19715 — monitor data layer (window.EnzoMonitor):
+   *      var API_BASE = '/api/v2'; // Same-origin, ...
+   *      -> var API_BASE = window.EnzoPagesBackend.getBackendBase();
+   *
+   *  [3] Line 24524 — live fullscreen monitor:
+   *      var API_BASE = '/api/v2';
+   *      -> var API_BASE = window.EnzoPagesBackend.getBackendBase();
+   *
+   *  [4] Line 28074 — monitor agents panel:
+   *      var API_BASE = '/api/v2';
+   *      -> var API_BASE = window.EnzoPagesBackend.getBackendBase();
+   *
+   *  [5] Line 39039 — lifecycle / orchestrator cancel helper:
+   *      var DEFAULT_API_BASE = '/api/v2';
+   *      -> var DEFAULT_API_BASE =
+   *           window.EnzoPagesBackend.getBackendBase();
+   *      (opts.apiBase still overrides when a caller passes one.)
+   *
+   *  [6] Lines 41608-41609 — livescreen:
+   *      var API_BASE = '/api/v2';
+   *      var FETCH_BASE_DEFAULT = '/api/fetch';
+   *      -> var API_BASE = window.EnzoPagesBackend.getBackendBase();
+   *         var FETCH_BASE_DEFAULT =
+   *           window.EnzoPagesBackend.getSearchUrl('/api/fetch');
+   *      (fetchPageUrl() builds FETCH_BASE + '?url=...', so the
+   *      livescreen page-fetch follows the fix. The livescreen
+   *      control/progress/sources URLs all hang off API_BASE.)
+   *
+   *  [7] SEO tool endpoints — relative '/api/v2/seo/<tool>' literals
+   *      used by fetch(endpoint) at line ~44945:
+   *      - SEO_TOOLS_MENU, lines 27205-27221 (9 entries, audit /
+   *        onpage / backlinks / keywords / explorer / rank /
+   *        competitors / content-gap / serp)
+   *      - the endpoint table at lines 35012-35052 (same 9 tools)
+   *      At the fetch call site (line ~44945), wrap the endpoint:
+   *        fetch(window.EnzoPagesBackend.getBackendUrl(endpoint), ...)
+   *      getBackendUrl() is idempotent: a path already starting with
+   *      the resolved base is returned unchanged, so wrapping is safe
+   *      even if a literal is later made absolute. Do NOT rewrite
+   *      the menu literals themselves — they are also used as labels
+   *      in the router table (lines 35074-35184 list the same
+   *      '/api/v2/tasks/{id}/...' endpoints as documentation strings
+   *      for the monitor/control handlers; those are NOT fetched
+   *      directly and must be left as-is).
+   *
+   *  [8] Search-proxy call sites — same absolute-URL rule:
+   *      The proxy already sends Access-Control-Allow-Origin: *
+   *      (verified live), so these work cross-origin as soon as the
+   *      URL is absolute. Wrap each URL at its construction site
+   *      with window.EnzoPagesBackend.getSearchUrl(...):
+   *      - line 3016:  fetchJSONT('/api/search?q=' + ...)
+   *      - line 3048:  fetchJSONT('/api/fetch?url=' + ...)
+   *      - line 40513: var url = '/api/search?q=' + socEncode(...)
+   *      - line 40546: var url = '/api/fetch?url=' + socEncode(...)
+   *      - line 41263: fetchJson('/api/search?q=' + ...)
+   *      - lines 41305, 41326: fetchText('/api/fetch?url=' + ...)
+   *      - lines 44161-44162: search58 / fetch58 ('/api/search?q=',
+   *        '/api/fetch?url=') — wrap inside fetchJson58 callers or
+   *        inside search58/fetch58 themselves.
+   *      getSearchUrl() is idempotent and returns the input unchanged
+   *      on same-origin hosts, so wrapping is safe everywhere.
+   *      (socDefaultFetcher at line 40487 takes the URL as given, so
+   *      wrapping the construction sites above covers it.)
+   *
+   *  [9] ASK-PATH GATE (honest-unreachable handling — mandatory):
+   *      In the ask flow, BEFORE any fetch to the backend, run:
+   *        window.EnzoPagesBackend.checkBackendReachable()
+   *          .then(function (check) {
+   *            if (window.EnzoPagesBackend.shouldBlockAsk(check)) {
+   *              show the notice from
+   *              window.EnzoPagesBackend.buildUnavailableNotice(check)
+   *              in the chat, in the user's language, and STOP —
+   *              do not send the ask, do not answer in normal mode,
+   *              do not fall back to the search proxy and present
+   *              its snippets as a researched answer;
+   *            } else { proceed with the normal ask flow; }
+   *          });
+   *      Cache a successful check for the session (one check per page
+   *      load is enough; re-check on the next ask only after a
+   *      failure, or when the user retries). A failed check must be
+   *      re-run on retry — never cache a failure as permanent.
+   *      NOTE: this gate is in ADDITION to the existing v2Up fallback
+   *      line — the fallback line must not be used to present a
+   *      normal-mode answer as if research had run.
+   *
+   *  [10] MONITOR LINE: where the export shows backend state
+   *      (v2StateLine / setFallbackLine, around line 12750), use
+   *      describeCheck(check) so the panel states the resolved base
+   *      and the real reason when unreachable.
+   *
+   *  KNOWN LIVE LIMIT (not fixed by this piece — separate defect):
+   *    Research-route asks currently return HTTP 500 internal_error
+   *    from the live backend (verified twice 22 Nov 2026 with fresh
+   *    idempotency keys; normal-route asks return 200). After the
+   *    CORS deploy, Pages research will still fail at the ask step
+   *    until that 500 is fixed. This piece surfaces that failure
+   *    through the same honest notice path (the ask returns an error
+   *    instead of a task) — it must never be papered over with a
+   *    fabricated answer.
+   */
+
+  /* ------------------------------------------------------------------ */
+  /* Export                                                              */
+  /* ------------------------------------------------------------------ */
+
+  var api = {
+    SAME_ORIGIN_HOSTS: SAME_ORIGIN_HOSTS,
+    ABSOLUTE_BACKEND_ORIGIN: ABSOLUTE_BACKEND_ORIGIN,
+    ABSOLUTE_BACKEND_BASE: ABSOLUTE_BACKEND_BASE,
+    RELATIVE_BACKEND_BASE: RELATIVE_BACKEND_BASE,
+    normaliseHostname: normaliseHostname,
+    isSameOriginHost: isSameOriginHost,
+    resolveBackendBase: resolveBackendBase,
+    resolveSearchOrigin: resolveSearchOrigin,
+    backendUrl: backendUrl,
+    searchUrl: searchUrl,
+    getBackendBase: getBackendBase,
+    getSearchOrigin: getSearchOrigin,
+    getBackendUrl: getBackendUrl,
+    getSearchUrl: getSearchUrl,
+    checkBackendReachable: checkBackendReachable,
+    buildUnavailableNotice: buildUnavailableNotice,
+    shouldBlockAsk: shouldBlockAsk,
+    describeCheck: describeCheck
+  };
+
+  root.EnzoPagesBackend = api;
+
+  /* CommonJS export for node-based tests (harmless in the browser). */
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = api;
+  }
+})(typeof window !== 'undefined' ? window : this);
+</script>
+<script>
+/* ==========================================================================
+ * PIECE 31 — Universal research triggers + clarifying-gate repair
+ * ENAO AI live-defect fix track (artifact slug: enao-ai). Defects 1, A, B.
+ *
+ * DEFECT (evidence: Raja's screenshot, 22 Nov 2026 4:07 PM PKT):
+ *   User typed exactly: "100 websites per dakho SEO kasy karty han"
+ *   ENZO replied with a "Normal" badge and an ENGLISH clarifying question:
+ *   'Just to be sure — did you ask this: "websites per dakho seo kasy
+ *   karty han"? Say yes, or tell me what you meant.'
+ *   That is a CLEAR research order being clarified, in the wrong language.
+ *
+ * ROOT CAUSE (verified against the live export enao-ai.html):
+ *   1. The outer askQuestion wrapper (~line 14043) runs BEFORE
+ *      classifyIntent ever sees the message. It calls garbledScore(text)
+ *      (~line 13961), which counts "common words" from a list that does
+ *      not contain dakho / kasy / karty / han / per / websites / seo, so
+ *      the ratio is 0 and the Roman Urdu order scores as "garbled".
+ *      The wrapper then fires CONFIRM_T.ask (~line 13983).
+ *   2. The wrapper picks the template by detectLang(text) (~line 2389),
+ *      whose Roman-word list also lacks dakho / kasy / karty / han, so
+ *      it returns 'en' and the ENGLISH template is used. (Correction to
+ *      the task brief: CONFIRM_T.ask is NOT English-only — it already
+ *      has roman and urdu functions. The bug is detection + gating, not
+ *      the template map. This piece still ships canonical templates so
+ *      the assembler has one source of truth going forward.)
+ *   3. classifyIntent / intIsResearch (~line 23034 / 22720) would have
+ *      caught "100 websites" via the source-count rule — but it never
+ *      runs, because the confirm wrapper returns first. And without the
+ *      number ("websites per dakho SEO kasy karty han") even the
+ *      classifiers miss it: no dakho/dekho order rule, no "kasy karty
+ *      han" (kaise karte hain) fold, no "per dakho" order rule.
+ *   4. Backend classifier (enao-platform/intent/classifier.py) verified
+ *      22 Nov 2026 by direct run: "100 websites per dakho SEO kasy
+ *      karty han" -> research ONLY via the source count; the same order
+ *      without the number -> normal; "is par research karo" -> normal;
+ *      "SEO kasy karty han dikhao" -> normal. The backend has its own
+ *      trigger lists and does NOT delegate to a shared list, so a Python
+ *      mirror (pieces/31-triggers.py) is supplied and must be wired in.
+ *
+ * THE RULE (locked by this piece):
+ *   A research order with a clear topic is NEVER ambiguous. It goes
+ *   straight to research mode: never a clarifying question, never a
+ *   Normal badge, never a "did you ask this?" confirmation.
+ *   The clarifying gate may ONLY fire when the request is genuinely
+ *   ambiguous AND not a research order. When it does fire, the question
+ *   is in the user's own language (Roman Urdu / Urdu script / English).
+ *
+ * WHAT "RESEARCH ORDER" MEANS HERE (meaning, not bare keywords):
+ *   An explicit research verb / order phrase PLUS one of:
+ *     (a) a concrete topic/object word ("SEO", "websites", "phone"),
+ *     (b) a source count ("100 websites", "50 sources"),
+ *     (c) a topic already known in this chat (context.currentTopic),
+ *     (d) a bare imperative with no object at all ("research karo",
+ *         "dhoond ke do", "nikaal ke do") — settled P1/P5 behaviour:
+ *         a bare imperative is an order to act, and the research flow
+ *         asks for the missing topic itself (see needsTopic).
+ *   A demonstrative-only object ("is par", "ye", "us") with NO known
+ *   topic names nothing to research, so it is NOT counted as a research
+ *   order here: the gate MAY ask "kis topic par?" — in the user's own
+ *   language. This is a deliberate tightening of the old P1/P5 split
+ *   (which clarified "research it" but researched bare "dhoond do");
+ *   one uniform rule now covers every verb family.
+ *   NO topic names appear anywhere in this file (Bitcoin lesson).
+ *
+ * PUBLIC API (pure functions, no DOM, no network, no dependencies):
+ *   detectLanguage(text) -> 'urdu' | 'hindi' | 'roman' | 'en'
+ *   isResearchOrder(text, context?)
+ *     -> { research:boolean, reason:string, topic:string|null,
+ *          lang:string, needsTopic:boolean, matched:string|null }
+ *     context is optional: { currentTopic } or { state:{ currentTopic } }.
+ *   clarifyQuestion(text, reason, lang) -> string (user's language)
+ *   shouldClarify(text, context?)
+ *     -> { clarify:boolean, lang:string, reason:string,
+ *          question:string|null, research:object }
+ *     THE SINGLE FUNCTION THE GATE CALLS FIRST (see WIRING below).
+ *   extractTopic(text) -> string|null (best-effort topic, advisory only)
+ *
+ * WIRING (assembler — this piece wires nothing itself, never edits the
+ * artifact, never deploys):
+ *   1. FRONTEND, askQuestion confirm wrapper (~line 14043): call
+ *      EnzoResearchTriggers.shouldClarify(text) FIRST, before
+ *      garbledScore / CONFIRM_T / isDestructive. If clarify === false,
+ *      proceed — never confirm, never ask "did you ask this?".
+ *      If clarify === true, show result.question (already in the
+ *      user's language) instead of CONFIRM_T.ask.
+ *   2. FRONTEND, Rule-48 gate wrapper (~line 15422): call
+ *      shouldClarify(raw) FIRST, before vagueCheck / classifyIntent.
+ *      If clarify === false, skip the gate entirely (a research order
+ *      must also never receive the "Normal" badge — the badge/kind must
+ *      be derived from the trigger result, not the general default).
+ *      If clarify === true, use result.question via clarifyQuestion().
+ *   3. BACKEND, intent/classifier.py step 6: call is_research_order()
+ *      from pieces/31-triggers.py (same trigger set) before the
+ *      definition step, after the definition-of-research guard, so
+ *      frontend and backend agree. intent/clarification.py _detect_lang
+ *      should use detect_language() from the same mirror (its Roman
+ *      marker list has the same dakho/kasy gap).
+ *   4. Never re-introduce a research-vs-normal choice question. The
+ *      templates in clarifyQuestion() name the missing topic/referent
+ *      only; they never ask the user to choose a mode.
+ *
+ * STYLE: plain ES5, var + function declarations, no modules, matching
+ * the existing artifact style. Zero emojis.
+ * ========================================================================== */
+(function (global) {
+'use strict';
+
+/* ---------- normalisation ---------- */
+function trim(s) { return String(s == null ? '' : s).replace(/^\s+|\s+$/g, ''); }
+
+function foldDigits(s) {
+  var out = '', i, c;
+  for (i = 0; i < s.length; i++) {
+    c = s.charCodeAt(i);
+    if (c >= 0x660 && c <= 0x669) out += String.fromCharCode(48 + c - 0x660);
+    else if (c >= 0x6F0 && c <= 0x6F9) out += String.fromCharCode(48 + c - 0x6F0);
+    else if (c >= 0x966 && c <= 0x96F) out += String.fromCharCode(48 + c - 0x966);
+    else out += s.charAt(i);
+  }
+  return out;
+}
+
+/* Roman-Urdu spelling folds. Applied to a lower-cased copy used ONLY for
+   trigger matching — never to the text shown to the user. The folds that
+   fix this defect: dakho->dekho, kasy/kaisy->kaise, karty->karte,
+   han->hain, per->par, dhoondh/dhund->dhoond, kro->karo, kr->kar. */
+var ROMAN_FOLDS = [
+  [/\bkia\b/g, 'kya'], [/\bha\b/g, 'hai'], [/\bhen\b/g, 'hain'],
+  [/\brahay\b/g, 'rahe'], [/\brahy\b/g, 'rahe'], [/\bjaa\b/g, 'ja'],
+  [/\bkidher\b/g, 'kidhar'], [/\bkonsa\b/g, 'kaunsa'],
+  [/\bkesay\b/g, 'kaise'], [/\bkese\b/g, 'kaise'],
+  [/\bkasy\b/g, 'kaise'], [/\bkaisy\b/g, 'kaise'],
+  [/\bdhoondh\b/g, 'dhoond'], [/\bdhund\b/g, 'dhoond'],
+  [/\bkarty\b/g, 'karte'], [/\bkrty\b/g, 'karte'],
+  [/\bkro\b/g, 'karo'], [/\bkr\b/g, 'kar'],
+  [/\bdakho\b/g, 'dekho'], [/\bdekhao\b/g, 'dikhao'],
+  [/\bper\b/g, 'par'], [/\bhan\b/g, 'hain'],
+  [/\bbtao\b/g, 'batao'], [/\bbtau\b/g, 'batao']
+];
+
+function normRoman(text) {
+  var s = ' ' + foldDigits(String(text || '').toLowerCase())
+    .replace(/[?!.,;:'"()\[\]{}_\/\\\-–—~…؟۔،؛]+/g, ' ')
+    .replace(/\s+/g, ' ') + ' ';
+  var i;
+  for (i = 0; i < ROMAN_FOLDS.length; i++) s = s.replace(ROMAN_FOLDS[i][0], ' ' + ROMAN_FOLDS[i][1] + ' ');
+  return s.replace(/\s+/g, ' ').replace(/^ | $/g, ' ') ;
+}
+
+function normPadded(text) { return ' ' + normRoman(text).replace(/^ +| +$/g, '') + ' '; }
+function tokensOf(normed) {
+  var t = trim(normed);
+  return t ? t.split(/\s+/) : [];
+}
+function hasUrdu(text) { return /[\u0600-\u06FF]/.test(String(text || '')); }
+function hasDevanagari(text) { return /[\u0900-\u097F]/.test(String(text || '')); }
+
+/* ---------- language detection ----------
+   The artifact's detectLang missed dakho/kasy/karty/han and returned 'en'
+   for a Roman Urdu order. Any ONE Roman-Urdu marker word is enough: these
+   words do not occur in plain English text. (Pure English content words
+   such as "websites" or "SEO" never cancel a Roman marker.) */
+var ROMAN_MARKER_RE = /\b(kya|kia|hai|hain|karo|kar|karke|batao|samjhao|kaam|kidhar|kahan|kab|tum|aap|mera|meri|mujhe|mujhay|ye|yeh|wo|woh|matlab|baare|bare|mein|nahi|nahin|abhi|aur|bhi|zara|theek|chahiye|dhoond\w*|dhund\w*|talaash|talash|khoj|dakho|dikha\w*|dekh\w*|nikaal\w*|nikal\w*|kasy|kaise|kaisy|karty|karte|par|pe|ko|ki|ke|ka|tha|thi|wala|wali|kahan|kidhar|kisko|kaunsa|konsa|kyun|kyu|kaisa|aj|kal|bohat|acha|achi|jaldi|bhai|yaar|shodh|tehqeeq|tahqeeq|jaanch|taftish|naye|naya|sab|acha|bata)\b/i;
+
+function detectLanguage(text) {
+  var raw = String(text || '');
+  if (hasUrdu(raw)) return 'urdu';
+  if (hasDevanagari(raw)) return 'hindi';
+  if (ROMAN_MARKER_RE.test(raw)) return 'roman';
+  return 'en';
+}
+
+/* ---------- word sets for the object verdict ----------
+   DEMO: demonstratives / generic nouns — they name nothing to research.
+   VERB: order verbs + auxiliaries — stripped when judging the object.
+   FILLER: particles, pronouns, question words — stripped likewise.
+   MODIFIER: adjectives that carry no topic ("latest", "deep").
+   The Urdu-script set covers the same roles in Urdu script; the
+   Devanagari set covers the same roles in Hindi script. */
+var DEMO_W = { wo: 1, woh: 1, ye: 1, yeh: 1, us: 1, uss: 1, iss: 1, un: 1,
+  wohi: 1, yehi: 1, usi: 1, isi: 1, unhi: 1, inhi: 1, that: 1, this: 1,
+  it: 1, those: 1, these: 1, them: 1, same: 1, wala: 1, wali: 1, wale: 1,
+  waala: 1, cheez: 1, thing: 1, stuff: 1, kaam: 1, kam: 1, kuch: 1,
+  something: 1, anything: 1, doosra: 1, dusra: 1, doosri: 1, pehla: 1,
+  pahla: 1, pehli: 1, another: 1, other: 1, pichla: 1, pichli: 1,
+  agla: 1, agli: 1, jo: 1, is: 1, topic: 1, subject: 1, baat: 1,
+  mawzu: 1, mozuh: 1, dono: 1,
+  'یہ': 1, 'وہ': 1, 'اس': 1, 'اسی': 1, 'وہی': 1, 'یہی': 1, 'ان': 1,
+  'کام': 1, 'چیز': 1, 'کچھ': 1, 'والا': 1, 'والی': 1, 'دوسرا': 1,
+  'پہلا': 1, 'نمبر': 1, 'موضوع': 1, 'بات': 1,
+  'यह': 1, 'वह': 1, 'इस': 1, 'उस': 1, 'काम': 1, 'चीज़': 1, 'बात': 1 };
+var VERB_W = { kar: 1, karo: 1, kr: 1, kro: 1, karna: 1, krna: 1, kardo: 1,
+  karde: 1, karke: 1, kiya: 1, karte: 1, karta: 1, karti: 1, karen: 1,
+  karain: 1, karein: 1, do: 1, does: 1, did: 1, de: 1, dena: 1, dedo: 1,
+  bana: 1, banao: 1, banana: 1, theek: 1, thik: 1, fix: 1, handle: 1,
+  sort: 1, bhej: 1, bhejo: 1, bhejna: 1, send: 1, laga: 1, lagao: 1,
+  khol: 1, kholo: 1, band: 1, start: 1, stop: 1, chala: 1, chalao: 1,
+  rakh: 1, rakho: 1, nikal: 1, nikalo: 1, nikaal: 1, nikaalo: 1, le: 1,
+  lo: 1, lena: 1, ao: 1, aao: 1, jao: 1, ja: 1, batao: 1, bata: 1,
+  batana: 1, tell: 1, show: 1, dikhao: 1, dikha: 1, get: 1, give: 1,
+  make: 1, write: 1, ho: 1, hua: 1, jaye: 1, gaya: 1, complete: 1,
+  finish: 1, run: 1, play: 1, delete: 1, remove: 1, erase: 1, clear: 1,
+  bola: 1, kaha: 1, dekho: 1, dekh: 1, dekhao: 1, dakho: 1,
+  dhoond: 1, dhoondh: 1, dhund: 1, talaash: 1, talash: 1, khoj: 1,
+  research: 1, investigate: 1, investigates: 1, investigated: 1,
+  search: 1, google: 1, find: 1, check: 1, verify: 1, compare: 1,
+  tehqeeq: 1, tahqeeq: 1, shodh: 1, jaanch: 1, taftish: 1,
+  chahiye: 1, milega: 1, milegi: 1, milenge: 1, milta: 1, milti: 1,
+  mile: 1,
+  'کر': 1, 'کرو': 1, 'دو': 1, 'دینا': 1, 'بھیج': 1, 'بھیجو': 1,
+  'بنا': 1, 'بناؤ': 1, 'بتاؤ': 1, 'بتا': 1, 'لگا': 1, 'لگاؤ': 1,
+  'دیکھو': 1, 'دکھاؤ': 1, 'ڈھونڈ': 1, 'تلاش': 1, 'ریسرچ': 1,
+  'تحقیق': 1, 'گوگل': 1, 'چاہیے': 1, 'تیار': 1, 'کرو': 1, 'کر': 1,
+  'کے': 1, 'کرکے': 1,
+  'करो': 1, 'कर': 1, 'दो': 1, 'ढूंढ': 1, 'खोज': 1, 'शोध': 1 };
+var FILLER_W = { please: 1, plz: 1, zara: 1, bhai: 1, yaar: 1, ab: 1,
+  abhi: 1, jaldi: 1, mera: 1, meri: 1, mere: 1, mujhe: 1, mujhay: 1,
+  aap: 1, tum: 1, tu: 1, ko: 1, se: 1, ka: 1, ki: 1, ke: 1, hai: 1,
+  hain: 1, tha: 1, thi: 1, na: 1, bhi: 1, to: 1, aur: 1, and: 1,
+  the: 1, a: 1, an: 1, my: 1, me: 1, you: 1, just: 1, now: 1, right: 1,
+  for: 1, of: 1, on: 1, in: 1, up: 1, out: 1, is: 1, are: 1, was: 1,
+  were: 1, kya: 1, kia: 1, kyu: 1, kyun: 1, kab: 1, kahan: 1,
+  kidhar: 1, kaise: 1, kaisa: 1, konsa: 1, kaunsa: 1, kaun: 1,
+  who: 1, what: 1, when: 1, where: 1, why: 1, how: 1, which: 1,
+  par: 1, per: 1, pe: 1, mein: 1, baare: 1, bare: 1, about: 1,
+  'پر': 1, 'سے': 1, 'کو': 1, 'کا': 1, 'کی': 1, 'کے': 1, 'ہے': 1,
+  'ہیں': 1, 'میں': 1, 'بارے': 1, 'مجھے': 1, 'میرا': 1, 'میری': 1,
+  'آپ': 1, 'کیسے': 1, 'کرتے': 1, 'ہیں': 1, 'یہ': 1, 'وہ': 1,
+  'पर': 1, 'से': 1, 'को': 1, 'का': 1, 'की': 1, 'के': 1, 'में': 1, 'है': 1 };
+var MODIFIER_W = { deep: 1, detailed: 1, latest: 1, recent: 1, newest: 1,
+  taaza: 1, taza: 1, 'تفصیلی': 1, 'تازہ': 1, 'تازہ ترین': 1 };
+
+/* Information nouns: the "chahiye" (want) family is a research order
+   only when the wanted thing is information (websites, sources, videos,
+   a report). "mujhe paani chahiye" (I want water) is not research. */
+var INFO_NOUN_RE = /\b(websites?|web\s*sites?|sites?|sources?|references?|papers?|videos?|report|articles?|links?|info|information|data|list|names?|numbers?|prices?|news|details?|detail|tafseel|maloomat)\b/;
+var INFO_NOUN_URDU_RE = /ویب\s*سائٹس?|ذرائع|ویڈیو|رپورٹ|مضمون|لنک|معلومات|فہرست/;
+
+/* ---------- object verdict ----------
+   After stripping demo / verb / filler / modifier words, what is left?
+   'content' — a real topic/object (or a known chat topic standing in
+     for a demonstrative); 'demo' — only a demonstrative, no known topic;
+     'bare' — a bare imperative with no object at all. */
+function contextTopic(context) {
+  if (!context) return null;
+  if (typeof context.currentTopic === 'string' && trim(context.currentTopic)) return trim(context.currentTopic);
+  if (context.state && typeof context.state.currentTopic === 'string' && trim(context.state.currentTopic)) return trim(context.state.currentTopic);
+  if (context.intelState && typeof context.intelState.currentTopic === 'string' && trim(context.intelState.currentTopic)) return trim(context.intelState.currentTopic);
+  return null;
+}
+
+function objectVerdict(normed, ctxTopic) {
+  var toks = tokensOf(normed), i, w, content = [], hasDemo = false;
+  for (i = 0; i < toks.length; i++) {
+    w = toks[i];
+    if (DEMO_W[w]) { hasDemo = true; continue; }
+    if (VERB_W[w] || FILLER_W[w] || MODIFIER_W[w]) continue;
+    if (w.length < 2 && !/^\d+$/.test(w)) continue;
+    content.push(w);
+  }
+  if (content.length) return { kind: 'content', content: content };
+  if (hasDemo) {
+    if (ctxTopic) return { kind: 'content', content: [ctxTopic], viaContext: true };
+    return { kind: 'demo', content: [] };
+  }
+  return { kind: 'bare', content: [] };
+}
+
+/* A verb-family order resolves through the object verdict:
+   content -> research (topic = the content, refined by extractTopic);
+   demo    -> NOT research (reason: pronoun-no-topic; gate may clarify);
+   bare    -> research with needsTopic = true (bare imperative order). */
+function orderVerdict(normed, ctxTopic, reason, matched) {
+  var v = objectVerdict(normed, ctxTopic);
+  if (v.kind === 'content') {
+    return { research: true, reason: reason, topic: null, needsTopic: false, matched: matched, _content: v.content };
+  }
+  if (v.kind === 'demo') {
+    return { research: false, reason: 'research-verb-pronoun-no-topic', topic: null, needsTopic: false, matched: matched, _content: [] };
+  }
+  return { research: true, reason: reason, topic: null, needsTopic: true, matched: matched, _content: [] };
+}
+
+/* ---------- topic extraction (best effort, advisory only) ---------- */
+function extractTopic(text) {
+  var t = ' ' + foldDigits(String(text || '')) + ' ';
+  t = t.replace(/\b(within|in|under)\s+\d{1,4}\s*(minutes?|mins?|minute)\b/gi, ' ');
+  t = t.replace(/\b\d{1,4}\s*(minute|mint|min)\s*(mein|main|ke\s+andar)\b/gi, ' ');
+  t = t.replace(/\b(please|braah|baraah)\b/gi, ' ');
+  t = t.replace(/\b(deep\s+)?research\s+(on|about|par|ke\s+baare\s+mein)\s+/gi, ' ');
+  t = t.replace(/^\s*(is\s+par|us\s+par|is\s+ke\s+baare\s+mein|اس\s+پر|اس\s+کے\s+بارے\s+میں)\s*(research|ریسرچ|تحقیق)\s*(karo|kar|karke|kar\s+ke\s+do|کرو|کر|کریں|کر\s*کے)?\s*/gi, ' ');
+  t = t.replace(/^\s*(research|investigate|investigation|find|search|explore|look\s+up|google|dhoond\w*|dhund\w*|khoj|shodh|tehqeeq|tahqeeq|jaanch|taftish|talaash|talash|ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|शोध|खोज|ढूंढ)\s*(karo|kar|karke|do|ke\s+do|kar\s+ke\s+do|کرو|کر|کریں|کر\s*کے|دو|کے|بتاؤ|دے|لو|करो|कर|करें|दो)?\s*/gi, ' ');
+  t = t.replace(/\b(per|par|pe)\s+(dakho|dikhao|dekho|dekh|دیکھو|دکھاؤ)\b/gi, ' ');
+  t = t.replace(/\b(kasy|kaise|kaisy|kesay|kese)\s+(karty|karte)\s+(han|hain)\b/gi, ' ');
+  t = t.replace(/\b(kaise|kaisy)\s+(karte|karti)\s+(hain|hai)\b/gi, ' ');
+  t = t.replace(/\s+(karo|kar|do|ke\s+do|kar\s+ke\s+do|karke|کرو|کر|دو|کر\s*کے)\s*$/gi, ' ');
+  t = t.replace(/\s+(batao|batayein|dikhao|dekho|دیکھو|دکھاؤ|بتاؤ)\s*$/gi, ' ');
+  t = trim(t.replace(/[?!.,;:'"()\[\]{}]+/g, ' ').replace(/\s+/g, ' '));
+  if (!t) return null;
+  if (/^(it|that|this|these|those|them|ye|yeh|wo|woh|us|is|isi|usi)$/i.test(t)) return null;
+  var v = objectVerdict(normRoman(t), null);
+  if (v.kind !== 'content') return null;
+  return t.slice(0, 100);
+}
+
+/* ---------- guards ---------- */
+function isDefinitionOfResearch(text, normed) {
+  var n = normed;
+  if (/\bwhat\s+(is|are|was|were)\b[^.?!]{0,40}\bresearch\b/.test(n)) return true;
+  if (/\b(explain|define|describe)\b[^.?!]{0,30}\bresearch\b/.test(n)) return true;
+  if (/\bresearch\b[^.?!]{0,30}\b(ka|ki|ke)\s+matlab\s+(kya|kia)\b/.test(n)) return true;
+  if (/\bresearch\b[^.?!]{0,30}\b(kya|kia)\s+(hai|hota|hoti)\b/.test(n)) return true;
+  if (/\btell\s+me\s+about\s+research\s*[?!.]*$/.test(n)) return true;
+  if (/ریسرچ\s*(کا\s*مطلب\s*کیا|کیا\s*ہے)/.test(text)) return true;
+  if (/تحقیق\s*(کا\s*مطلب\s*کیا|کیا\s*ہے)/.test(text)) return true;
+  return false;
+}
+
+/* Independent order verbs that rescue a message from the
+   definition-of-research guard (e.g. "research ka matlab kya hai,
+   dhoond ke do" still orders a search). */
+function hasIndependentOrder(normed, raw) {
+  if (/\b(dhoond\w*|dhund\w*|talaash|talash|khoj|search|google|nikal\w*|nikaal\w*|compare|verify|check)\b/.test(normed)) return true;
+  if (/\b(dekho|dekh|dikhao|dikha|dekhna|dekhein)\b/.test(normed)) return true;
+  if (/\d{1,4}\s*(sources?|websites?|sites?|references?|papers?)\b/.test(normed)) return true;
+  if (/ڈھونڈ|تلاش|گوگل|دیکھو|دکھاؤ|ریسرچ\s*(کرو|کر)/.test(raw)) return true;
+  if (/\b(detailed\s+)?report\b/.test(normed)) return true;
+  if (/تفصیلی\s*رپورٹ/.test(raw)) return true;
+  return false;
+}
+
+/* ---------- conversation (guftagu) ----------
+   Greetings and everyday talk about the assistant itself, in English,
+   Roman Urdu, Urdu script and Hindi. These NEVER research and NEVER
+   clarify. All patterns are 2nd-person / self-directed, so third-party
+   questions ("Lahore kahan hai", "match kab start hoga") stay out. */
+var CONVERSATION_RES = [
+  [/\b(assalamualaikum|assalamu alaikum|aoa|salam|hello|hi|hey|namaste|namaskar)\b/, 'greeting'],
+  [/\bgood\s+(morning|afternoon|evening)\b/, 'greeting'],
+  [/\b(thank you|thanks|shukriya)\b/, 'greeting'],
+  [/\b(bye|allah hafiz|khuda hafiz)\b/, 'greeting'],
+  [/\bkya\s+ha+l\s+hai\b/, 'howru'],
+  [/\bkaise\s+ho\b/, 'howru'],
+  [/\baur\s+sunao\b/, 'howru'],
+  [/\bhow are you\b/, 'howru'],
+  [/\bwhats?\s+up\b/, 'howru'],
+  [/\bhow\s+(was|is)\s+your\s+day\b/, 'howru'],
+  [/\bkya\s+kar\s+rahe\s+ho\b/, 'doing'],
+  [/\bkya\s+karte\s+ho\b/, 'doing'],
+  [/\bwhat are you doing\b/, 'doing'],
+  [/\bwhat\s+did\s+you\s+do\s+today\b/, 'doing'],
+  [/\b(kidhar|kahan)\s+ja\s+rahe\s+ho\b/, 'going'],
+  [/\bwhere are you going\b/, 'going'],
+  [/(^|\s)(tum\s+|aap\s+|tu\s+)?(kahan|kidhar)\s+ho(\s|$)/, 'where'],
+  [/\btu\s+kahan\s+hai\b/, 'where'],
+  [/\bwhere are you\s*[?!.]*$/, 'where'],
+  [/\bkaunsa\s+kaam\s+kar\s+rahe\s+ho\b/, 'whichwork'],
+  [/\bkaun\s+sa\s+kaam\s+kar\s+rahe\s+ho\b/, 'whichwork'],
+  [/\bkis\s+kaam\s+(par|mein)\s+ho\b/, 'whichwork'],
+  [/\bwhat work are you doing\b/, 'whichwork'],
+  [/\bkis\s+tarah\s+(ka\s+)?kar\s+rahe\s+ho\b/, 'how'],
+  [/\bkaise\s+kar\s+rahe\s+ho\b/, 'how'],
+  [/\bhow are you doing\s+(it|this|that)\b/, 'how'],
+  [/\bkab\s+(start|shuru)\s+kiya\s+(hai|tha)\b/, 'started'],
+  [/\bkab\s+se\s+(start|shuru)\s+kiya\b/, 'started'],
+  [/\bwhen did you start\b/, 'started'],
+  [/\bkitne\s+time\s+mein\s+ho\s+jayega\b/, 'done'],
+  [/\bkitna\s+time\s+lagega\b/, 'done'],
+  [/\b(ye|yeh)\s+kaam\s+kab\s+ho\s+jayega\b/, 'done'],
+  [/\bkab\s+tak\s+ho\s+jayega\b/, 'done'],
+  [/\bkitni\s+der\s+mein\s+ho\s+jayega\b/, 'done'],
+  [/\bhow long will\s+(it|this|that)\s+take\b/, 'done'],
+  [/\bwhen will\s+(it|this|that)\s+be done\b/, 'done'],
+  [/\b(tum|aap)\s+kaun\s+ho\b/, 'who'],
+  [/\bwho are you\s*[?!.]*$/, 'who'],
+  [/\bwhat is your name\s*[?!.]*$/, 'who'],
+  [/\bkya\s+ho\s+raha\s+hai\b/, 'howru']
+];
+var CONVERSATION_SCRIPT_RES = [
+  [/السلام علیکم|شکریہ|خدا حافظ|اللہ حافظ/, 'greeting'],
+  [/کیا حال ہے/, 'howru'], [/کیسے ہو/, 'howru'], [/اور سناؤ/, 'howru'],
+  [/کیا کر رہے ہو/, 'doing'], [/کیا کرتے ہو/, 'doing'],
+  [/کدھر جا رہے ہو/, 'going'], [/کہاں جا رہے ہو/, 'going'],
+  [/کہاں ہو/, 'where'], [/کدھر ہو/, 'where'],
+  [/کونسا کام کر رہے ہو/, 'whichwork'], [/کس کام پر ہو/, 'whichwork'],
+  [/کس طرح کا کر رہے ہو/, 'how'], [/کیسے کر رہے ہو/, 'how'],
+  [/کب سٹارٹ کیا ہے/, 'started'], [/کب شروع کیا ہے/, 'started'],
+  [/کتنے ٹائم میں ہو جائے گا/, 'done'], [/کتنا ٹائم لگے گا/, 'done'],
+  [/یہ کام کب ہو جائے گا/, 'done'], [/کب تک ہو جائے گا/, 'done'],
+  [/تم کون ہو/, 'who'], [/آپ کون ہو/, 'who'], [/کیا ہو رہا ہے/, 'howru'],
+  [/क्या हाल है/, 'howru'], [/कैसे हो/, 'howru'],
+  [/क्या कर रहे हो/, 'doing'], [/कहाँ हो/, 'where'],
+  [/तुम कौन हो/, 'who'], [/कब शुरू किया/, 'started'],
+  [/नमस्ते|नमस्कार|धन्यवाद/, 'greeting']
+];
+
+function conversationKind(text, normed) {
+  var i;
+  for (i = 0; i < CONVERSATION_RES.length; i++) {
+    if (CONVERSATION_RES[i][0].test(normed)) return CONVERSATION_RES[i][1];
+  }
+  for (i = 0; i < CONVERSATION_SCRIPT_RES.length; i++) {
+    if (CONVERSATION_SCRIPT_RES[i][0].test(text)) return CONVERSATION_SCRIPT_RES[i][1];
+  }
+  return null;
+}
+
+/* ---------- definition / explanation ----------
+   "what is / kya hai / explain / samjhao / tell me more about X /
+   how does X work / why ..." — including "ye kya hai" and its Urdu
+   script and Hindi equivalents. Direct answer, never clarify, never
+   research — unless an explicit research order verb is also present
+   (isResearchOrder runs first; this guard only matters when it is not). */
+function isDefinition(text, normed) {
+  var n = normed;
+  if (/^\s*what\s+is\s+the\s+best\b/.test(n)) return false;
+  if (/\bwhat\s+(is|are|was|were)\b/.test(n)) return true;
+  if (/\bwhat\s+does\b.{0,30}\bmean\b/.test(n)) return true;
+  if (/\bmeaning\s+of\b/.test(n)) return true;
+  if (/^\s*(explain|define|describe)\b/.test(n)) return true;
+  if (/\b(explain|define|describe|samjhao|samjhaein|samjhaen)\b/.test(n)) return true;
+  if (/\b(kya|kia)\s+(hai|ha|hota|hoti|hote)\b/.test(n)) return true;
+  if (/\b(ka|ki|ke)\s+matlab\s+(kya|kia)\b/.test(n)) return true;
+  if (/\b(kise|kis\s+ko|kisko)\s+keht(e|ay)\s+(hain|hen)\b/.test(n)) return true;
+  if (/\bkya\s+cheez\s+(hai|ho\s+sakti\s+hai)\b/.test(n)) return true;
+  if (/\b(baare|bare)\s+mein\s+(batao|batayein|samjhao)\b/.test(n)) return true;
+  if (/\btell\s+me\s+(more\s+)?about\s+(?!(it|that|this|them)\b)\S/.test(n)) return true;
+  if (/\bhow\s+does\b.{0,40}\bwork\b/.test(n)) return true;
+  if (/\bwhy\s+(is|are|does|do|did)\b/.test(n)) return true;
+  if (/\b(kyun|kyu)\b/.test(n) && /\b(hai|hota|hoti|tha|thi)\b/.test(n)) return true;
+  if (/(کیا ہے|کیا ہوتا ہے|کیا ہوتی ہے|کا مطلب کیا|کس کو کہتے ہیں|سمجھاؤ|بتاؤ)/.test(text)) return true;
+  if (/(کیا چیز ہے|کیا چیز ہو سکتی ہے)/.test(text)) return true;
+  if (/(क्या है|क्या होता है|समझाओ|बताओ)/.test(text)) return true;
+  return false;
+}
+
+/* ---------- the research-order check (the canonical trigger set) ---------- */
+function isResearchOrder(text, context) {
+  var raw = String(text == null ? '' : text);
+  var lang = detectLanguage(raw);
+  var normed = normPadded(raw);
+  var n = normed;
+  var folded = foldDigits(raw);
+  var ctxTopic = contextTopic(context);
+  var none = { research: false, reason: 'no-research-signal', topic: null, lang: lang, needsTopic: false, matched: null };
+  if (!trim(raw)) return none;
+
+  /* Guard: a question ABOUT the word research is a definition, unless
+     an independent order verb is also present. */
+  if (isDefinitionOfResearch(raw, n) && !hasIndependentOrder(n, raw)) {
+    return { research: false, reason: 'definition-of-research', topic: null, lang: lang, needsTopic: false, matched: null };
+  }
+
+  var v;
+  /* Lone research/search word with no object and no topic ("research",
+     "dhoond") names nothing to investigate: NOT research. The gate may
+     ask which topic. This guard must run before the verb families, or
+     the bare-imperative rule below would claim the lone word. */
+  if (/^(research|search|tehqeeq|tahqeeq|shodh|khoj|dhoond|dhund|talaash|talash|google|find|check|verify|compare)\.?$/.test(trim(n)) ||
+      /^(ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|शोध|खोज|ढूंढ)$/.test(trim(raw))) {
+    return { research: false, reason: 'research-word-no-topic', topic: null, lang: lang, needsTopic: false, matched: null };
+  }
+  /* R1. Source count on its own ("100 websites", "50 authentic
+     sources", "۱۰۰ ویب سائٹس"). The screenshot order fires here. */
+  if (/\d{1,4}\s+(authentic|reliable|genuine|credible|trustworthy|real|mustand)?\s*(sources?|websites?|web\s*sites?|sites?|references?|research\s*papers?|papers?)\b/.test(n)) {
+    return finish(true, 'explicit-source-count', raw, lang, ctxTopic, 'source-count');
+  }
+  if (/(\d{1,4})\s*(مستند|قابل\s*اعتماد)?\s*(ذرائع|ویب\s*سائٹس?|حوالہ\s*جات?)/.test(folded)) {
+    return finish(true, 'explicit-source-count', raw, lang, ctxTopic, 'source-count-urdu');
+  }
+  if (/\d{1,4}\s*(zaraye|hawale|websites?|sources?)\b/.test(n)) {
+    return finish(true, 'explicit-source-count', raw, lang, ctxTopic, 'source-count-roman');
+  }
+
+  /* Definition guard (coordinator fix, 22 Nov 2026): a definition /
+     explanation question is NOT a research order even when it contains
+     a trigger word ("How does search work?", "Tell me about search
+     engines"). Runs AFTER the explicit source-count rule (an explicit
+     count is an order that wins) and BEFORE the verb families — this
+     matches the backend classifier, where step 6b (source count) still
+     runs after the mirror guard. */
+  if (isDefinition(raw, n)) {
+    return { research: false, reason: 'definition-question', topic: null, lang: lang, needsTopic: false, matched: null };
+  }
+
+  /* R2. Research verbs: research / investigate / tehqeeq / shodh (+ karo
+     / kar / kar ke do / on / about / par + topic). */
+  if (/\b(research|investigat\w*|tehqeeq|tahqeeq|shodh|jaanch|taftish)\b/.test(n)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-research-verb', 'research-verb');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R3. Search orders: dhoond / dhoondh / dhoondo / talaash / khoj /
+     search / google (+ do / ke do / kar / karo / lo / batao / nikalo). */
+  if (/\b(dhoond\w*|dhund\w*|talaash|talash|khoj|search|google)\b/.test(n)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-search-order', 'search-order');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R4. Look-into / show orders: "is ke baare mein mujhe dekho",
+     "websites per dakho", "SEO kasy karty han dikhao", "X dikhao". */
+  if (/\b(baare|bare)\s+mein\b.{0,34}\b(dekho|dekhna|dekhein|dikhao|dekh)\b/.test(n) ||
+      /\b(dekho|dekh|dikhao|dikha|dekhna|dekhein)\b/.test(n)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-look-into-order', 'look-into-order');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R5. Nikaal orders: nikaal ke do / nikaalo / nikal kar do. */
+  if (/\b(nikaal\w*|nikal\w*)\b/.test(n)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-find-order', 'nikaal-order');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R6. Compare / verify / check orders (+ karo / kar / ke do). */
+  if (/\b(compare|verify|fact[\s-]?check|cross[\s-]?check|check)\b/.test(n)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-verify-order', 'verify-order');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R7. Report deliverables: detailed report / report on X. */
+  if (/\b(prepare|give|make|write|banayo|taiyar\s+karo)\b.{0,24}\b(detailed\s+)?report\b/.test(n) ||
+      /\bdetailed\s+report\b/.test(n)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-report-deliverable', 'report-deliverable');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R8. "chahiye" orders — only when the wanted thing is information
+     (websites / sources / videos / report / ...), or a chat topic is
+     known. Bare "ye mujhe chahiye" names nothing: not research. */
+  if (/\bchahiye\b/.test(n)) {
+    if (INFO_NOUN_RE.test(n) || INFO_NOUN_URDU_RE.test(raw) || ctxTopic) {
+      v = orderVerdict(n, ctxTopic, 'explicit-want-order', 'chahiye-order');
+      return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+    }
+    return { research: false, reason: 'chahiye-no-topic', topic: null, lang: lang, needsTopic: false, matched: 'chahiye-order' };
+  }
+  /* R9. Where-to-find orders: "batao kahan se milega", "kahan milega". */
+  if (/\bkahan\b.{0,24}\b(milega|milegi|milenge|milta|milti|mile)\b/.test(n) ||
+      /\b(milega|milegi|milenge)\b/.test(n)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-where-to-find', 'where-to-find');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R10. Find / look-up orders (English). */
+  if (/\bfind\s+out\b.{0,18}\babout\b/.test(n) || /\bfind\b/.test(n) || /\blook\s+up\b/.test(n)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-find-order', 'find-order');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R11. Urdu-script orders. */
+  if (/ریسرچ\s*(کرو|کر|کریں|کر\s*کے)/.test(raw) || /تحقیق\s*(کرو|کر|کریں|کر\s*کے)/.test(raw)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-research-verb', 'research-verb-urdu');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  if (/ڈھونڈ\s*(دو|کے|کر|بتاؤ|دے|لو)/.test(raw) || /تلاش\s*(کرو|کر|کر\s*کے)/.test(raw) ||
+      /گوگل\s*(کرو|کر)/.test(raw) || /انٹرنیٹ\s*(سے|پر)\s*ڈھونڈ/.test(raw)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-search-order', 'search-order-urdu');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  if (/بارے\s*میں.{0,34}دیکھو/.test(raw) || /دیکھو|دکھاؤ/.test(raw)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-look-into-order', 'look-into-order-urdu');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  if (/تفصیلی\s*رپورٹ/.test(raw)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-report-deliverable', 'report-deliverable-urdu');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  if (/مجھے.{0,20}چاہیے/.test(raw) && (INFO_NOUN_URDU_RE.test(raw) || ctxTopic)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-want-order', 'chahiye-order-urdu');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R12. Devanagari orders (mirrors the backend classifier). */
+  if (/शोध\s*(करो|कर|करें)/.test(raw) || /खोज\s*(करो|कर)/.test(raw) ||
+      /ढूंढ\s*(दो|कर)/.test(raw) || /इंटरनेट\s*से\s*ढूंढ/.test(raw)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-search-order', 'search-order-hindi');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  return none;
+
+  function finish(research, reason, textArg, langArg, ctx, matched, verdict) {
+    var topic = null, needsTopic = false;
+    if (research) {
+      topic = extractTopic(textArg);
+      if (!topic && ctx) topic = ctx;
+      if (verdict && verdict._content && verdict._content.length && verdict.viaContext) topic = ctx;
+      needsTopic = !topic;
+      if (verdict && verdict.research && verdict._content && verdict._content.length === 0) needsTopic = true;
+      if (topic) needsTopic = false;
+    }
+    return { research: research, reason: reason, topic: topic, lang: langArg, needsTopic: needsTopic, matched: matched };
+  }
+}
+
+/* ---------- clarification questions (user's own language) ----------
+   ONE short, specific question per unclear reason. Never a
+   research-vs-normal choice — that question IS the loop this piece
+   removes. Templates exist for roman + urdu + en (+ hindi, mirroring
+   the backend clarification manager). */
+var CLARIFY_T = {
+  'empty-message': {
+    en: function () { return 'What would you like me to do?'; },
+    roman: function () { return 'Aap kya karwana chahte hain?'; },
+    urdu: function () { return 'آپ کیا کروانا چاہتے ہیں؟'; },
+    hindi: function () { return 'आप क्या करवाना चाहते हैं?'; }
+  },
+  'research-word-no-topic': {
+    en: function () { return 'Which topic should I look into?'; },
+    roman: function () { return 'Main kis topic par kaam karoon?'; },
+    urdu: function () { return 'میں کس موضوع پر کام کروں؟'; },
+    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; }
+  },
+  'pronoun-only-no-topic': {
+    en: function () { return 'Which topic should I look into?'; },
+    roman: function () { return 'Main kis topic par kaam karoon?'; },
+    urdu: function () { return 'میں کس موضوع پر کام کروں؟'; },
+    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; }
+  },
+  'tell-more-no-topic': {
+    en: function () { return 'Which topic should I look into?'; },
+    roman: function () { return 'Main kis topic par kaam karoon?'; },
+    urdu: function () { return 'میں کس موضوع پر کام کروں؟'; },
+    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; }
+  },
+  'research-verb-pronoun-no-topic': {
+    en: function () { return 'Which topic should I look into?'; },
+    roman: function () { return 'Main kis topic par kaam karoon?'; },
+    urdu: function () { return 'میں کس موضوع پر کام کروں؟'; },
+    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; }
+  },
+  'chahiye-no-topic': {
+    en: function () { return 'Which topic should I look into?'; },
+    roman: function () { return 'Main kis topic par kaam karoon?'; },
+    urdu: function () { return 'میں کس موضوع پر کام کروں؟'; },
+    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; }
+  },
+  'bare-topic-fragment': {
+    en: function (t) { return 'What would you like to know about "' + t + '"?'; },
+    roman: function (t) { return '"' + t + '" ke baare mein aap kya jaanna chahte hain?'; },
+    urdu: function (t) { return '"' + t + '" کے بارے میں آپ کیا جاننا چاہتے ہیں؟'; },
+    hindi: function (t) { return '"' + t + '" के बारे में आप क्या जानना चाहते हैं?'; }
+  },
+  'no-referent': {
+    en: function (a, b) { return a && b ? 'Do you mean "' + a + '" or "' + b + '"?' : 'Which task do you mean?'; },
+    roman: function (a, b) { return a && b ? 'Aap ka matlab "' + a + '" hai ya "' + b + '"?' : 'Aap kis kaam ki baat kar rahe hain?'; },
+    urdu: function (a, b) { return a && b ? 'آپ کا مطلب "' + a + '" ہے یا "' + b + '"؟' : 'آپ کس کام کی بات کر رہے ہیں؟'; },
+    hindi: function (a, b) { return a && b ? 'आपका मतलब "' + a + '" है या "' + b + '"?' : 'आप किस काम की बात कर रहे हैं?'; }
+  },
+  'destructive-unclear-target': {
+    en: function () { return 'What exactly do you want me to delete or send?'; },
+    roman: function () { return 'Aap kya delete ya send karna chahte hain?'; },
+    urdu: function () { return 'آپ کیا حذف یا بھیجنا چاہتے ہیں؟'; },
+    hindi: function () { return 'आप क्या हटाना या भेजना चाहते हैं?'; }
+  },
+  'generic': {
+    en: function () { return 'Could you say a little more about what you would like me to do?'; },
+    roman: function () { return 'Aap kis baare mein baat kar rahe hain?'; },
+    urdu: function () { return 'آپ کس بارے میں بات کر رہے ہیں؟'; },
+    hindi: function () { return 'आप किस बारे में बात कर रहे हैं?'; }
+  }
+};
+
+function clarifyQuestion(text, reason, lang, options) {
+  var L = (lang === 'urdu' || lang === 'hindi' || lang === 'roman') ? lang : 'en';
+  var group = CLARIFY_T[reason] ? reason : 'generic';
+  var g = CLARIFY_T[group];
+  var fn = g[L] || g.en;
+  var topic = trim(String(text || '').replace(/[?!.,]+$/g, ''));
+  var a = options && options[0] ? options[0] : null;
+  var b = options && options[1] ? options[1] : null;
+  if (group === 'bare-topic-fragment') return fn(topic);
+  if (group === 'no-referent') return fn(a, b);
+  return fn();
+}
+
+/* ---------- genuinely-ambiguous reasons (clarify is a last resort) ---------- */
+var COMMON_VERBS = { is: 1, are: 1, was: 1, were: 1, do: 1, does: 1,
+  did: 1, can: 1, could: 1, will: 1, would: 1, should: 1, explain: 1,
+  tell: 1, find: 1, search: 1, research: 1, give: 1, show: 1, make: 1,
+  write: 1, help: 1, think: 1, like: 1, want: 1, need: 1, get: 1,
+  know: 1, mean: 1, work: 1, happen: 1, go: 1, come: 1, say: 1, see: 1,
+  hai: 1, hain: 1, karo: 1, kar: 1, kya: 1, kia: 1, ka: 1, ki: 1, ke: 1,
+  mein: 1, batao: 1, samjhao: 1 };
+
+function ambiguousReason(text, normed, ctxTopic) {
+  var t = trim(text), n = normed;
+  if (!t) return 'empty-message';
+  if (/^(research|search|tehqeeq|tahqeeq|shodh|khoj|dhoond|dhund|talaash|talash|google|find|check|verify|compare)\.?$/.test(trim(n))) return 'research-word-no-topic';
+  if (/^(ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|शोध|खोज|ढूंढ)$/.test(t)) return 'research-word-no-topic';
+  if (!ctxTopic) {
+    if (/\b(research|search|find|look\s+up|google|verify|check)\s+(it|that|this|them)\s*[?!.]*$/.test(n)) return 'pronoun-only-no-topic';
+    if (/^\s*tell\s+me\s+(more\s+)?about\s+(it|that|this|them)\s*[?!.]*$/.test(n)) return 'pronoun-only-no-topic';
+    if (/^\s*what\s+about\s+(it|that|this|them)\s*[?!.]*$/.test(n)) return 'pronoun-only-no-topic';
+    if (/^\s*tell\s+me\s+more\s*[?!.]*$/.test(n)) return 'tell-more-no-topic';
+  }
+  if (/\b(delete|remove|erase|clear|send|bhej|bhejo)\b.{0,25}\b(it|that|this|them|that one)\b/.test(n)) return 'destructive-unclear-target';
+  if (/^(delete|remove|send|bhej|bhejo)\s+(it|that|this|them|kar|karo|do)\b/.test(n)) return 'destructive-unclear-target';
+  if (/^(یہ|وہ|اس|اسی)\s+(والا\s+)?کام\s+کر\s+دو/.test(t)) return 'no-referent';
+  if (/^یہ\s+کر\s+دو/.test(t) || /^وہ\s+کر\s+دو/.test(t)) return 'no-referent';
+  var toks = tokensOf(n);
+  if (toks.length > 0 && toks.length <= 14) {
+    var v = objectVerdict(n, ctxTopic);
+    if (v.kind === 'demo') return 'no-referent';
+  }
+  if (toks.length >= 1 && toks.length <= 3) {
+    var hasVerb = false, j;
+    for (j = 0; j < toks.length; j++) { if (COMMON_VERBS[toks[j]]) { hasVerb = true; break; } }
+    if (!hasVerb && !conversationKind(text, n)) return 'bare-topic-fragment';
+  }
+  return null;
+}
+
+/* ---------- the gate hook: the ONE function the gate calls FIRST ----------
+   shouldClarify(text, context) -> { clarify, lang, reason, question,
+   research }. The assembler calls this before garbledScore/CONFIRM_T
+   and before vagueCheck/classifyIntent. clarify === false means:
+   proceed — never confirm, never clarify, never badge as Normal when
+   research.research is true. clarify === true means: show question
+   (already in the user's language) and nothing else. */
+function shouldClarify(text, context) {
+  var raw = String(text == null ? '' : text);
+  var lang = detectLanguage(raw);
+  var normed = normPadded(raw);
+  var ctxTopic = contextTopic(context);
+  var r = isResearchOrder(raw, context);
+  if (r.research) {
+    return { clarify: false, lang: lang, reason: 'research-order:' + r.reason, question: null, research: r };
+  }
+  if (r.reason === 'research-verb-pronoun-no-topic' || r.reason === 'chahiye-no-topic' || r.reason === 'research-word-no-topic') {
+    return { clarify: true, lang: lang, reason: r.reason, question: clarifyQuestion(raw, r.reason, lang), research: r };
+  }
+  if (conversationKind(raw, normed)) {
+    return { clarify: false, lang: lang, reason: 'conversation', question: null, research: r };
+  }
+  if (isDefinition(raw, normed)) {
+    return { clarify: false, lang: lang, reason: 'definition', question: null, research: r };
+  }
+  var amb = ambiguousReason(raw, normed, ctxTopic);
+  if (amb) {
+    return { clarify: true, lang: lang, reason: amb, question: clarifyQuestion(raw, amb, lang), research: r };
+  }
+  return { clarify: false, lang: lang, reason: 'general-default', question: null, research: r };
+}
+
+/* ---------- exports ---------- */
+var api = {
+  detectLanguage: detectLanguage,
+  isResearchOrder: isResearchOrder,
+  clarifyQuestion: clarifyQuestion,
+  shouldClarify: shouldClarify,
+  extractTopic: extractTopic,
+  normRoman: normRoman,
+  conversationKind: conversationKind,
+  isDefinition: isDefinition
+};
+global.EnzoResearchTriggers = api;
+if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<script>
+/* ==========================================================================
+ * ENAO AI — Live-defect fix, worker 3: CHAT-SYNC + POLLING 404 STORM
+ * Piece 32: pieces/32-polling-fix.js
+ *
+ * Defect (VM log, 22 Nov 2026 ~11:03-11:08 UTC, confirmed live by the
+ * coordinator): the browser polled GET /api/v2/chats/cmwrc44ophyz4/tasks
+ * and /events?since=0 many times per second (same for chat
+ * cmwrqbn8526y6); GET /api/v2/tasks//progress and /sources with an EMPTY
+ * task id; POST /api/v2/tasks/2/cancel -> 404. The cmwr* ids are
+ * localStorage-only chats the backend never knew about, and the frontend
+ * polled them forever.
+ *
+ * Root causes found by grep in ~/workspace/your_files/enao-ai/enao-ai.html
+ * (45,471 lines; NEVER edited by this piece):
+ *
+ *  R1. TWO ID NAMESPACES, MONITOR USES THE WRONG ONE. Local chats live in
+ *      localStorage 'enao_chats_v1' with ids like cmwrqbn8526y6. The
+ *      backend only knows the server-assigned id returned by POST /chats
+ *      (ensureBackendChat, ~L12885, stored as chat.backendId). The monitor
+ *      data layer (M1, ~L20582 pollOnce) is fed the LOCAL id:
+ *      syncMonitorChat (~L44263, setInterval 1200 ms) calls
+ *      EnzoMonitor.setChatId(activeChat().id) and .start(); backendAsk
+ *      (~L13290) calls EnzoMonitor.setChatId(chat.id); monitor restore()
+ *      (~L19928) reloads a persisted (local) chatId from localStorage
+ *      'enao_monitor_v1' and start() polls it on page load. So a chat
+ *      that never had an /ask is polled from load, forever.
+ *  R2. MONITOR RETRIES 404 FOREVER. M1 pollOnce (~L20582) treats a 404
+ *      as proof the backend is up ("404 (unknown chat) still proves the
+ *      backend is up") and re-schedules with backoff [1,2,5,10,30]s
+ *      forever. pollProgressOnce (~L20669) re-schedules progress polling
+ *      on ANY failure, forever. No code path ever marks a chat unknown.
+ *  R3. P-F v2req STRIPS THE HTTP STATUS (~L12720). It throws a generic
+ *      Error('http '+r.status) with no err.status, so the P-F task poller
+ *      startPoll (~L13154, tick every 2500 ms, 4000 ms paused, first tick
+ *      600 ms) cannot tell a 404 from a network error; its 3-strike rule
+ *      counts every error alike and falls back to legacy search instead
+ *      of marking the chat/task unknown.
+ *  R4. EMPTY-ID CALLS HAVE NO SINGLE CHOKE POINT. fetchTaskSources
+ *      (~L12920) guards `if(!taskId)` but handleAskResp (~L13260) calls
+ *      it with resp.task_id unchecked; startPoll fetches
+ *      v2get('/tasks/'+taskId) and /progress with no guard; postModify
+ *      (~L25065, ~L29315) calls fetch with encodeURIComponent(taskId)
+ *      and no guard at all (encodeURIComponent(undefined) === "undefined");
+ *      the lifecycle cancelTask (~L39442) does String(taskId) — turning
+ *      undefined into the literal string "undefined" — and
+ *      notifyBackendCancel (~L39288) fires the POST even for unknown ids
+ *      ("Cancelling an unknown task id is also safe... the backend is
+ *      still told"). v2Control (~L12818) and stopGeneration (~L13824)
+ *      POST /tasks/{t.taskId}/cancel with no guard. That is where
+ *      /tasks//progress, /tasks//sources and /tasks/2/cancel come from:
+ *      an empty id, or a stale/unknown id, sent with no check.
+ *  R5. LIVE SCREEN RECURSES FOREVER. EnzoLiveScreen pollOnce (~L42544)
+ *      fetches task + progress + events every 2500 ms and schedulePoll
+ *      (~L42531) re-schedules on BOTH resolve and reject; openLiveScreen
+ *      (~L42840) takes its chatId from EnzoMonitor.getState().chatId —
+ *      the same local id from R1. No 404 handling anywhere in the loop.
+ *  R6. restoreBackendForChat (~L13323) is the ONE correct caller: it
+ *      uses the backend id (bid) for /chats/{bid}/tasks. Every other
+ *      chat poller uses the local id. The fix makes every poller use R6's
+ *      rule: poll a chat ONLY under its backend id, ONLY after the
+ *      backend confirmed it.
+ *
+ * What this piece does (pure, testable helpers + one guarded transport
+ * that is the single choke point every caller must use):
+ *
+ *  1. Backend-known chat registry. A chat is pollable ONLY after the
+ *     backend confirmed it (successful create/get/ask for that chat id).
+ *     Local-only chats are NEVER polled.
+ *  2. First-404 rule. The first 404 on a chat's /tasks or /events marks
+ *     that chat local-only, stops its polling loops immediately, and
+ *     never retries it in the session. An unknown chat is polled AT MOST
+ *     ONCE per session (one probe, then stopped).
+ *  3. Empty-id guard at the single choke point (the transport below)
+ *     and re-checked at each poller: no progress/sources/task/cancel/
+ *     pause/resume/modify call may ever fire with an empty, blank,
+ *     whitespace-only, undefined, null, "undefined", "null" or "NaN"
+ *     task id. Same for empty chat ids.
+ *  4. Monitor and Live Screen pollers share the same registry, guards
+ *     and first-404 rule (createMonitorPoller / createLiveScreenPoller).
+ *  5. Unknown-task control dedupe: a cancel/pause/resume/modify is sent
+ *     ONLY for a task id the backend has confirmed (ask response,
+ *     successful task/progress fetch, or an explicit confirmTask()).
+ *     A control call for a task the backend does not know is never sent
+ *     at all — zero fetch calls — so the live POST /api/v2/tasks/2/cancel
+ *     404 can never happen. After a 404 a task stays unknown and its
+ *     control calls stay suppressed for the session; an in-flight
+ *     control call is never duplicated; a successful cancel is never
+ *     re-sent (task terminal).
+ *
+ * What this piece does NOT change: polling behaviour for backend-known
+ * chats and tasks is untouched — progress still polls every 2 s / 2.5 s,
+ * long-poll events still re-poll at once after a 25 s hold, non-404
+ * errors still back off and retry. No fetch is invented, no data is
+ * synthesised, no emojis.
+ *
+ * Style: plain ES5, var + function declarations, no dependencies, no
+ * emojis. Loads in a browser as window.EnzoPollingFix and in Node as a
+ * CommonJS module (require('./32-polling-fix.js')) for the harness.
+ * ========================================================================== */
+(function (root, factory) {
+  'use strict';
+  var api = factory();
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = api;
+  }
+  if (root) root.EnzoPollingFix = api;
+})(typeof window !== 'undefined' ? window
+    : (typeof globalThis !== 'undefined' ? globalThis : this),
+function () {
+  'use strict';
+
+  var VERSION = '32-polling-fix v1.0 (enao-live-fix, 22 Nov 2026)';
+  var TERMINAL_TASK_STATES = {
+    completed: true, partially_completed: true,
+    failed: true, cancelled: true
+  };
+  var CONTROL_ACTIONS = { pause: true, resume: true, cancel: true, modify: true };
+  var BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
+
+  /* ------------------------------------------------------------------ */
+  /* Small pure helpers                                                  */
+  /* ------------------------------------------------------------------ */
+
+  /* Normalise an id. Returns the trimmed string, or null when the value
+     can never be a real backend id: undefined, null, non-string
+     non-number, empty, whitespace-only, or the literal strings produced
+     by String(undefined) / String(null) — the exact trap at export
+     L39442 (cancelTask does String(taskId)) and L25065/L29315
+     (encodeURIComponent(undefined) === "undefined"). Numbers are
+     accepted (a numeric task id such as 2 is non-empty; whether the
+     backend knows it is decided by the registry/404 rule, not here). */
+  function asId(value) {
+    if (typeof value === 'number') {
+      if (!isFinite(value)) return null;
+      return String(value);
+    }
+    if (typeof value !== 'string') return null;
+    var s = value.replace(/^\s+|\s+$/g, '');
+    if (!s) return null;
+    if (s === 'undefined' || s === 'null' || s === 'NaN') return null;
+    return s;
+  }
+
+  function isNonEmptyId(value) {
+    return asId(value) !== null;
+  }
+
+  /* Detect a 404 from any of the error shapes in the export. The
+     monitor's httpJson (~L20557) sets err.status; P-F v2req (~L12720)
+     does NOT, it throws Error('http 404') — so the message text must
+     also be checked. A bare "Not Found" with no 404 is NOT treated as
+     a 404: only a numeric 404 counts, so a stray message can never
+     wrongly quarantine a known chat. */
+  function is404(err) {
+    if (!err) return false;
+    if (err.status === 404 || err.statusCode === 404) return true;
+    var m = String((err && err.message) || err);
+    return /(^|[^0-9])404([^0-9]|$)/.test(m);
+  }
+
+  function isTerminalTaskState(state) {
+    return !!TERMINAL_TASK_STATES[state];
+  }
+
+  function clone(obj) {
+    if (obj === undefined) return undefined;
+    return JSON.parse(JSON.stringify(obj));
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Registry: what the backend has confirmed, what it rejected, and    */
+  /* what has already been probed once this session. One registry per   */
+  /* page load; nothing here persists to localStorage, so a reload      */
+  /* re-probes once (correct: a chat created on the backend since the   */
+  /* last load must be pollable again).                                 */
+  /* ------------------------------------------------------------------ */
+
+  function createRegistry() {
+    var knownByLocal = {};   /* local chat id -> backend chat id */
+    var knownBackend = {};   /* backend chat id -> true */
+    var localOnly = {};      /* chat id (local or backend, as polled) -> true */
+    var probed = {};         /* chat id -> number of probe attempts */
+    var knownTasks = {};     /* task id -> true */
+    var unknownTasks = {};   /* task id -> true (404'd, never retry) */
+    var controlState = {};   /* taskId + '|' + action -> 'inflight'|'ok'|'notfound' */
+
+    function markLocalOnly(chatId) {
+      var id = asId(chatId);
+      if (id) localOnly[id] = true;
+    }
+
+    return {
+      /* Backend confirmed this chat: POST /chats succeeded, or a
+         GET /chats/{id}/... succeeded. localId is the localStorage id,
+         backendId the server-assigned id; when they are the same id
+         (or only one is known) pass it as both. */
+      confirmChat: function (localId, backendId) {
+        var l = asId(localId);
+        var b = asId(backendId) || l;
+        if (!l || !b) return false;
+        knownByLocal[l] = b;
+        knownBackend[b] = true;
+        delete localOnly[l];
+        delete localOnly[b];
+        return true;
+      },
+      /* A poll under this id succeeded: the id itself is backend-known. */
+      confirmChatByPolledId: function (polledId) {
+        var id = asId(polledId);
+        if (!id) return false;
+        knownBackend[id] = true;
+        delete localOnly[id];
+        return true;
+      },
+      markChatLocalOnly: markLocalOnly,
+      isChatKnown: function (chatId) {
+        var id = asId(chatId);
+        if (!id) return false;
+        return !!knownBackend[id] || !!knownByLocal[id];
+      },
+      isChatLocalOnly: function (chatId) {
+        var id = asId(chatId);
+        if (!id) return false;
+        return !!localOnly[id];
+      },
+      /* The id a poller must put in the URL, or null when the chat must
+         not be polled at all. Never returns a local-only id. */
+      resolveBackendId: function (localId) {
+        var id = asId(localId);
+        if (!id) return null;
+        if (localOnly[id]) return null;
+        if (knownByLocal[id]) return knownByLocal[id];
+        if (knownBackend[id]) return id;
+        return null;
+      },
+      /* First-404 rule, probe half: true only the first time an
+         unconfirmed chat is polled. Callers must call noteProbe() when
+         they actually fire the probe so the count is exact. */
+      canProbeChat: function (chatId) {
+        var id = asId(chatId);
+        if (!id) return false;
+        if (localOnly[id]) return false;
+        return !probed[id];
+      },
+      noteProbe: function (chatId) {
+        var id = asId(chatId);
+        if (!id) return 0;
+        probed[id] = (probed[id] || 0) + 1;
+        return probed[id];
+      },
+      probeCount: function (chatId) {
+        var id = asId(chatId);
+        return id ? (probed[id] || 0) : 0;
+      },
+      /* Record a chat poll outcome. A 404 quarantines the chat
+         (local-only, polling stops); a success confirms it. Returns
+         'local-only', 'confirmed' or 'error' (non-404: retry with
+         backoff, chat stays unconfirmed). */
+      noteChatPollResult: function (chatId, err) {
+        var id = asId(chatId);
+        if (!id) return 'empty-id';
+        if (!err) {
+          knownBackend[id] = true;
+          delete localOnly[id];
+          return 'confirmed';
+        }
+        if (is404(err)) {
+          localOnly[id] = true;
+          return 'local-only';
+        }
+        return 'error';
+      },
+      confirmTask: function (taskId) {
+        var id = asId(taskId);
+        if (!id) return false;
+        knownTasks[id] = true;
+        delete unknownTasks[id];
+        return true;
+      },
+      isTaskKnown: function (taskId) {
+        var id = asId(taskId);
+        return !!id && !!knownTasks[id];
+      },
+      isTaskUnknown: function (taskId) {
+        var id = asId(taskId);
+        return !!id && !!unknownTasks[id];
+      },
+      markTaskUnknown: function (taskId) {
+        var id = asId(taskId);
+        if (id) unknownTasks[id] = true;
+      },
+      /* Record a task poll outcome. A 404 quarantines the task;
+         a success confirms it. Returns 'unknown', 'confirmed' or
+         'error'. */
+      noteTaskPollResult: function (taskId, err) {
+        var id = asId(taskId);
+        if (!id) return 'empty-id';
+        if (!err) {
+          knownTasks[id] = true;
+          delete unknownTasks[id];
+          return 'confirmed';
+        }
+        if (is404(err)) {
+          unknownTasks[id] = true;
+          return 'unknown';
+        }
+        return 'error';
+      },
+      /* Control-call dedupe (rule 5). Returns true when a control call
+         for this task+action may be sent now. A control call is sent
+         ONLY for a task the backend has confirmed: an unconfirmed task
+         (never seen in a successful ask/task/progress response) is
+         treated as unknown, so POST /tasks/2/cancel-style calls for ids
+         the backend never issued make zero fetch calls. */
+      canSendControl: function (taskId, action) {
+        var id = asId(taskId);
+        if (!id || !CONTROL_ACTIONS[action]) return false;
+        if (!knownTasks[id]) return false;
+        if (unknownTasks[id]) return false;
+        var st = controlState[id + '|' + action];
+        if (st === 'inflight' || st === 'notfound') return false;
+        /* A successful cancel is terminal: never re-send it. Pause /
+           resume may be sent again after a success. */
+        if (st === 'ok' && action === 'cancel') return false;
+        return true;
+      },
+      noteControlSent: function (taskId, action) {
+        var id = asId(taskId);
+        if (id && CONTROL_ACTIONS[action]) controlState[id + '|' + action] = 'inflight';
+      },
+      noteControlResult: function (taskId, action, err) {
+        var id = asId(taskId);
+        if (!id || !CONTROL_ACTIONS[action]) return 'empty-id';
+        var key = id + '|' + action;
+        if (!err) {
+          controlState[key] = 'ok';
+          knownTasks[id] = true;
+          delete unknownTasks[id];
+          return 'confirmed';
+        }
+        if (is404(err)) {
+          controlState[key] = 'notfound';
+          unknownTasks[id] = true;
+          return 'unknown';
+        }
+        delete controlState[key];
+        return 'error';
+      },
+      snapshot: function () {
+        return {
+          knownByLocal: clone(knownByLocal),
+          knownBackend: clone(knownBackend),
+          localOnly: clone(localOnly),
+          probed: clone(probed),
+          knownTasks: clone(knownTasks),
+          unknownTasks: clone(unknownTasks),
+          controlState: clone(controlState)
+        };
+      }
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Guarded transport: the SINGLE choke point. Every backend poll /    */
+  /* control call in the export must go through here (or through a      */
+  /* wrapper with identical checks). No method here ever calls fetch    */
+  /* with an empty id, with a local-only chat, with a second probe of   */
+  /* an unknown chat, with an unknown task, or with a duplicate /       */
+  /* already-404'd control call. Rejections carry .code so callers can  */
+  /* tell a guard refusal (no request was sent) from a backend error.   */
+  /* ------------------------------------------------------------------ */
+
+  function guardedError(code, message) {
+    var e = new Error(message);
+    e.code = code;
+    return e;
+  }
+
+  /* fetchFn must be fetch-compatible: fetch(url, opts) -> Promise of a
+     Response-like {ok, status, json()}. The transport normalises a
+     non-2xx response into an Error with .status set — this also repairs
+     R3 for callers routed through here (P-F v2req drops the status). */
+  function createTransport(fetchFn, registry, opts) {
+    if (typeof fetchFn !== 'function') {
+      throw new Error('EnzoPollingFix.createTransport: fetchFn is required');
+    }
+    var reg = registry || createRegistry();
+    var base = (opts && typeof opts.base === 'string' && opts.base)
+      ? opts.base.replace(/\/$/, '') : '/api/v2';
+
+    function callFetch(url, fetchOpts) {
+      var p;
+      try {
+        p = fetchFn(url, fetchOpts || { method: 'GET' });
+      } catch (e) {
+        return Promise.reject(e instanceof Error ? e : new Error(String(e)));
+      }
+      return Promise.resolve(p).then(function (resp) {
+        if (!resp || typeof resp.json !== 'function') {
+          throw new Error('Invalid response from backend');
+        }
+        return resp.json().catch(function () { return null; }).then(function (j) {
+          if (!resp.ok) {
+            var err = new Error((j && (j.message || j.error)) ||
+              ('Backend returned HTTP ' + resp.status));
+            err.status = resp.status;
+            err.payload = j;
+            throw err;
+          }
+          return j;
+        });
+      });
+    }
+
+    /* Chat calls: known -> poll under the backend id; unconfirmed ->
+       exactly one probe under the id as given; local-only / already
+       probed -> refuse without fetching. On success the polled id is
+       confirmed; on 404 the chat is quarantined. */
+    function chatCall(kind, chatId, suffix, fetchOpts) {
+      var id = asId(chatId);
+      if (!id) {
+        return Promise.reject(guardedError('empty-chat-id',
+          'Refused ' + kind + ': chat id is empty — no request sent.'));
+      }
+      var backendId = reg.resolveBackendId(id);
+      if (backendId) {
+        return callFetch(base + '/chats/' + encodeURIComponent(backendId) + suffix, fetchOpts)
+          .then(function (j) { reg.noteChatPollResult(backendId, null); return j; },
+            function (err) { reg.noteChatPollResult(backendId, err); throw err; });
+      }
+      if (reg.isChatLocalOnly(id) || !reg.canProbeChat(id)) {
+        return Promise.reject(guardedError('chat-local-only',
+          'Refused ' + kind + ': chat ' + id +
+          ' is local-only (backend never confirmed it) — no request sent.'));
+      }
+      reg.noteProbe(id);
+      return callFetch(base + '/chats/' + encodeURIComponent(id) + suffix, fetchOpts)
+        .then(function (j) { reg.noteChatPollResult(id, null); return j; },
+          function (err) { reg.noteChatPollResult(id, err); throw err; });
+    }
+
+    /* Task calls: empty id -> refuse; unknown (404'd) task -> refuse;
+       otherwise fetch, confirming on success and quarantining on 404. */
+    function taskCall(kind, taskId, suffix, fetchOpts) {
+      var id = asId(taskId);
+      if (!id) {
+        return Promise.reject(guardedError('empty-task-id',
+          'Refused ' + kind + ': task id is empty — no request sent.'));
+      }
+      if (reg.isTaskUnknown(id)) {
+        return Promise.reject(guardedError('task-unknown',
+          'Refused ' + kind + ': task ' + id +
+          ' is unknown to the backend — no request sent.'));
+      }
+      return callFetch(base + '/tasks/' + encodeURIComponent(id) + suffix, fetchOpts)
+        .then(function (j) { reg.noteTaskPollResult(id, null); return j; },
+          function (err) { reg.noteTaskPollResult(id, err); throw err; });
+    }
+
+    function controlCall(taskId, action, body) {
+      var id = asId(taskId);
+      if (!id) {
+        return Promise.reject(guardedError('empty-task-id',
+          'Refused task control (' + action + '): task id is empty — no request sent.'));
+      }
+      if (!CONTROL_ACTIONS[action]) {
+        return Promise.reject(guardedError('bad-action',
+          'Refused task control: unknown action "' + action + '".'));
+      }
+      if (!reg.isTaskKnown(id)) {
+        return Promise.reject(guardedError('task-unknown',
+          'Refused task control (' + action + ') for task ' + id +
+          ': task was never confirmed by the backend — no request sent.'));
+      }
+      if (!reg.canSendControl(id, action)) {
+        return Promise.reject(guardedError('control-suppressed',
+          'Refused task control (' + action + ') for task ' + id +
+          ': already sent, in flight, or task unknown to the backend — no request sent.'));
+      }
+      reg.noteControlSent(id, action);
+      return callFetch(base + '/tasks/' + encodeURIComponent(id) + '/' + action, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {})
+      }).then(function (j) { reg.noteControlResult(id, action, null); return j; },
+        function (err) { reg.noteControlResult(id, action, err); throw err; });
+    }
+
+    return {
+      registry: reg,
+      base: base,
+      getChatEvents: function (chatId, since) {
+        var s = (typeof since === 'number' && since >= 0) ? since : 0;
+        return chatCall('events', chatId, '/events?since=' + s);
+      },
+      getChatTasks: function (chatId) {
+        return chatCall('chat-tasks', chatId, '/tasks');
+      },
+      getTask: function (taskId) {
+        return taskCall('task', taskId, '');
+      },
+      getTaskProgress: function (taskId) {
+        return taskCall('progress', taskId, '/progress');
+      },
+      getTaskSources: function (taskId) {
+        return taskCall('sources', taskId, '/sources');
+      },
+      postTaskControl: function (taskId, action) {
+        return controlCall(taskId, action, {});
+      },
+      postTaskModify: function (taskId, instruction) {
+        return controlCall(taskId, 'modify', { instruction: instruction || '' });
+      }
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Pollers. All share one registry + transport, all obey the same     */
+  /* rules, all stop on first 404. Timers are injectable so the harness */
+  /* can drive them without real time. Default timers are the globals.  */
+  /* ------------------------------------------------------------------ */
+
+  function defaultTimers() {
+    return {
+      setTimeout: function (fn, ms) { return setTimeout(fn, ms); },
+      clearTimeout: function (t) { clearTimeout(t); }
+    };
+  }
+
+  function nextBackoff(step) {
+    return BACKOFF_MS[Math.min(step, BACKOFF_MS.length - 1)];
+  }
+
+  /* Long-poll event poller — replaces M1 pollOnce (~L20582) and the
+     syncMonitorChat re-pointing (~L44263). Behaviour for known chats is
+     unchanged: after a successful long-poll (server held up to 25 s)
+     it re-polls at once; non-404 errors back off. A 404, an empty chat
+     id, or a local-only chat stops the loop immediately. */
+  function createEventPoller(opts) {
+    opts = opts || {};
+    var transport = opts.transport;
+    if (!transport) throw new Error('EnzoPollingFix.createEventPoller: transport is required');
+    var timers = opts.timers || defaultTimers();
+    var chatId = asId(opts.chatId);
+    var timer = null;
+    var running = false;
+    var stopped = false;
+    var stopReason = null;
+    var backoffStep = 0;
+    var rounds = 0;
+    var inFlight = null; /* a round already running: re-calling pollOnce
+      joins it instead of firing a duplicate probe (a duplicate probe
+      would break the at-most-once rule for unknown chats) */
+
+    function stop(reason) {
+      if (timer) { timers.clearTimeout(timer); timer = null; }
+      running = false;
+      stopped = true;
+      stopReason = reason || 'stopped';
+      if (typeof opts.onStop === 'function') {
+        try { opts.onStop(stopReason); } catch (e) { /* callback must not break stop */ }
+      }
+    }
+
+    function schedule(delayMs) {
+      if (!running || stopped) return;
+      if (timer) timers.clearTimeout(timer);
+      timer = timers.setTimeout(function () {
+        timer = null;
+        pollOnce();
+      }, delayMs);
+    }
+
+    function pollOnce() {
+      if (stopped || !running) return Promise.resolve(false);
+      if (inFlight) return inFlight;
+      if (!chatId) { stop('empty-chat-id'); return Promise.resolve(false); }
+      rounds++;
+      inFlight = transport.getChatEvents(chatId, opts.since || 0).then(function (j) {
+        inFlight = null;
+        if (stopped || !running) return false;
+        backoffStep = 0;
+        if (typeof opts.onEvents === 'function') {
+          try { opts.onEvents(j); } catch (e) { /* callback must not break polling */ }
+        }
+        if (typeof opts.onSince === 'function') {
+          try { opts.onSince(j); } catch (e) { /* ignore */ }
+        }
+        schedule(0); /* server already held up to 25 s: poll again at once */
+        return true;
+      }, function (err) {
+        inFlight = null;
+        if (stopped || !running) return false;
+        if (err && (err.code === 'chat-local-only' || err.code === 'empty-chat-id')) {
+          stop(err.code === 'empty-chat-id' ? 'empty-chat-id' : 'chat-local-only');
+          return false;
+        }
+        if (is404(err)) { stop('chat-404'); return false; }
+        if (typeof opts.onError === 'function') {
+          try { opts.onError(err); } catch (e) { /* ignore */ }
+        }
+        var delay = nextBackoff(backoffStep);
+        backoffStep++;
+        schedule(delay);
+        return false;
+      });
+      return inFlight;
+    }
+
+    return {
+      kind: 'events',
+      start: function () {
+        if (stopped) return false;
+        if (running) return true;
+        if (!chatId) { stop('empty-chat-id'); return false; }
+        /* Unknown chat: the transport allows exactly one probe; the
+           poller must not even schedule a retry loop for a chat the
+           registry already quarantined. */
+        var reg = transport.registry;
+        if (reg && reg.isChatLocalOnly(chatId)) { stop('chat-local-only'); return false; }
+        running = true;
+        backoffStep = 0;
+        pollOnce();
+        return true;
+      },
+      stop: function () { stop('stopped'); },
+      setChatId: function (id) {
+        var next = asId(id);
+        if (next === chatId) return;
+        if (timer) { timers.clearTimeout(timer); timer = null; }
+        chatId = next;
+        backoffStep = 0;
+        if (running && chatId) pollOnce();
+        else if (running) stop('empty-chat-id');
+      },
+      getChatId: function () { return chatId; },
+      pollOnce: pollOnce,
+      isRunning: function () { return running && !stopped; },
+      isStopped: function () { return stopped; },
+      getStopReason: function () { return stopReason; },
+      getRounds: function () { return rounds; }
+    };
+  }
+
+  /* Progress poller — replaces P-F startPoll tick (~L13154) and M1
+     pollProgressOnce (~L20669). Behaviour for known tasks is unchanged:
+     polls every intervalMs while the task is active; terminal states
+     stop it. A 404 or an empty task id stops it immediately. Non-404
+     errors back off, and after 3 consecutive non-404 errors it stops
+     with 'unreachable' (the existing P-F 3-strike rule, preserved). */
+  function createProgressPoller(opts) {
+    opts = opts || {};
+    var transport = opts.transport;
+    if (!transport) throw new Error('EnzoPollingFix.createProgressPoller: transport is required');
+    var timers = opts.timers || defaultTimers();
+    var taskId = asId(opts.taskId);
+    var intervalMs = (typeof opts.intervalMs === 'number' && opts.intervalMs > 0)
+      ? opts.intervalMs : 2500;
+    var timer = null;
+    var running = false;
+    var stopped = false;
+    var stopReason = null;
+    var strikes = 0;
+    var rounds = 0;
+    var inFlight = null; /* same duplicate-probe guard as the events poller */
+
+    function stop(reason) {
+      if (timer) { timers.clearTimeout(timer); timer = null; }
+      running = false;
+      stopped = true;
+      stopReason = reason || 'stopped';
+      if (typeof opts.onStop === 'function') {
+        try { opts.onStop(stopReason); } catch (e) { /* ignore */ }
+      }
+    }
+
+    function schedule(delayMs) {
+      if (!running || stopped) return;
+      if (timer) timers.clearTimeout(timer);
+      timer = timers.setTimeout(function () {
+        timer = null;
+        pollOnce();
+      }, delayMs);
+    }
+
+    function pollOnce() {
+      if (stopped || !running) return Promise.resolve(false);
+      if (inFlight) return inFlight;
+      if (!taskId) { stop('empty-task-id'); return Promise.resolve(false); }
+      rounds++;
+      inFlight = transport.getTaskProgress(taskId).then(function (p) {
+        inFlight = null;
+        if (stopped || !running) return false;
+        strikes = 0;
+        if (typeof opts.onProgress === 'function') {
+          try { opts.onProgress(p); } catch (e) { /* ignore */ }
+        }
+        if (p && isTerminalTaskState(p.state)) {
+          stop('terminal:' + p.state);
+          if (typeof opts.onTerminal === 'function') {
+            try { opts.onTerminal(p); } catch (e) { /* ignore */ }
+          }
+          return true;
+        }
+        schedule(intervalMs);
+        return true;
+      }, function (err) {
+        inFlight = null;
+        if (stopped || !running) return false;
+        if (err && (err.code === 'empty-task-id' || err.code === 'task-unknown')) {
+          stop(err.code === 'empty-task-id' ? 'empty-task-id' : 'task-404');
+          return false;
+        }
+        if (is404(err)) { stop('task-404'); return false; }
+        if (typeof opts.onError === 'function') {
+          try { opts.onError(err); } catch (e) { /* ignore */ }
+        }
+        strikes++;
+        if (strikes >= 3) { stop('unreachable'); return false; }
+        schedule(3000);
+        return false;
+      });
+      return inFlight;
+    }
+
+    return {
+      kind: 'progress',
+      start: function () {
+        if (stopped) return false;
+        if (running) return true;
+        if (!taskId) { stop('empty-task-id'); return false; }
+        var reg = transport.registry;
+        if (reg && reg.isTaskUnknown(taskId)) { stop('task-404'); return false; }
+        running = true;
+        strikes = 0;
+        pollOnce();
+        return true;
+      },
+      stop: function () { stop('stopped'); },
+      setTaskId: function (id) {
+        var next = asId(id);
+        if (next === taskId) return;
+        if (timer) { timers.clearTimeout(timer); timer = null; }
+        taskId = next;
+        strikes = 0;
+        if (running && taskId) pollOnce();
+        else if (running) stop('empty-task-id');
+      },
+      getTaskId: function () { return taskId; },
+      pollOnce: pollOnce,
+      isRunning: function () { return running && !stopped; },
+      isStopped: function () { return stopped; },
+      getStopReason: function () { return stopReason; },
+      getRounds: function () { return rounds; }
+    };
+  }
+
+  /* Monitor poller — M1 data layer shape (events long-poll + progress
+     poll + sources on terminal) sharing one registry/transport. An
+     unknown chat stops ONLY the events side; a known task's progress
+     keeps polling. Sources are fetched once, only for a known task id,
+     only when the task reaches a terminal state. */
+  function createMonitorPoller(opts) {
+    opts = opts || {};
+    var transport = opts.transport;
+    if (!transport) throw new Error('EnzoPollingFix.createMonitorPoller: transport is required');
+    var events = createEventPoller({
+      transport: transport,
+      chatId: opts.chatId,
+      timers: opts.timers,
+      since: opts.since || 0,
+      onEvents: opts.onEvents,
+      onError: opts.onError,
+      onStop: function (reason) {
+        if (typeof opts.onEventsStop === 'function') {
+          try { opts.onEventsStop(reason); } catch (e) { /* ignore */ }
+        }
+      }
+    });
+    var progress = null;
+    var sourcesFetched = {};
+
+    function ensureProgress(taskId) {
+      var id = asId(taskId);
+      if (!id) return null;
+      if (progress && progress.getTaskId() === id) return progress;
+      if (progress) progress.stop();
+      progress = createProgressPoller({
+        transport: transport,
+        taskId: id,
+        intervalMs: opts.progressIntervalMs || 2000,
+        timers: opts.timers,
+        onProgress: opts.onProgress,
+        onError: opts.onError,
+        onTerminal: function (p) {
+          if (!sourcesFetched[id]) {
+            sourcesFetched[id] = true;
+            transport.getTaskSources(id).then(function (j) {
+              if (typeof opts.onSources === 'function') {
+                try { opts.onSources(id, j); } catch (e) { /* ignore */ }
+              }
+            }, function () { /* sources failure never stops polling */ });
+          }
+          if (typeof opts.onTerminal === 'function') {
+            try { opts.onTerminal(id, p); } catch (e) { /* ignore */ }
+          }
+        },
+        onStop: function (reason) {
+          if (typeof opts.onProgressStop === 'function') {
+            try { opts.onProgressStop(reason); } catch (e) { /* ignore */ }
+          }
+        }
+      });
+      return progress;
+    }
+
+    return {
+      kind: 'monitor',
+      events: events,
+      start: function () {
+        var ok = events.start();
+        if (opts.taskId) {
+          var p = ensureProgress(opts.taskId);
+          if (p) p.start();
+        }
+        return ok;
+      },
+      stop: function () {
+        events.stop();
+        if (progress) progress.stop();
+      },
+      setChatId: function (id) { events.setChatId(id); },
+      getChatId: function () { return events.getChatId(); },
+      openTask: function (taskId) {
+        var p = ensureProgress(taskId);
+        if (!p) return null;
+        p.start();
+        return p;
+      },
+      getProgressPoller: function () { return progress; },
+      pollEventsOnce: function () { return events.pollOnce(); },
+      pollProgressOnce: function () {
+        return progress ? progress.pollOnce() : Promise.resolve(false);
+      },
+      isEventsStopped: function () { return events.isStopped(); },
+      getEventsStopReason: function () { return events.getStopReason(); }
+    };
+  }
+
+  /* Live Screen poller — one round fetches task + progress + events in
+     the same order as EnzoLiveScreen pollOnce (~L42544), every
+     pollIntervalMs, until the screen closes or the lifecycle is
+     terminal. A 404 on events skips ONLY the events leg from then on
+     (task/progress keep polling while the task is known); a 404 on the
+     task or progress leg stops the whole loop; an empty task id never
+     starts it. */
+  function createLiveScreenPoller(opts) {
+    opts = opts || {};
+    var transport = opts.transport;
+    if (!transport) throw new Error('EnzoPollingFix.createLiveScreenPoller: transport is required');
+    var timers = opts.timers || defaultTimers();
+    var taskId = asId(opts.taskId);
+    var chatId = asId(opts.chatId);
+    var intervalMs = (typeof opts.pollIntervalMs === 'number' && opts.pollIntervalMs > 0)
+      ? opts.pollIntervalMs : 2500;
+    var timer = null;
+    var open = false;
+    var stopped = false;
+    var stopReason = null;
+    var eventsStopped = false;
+    var rounds = 0;
+    var inFlight = null; /* same duplicate-probe guard as the other pollers */
+
+    function stop(reason) {
+      if (timer) { timers.clearTimeout(timer); timer = null; }
+      open = false;
+      stopped = true;
+      stopReason = reason || 'stopped';
+      if (typeof opts.onStop === 'function') {
+        try { opts.onStop(stopReason); } catch (e) { /* ignore */ }
+      }
+    }
+
+    function schedule() {
+      if (!open || stopped) return;
+      if (timer) timers.clearTimeout(timer);
+      timer = timers.setTimeout(function () {
+        timer = null;
+        pollOnce();
+      }, intervalMs);
+    }
+
+    function pollOnce() {
+      if (stopped || !open) return Promise.resolve(false);
+      if (inFlight) return inFlight;
+      if (!taskId) { stop('empty-task-id'); return Promise.resolve(false); }
+      rounds++;
+      var chain = Promise.resolve();
+      chain = chain.then(function () {
+        return transport.getTask(taskId);
+      }).then(function (j) {
+        var task = (j && j.task) ? j.task : j;
+        if (typeof opts.onTask === 'function') {
+          try { opts.onTask(task); } catch (e) { /* ignore */ }
+        }
+        if (task && isTerminalTaskState(task.state)) {
+          stop('terminal:' + task.state);
+          return null;
+        }
+        return task;
+      }, function (err) {
+        if (is404(err) || (err && err.code === 'task-unknown')) { stop('task-404'); }
+        else if (typeof opts.onError === 'function') {
+          try { opts.onError(err); } catch (e) { /* ignore */ }
+        }
+        return null;
+      });
+      chain = chain.then(function (task) {
+        if (stopped || !open || !task) return null;
+        return transport.getTaskProgress(taskId).then(function (p) {
+          if (typeof opts.onProgress === 'function') {
+            try { opts.onProgress(p); } catch (e) { /* ignore */ }
+          }
+          if (p && isTerminalTaskState(p.state)) stop('terminal:' + p.state);
+          return p;
+        }, function (err) {
+          if (is404(err) || (err && err.code === 'task-unknown')) stop('task-404');
+          return null;
+        });
+      });
+      chain = chain.then(function () {
+        if (stopped || !open || eventsStopped || !chatId) return null;
+        return transport.getChatEvents(chatId, opts.since || 0).then(function (j) {
+          if (typeof opts.onEvents === 'function') {
+            try { opts.onEvents(j); } catch (e) { /* ignore */ }
+          }
+          return j;
+        }, function (err) {
+          if (is404(err) || (err && err.code === 'chat-local-only')) {
+            eventsStopped = true;
+            if (typeof opts.onEventsStop === 'function') {
+              try { opts.onEventsStop('chat-404'); } catch (e) { /* ignore */ }
+            }
+          }
+          return null;
+        });
+      });
+      inFlight = chain.then(function () {
+        inFlight = null;
+        if (stopped || !open) return false;
+        if (typeof opts.onRound === 'function') {
+          try { opts.onRound(rounds); } catch (e) { /* ignore */ }
+        }
+        schedule();
+        return true;
+      }, function () {
+        inFlight = null;
+        return false;
+      });
+      return inFlight;
+    }
+
+    return {
+      kind: 'livescreen',
+      start: function () {
+        if (stopped) return false;
+        if (open) return true;
+        if (!taskId) { stop('empty-task-id'); return false; }
+        var reg = transport.registry;
+        if (reg && reg.isTaskUnknown(taskId)) { stop('task-404'); return false; }
+        open = true;
+        pollOnce();
+        return true;
+      },
+      stop: function () { stop('stopped'); },
+      close: function () { stop('closed'); },
+      setChatId: function (id) { chatId = asId(id); eventsStopped = false; },
+      setTaskId: function (id) { taskId = asId(id); },
+      pollOnce: pollOnce,
+      isOpen: function () { return open && !stopped; },
+      isStopped: function () { return stopped; },
+      isEventsStopped: function () { return eventsStopped; },
+      getStopReason: function () { return stopReason; },
+      getRounds: function () { return rounds; }
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* install(root): optional runtime wiring. Defensive by design — it   */
+  /* never throws, never replaces a method it cannot wrap, and reports  */
+  /* exactly what it patched. The assembler should ALSO apply the      */
+  /* static edits in WIRING (below); install() is the safety net for   */
+  /* the pieces that can only be reached at runtime (EnzoMonitor).     */
+  /* ------------------------------------------------------------------ */
+
+  function install(root) {
+    var w = root || (typeof window !== 'undefined' ? window : null);
+    var patched = [];
+    var refused = [];
+    if (!w) return { patched: patched, refused: ['no-window'] };
+    try {
+      var m = w.EnzoMonitor;
+      if (m) {
+        /* setChatId must never start polling a local-only chat, and
+           must poll under the backend id when one is known. */
+        if (typeof m.setChatId === 'function' && !m.setChatId.__pollingFixWrapped) {
+          var origSetChatId = m.setChatId;
+          var wrappedSetChatId = function (id) {
+            var reg = api._registry;
+            var clean = asId(id);
+            if (!clean) return; /* empty chat id: refuse silently, no poll */
+            if (reg) {
+              if (reg.isChatLocalOnly(clean)) return;
+              var backendId = reg.resolveBackendId(clean);
+              if (backendId) return origSetChatId.call(m, backendId);
+              /* Unconfirmed chat: do not hand it to the monitor at all.
+                 The ask flow confirms it via confirmChat() once the
+                 backend answers; until then there is nothing to poll. */
+              return;
+            }
+            return origSetChatId.call(m, id);
+          };
+          wrappedSetChatId.__pollingFixWrapped = true;
+          m.setChatId = wrappedSetChatId;
+          patched.push('EnzoMonitor.setChatId');
+        }
+        /* Control + sources calls go through the guard: empty or
+           unknown task ids never reach the network. */
+        var controlMap = [
+          ['pauseTask', 'pause'], ['resumeTask', 'resume'], ['cancelTask', 'cancel']
+        ];
+        controlMap.forEach(function (pair) {
+          var name = pair[0];
+          var action = pair[1];
+          if (typeof m[name] === 'function' && !m[name].__pollingFixWrapped) {
+            var orig = m[name];
+            var wrapped = function (taskId) {
+              var clean = asId(taskId);
+              if (!clean) {
+                return Promise.reject(new Error('taskId is required'));
+              }
+              var reg = api._registry;
+              if (reg && !reg.isTaskKnown(clean)) {
+                return Promise.reject(new Error('task ' + clean + ' was never confirmed by the backend'));
+              }
+              if (reg && !reg.canSendControl(clean, action)) {
+                return Promise.reject(new Error('task control (' + action + ') for task ' + clean + ' was already sent'));
+              }
+              return orig.call(m, taskId);
+            };
+            wrapped.__pollingFixWrapped = true;
+            m[name] = wrapped;
+            patched.push('EnzoMonitor.' + name);
+          }
+        });
+        if (typeof m.getSources === 'function' && !m.getSources.__pollingFixWrapped) {
+          var origSources = m.getSources;
+          var wrappedSources = function (taskId) {
+            var clean = asId(taskId);
+            if (!clean) return Promise.reject(new Error('taskId is required'));
+            var reg = api._registry;
+            if (reg && reg.isTaskUnknown(clean)) {
+              return Promise.reject(new Error('task ' + clean + ' is unknown to the backend'));
+            }
+            return origSources.call(m, taskId);
+          };
+          wrappedSources.__pollingFixWrapped = true;
+          m.getSources = wrappedSources;
+          patched.push('EnzoMonitor.getSources');
+        }
+        if (typeof m.openTask === 'function' && !m.openTask.__pollingFixWrapped) {
+          var origOpen = m.openTask;
+          var wrappedOpen = function (taskId) {
+            var clean = asId(taskId);
+            if (!clean) return Promise.reject(new Error('taskId is required'));
+            var reg = api._registry;
+            if (reg && reg.isTaskUnknown(clean)) {
+              return Promise.reject(new Error('task ' + clean + ' is unknown to the backend'));
+            }
+            return origOpen.call(m, taskId);
+          };
+          wrappedOpen.__pollingFixWrapped = true;
+          m.openTask = wrappedOpen;
+          patched.push('EnzoMonitor.openTask');
+        }
+      } else {
+        refused.push('EnzoMonitor absent (load this piece after the monitor, or call install() again)');
+      }
+    } catch (e) {
+      refused.push('install threw: ' + (e && e.message ? e.message : String(e)));
+    }
+    return { patched: patched, refused: refused };
+  }
+
+  /* Static wiring the assembler must apply in the export (install()
+     cannot do these: they are call-site edits). Line numbers are the
+     live export ~/workspace/your_files/enao-ai/enao-ai.html. */
+  var WIRING = [
+    '1. Load pieces/32-polling-fix.js BEFORE any script that polls, and call EnzoPollingFix.install() once window.EnzoMonitor exists (re-call after the monitor loads if it was absent).',
+    '2. P-F v2req (~L12720): preserve the HTTP status — in the error path set err.status = r.status before throwing, so startPoll can tell a 404 from a network error. Until then, route task/chat calls through EnzoPollingFix.createTransport(window.fetch), which sets .status itself.',
+    '3. ensureBackendChat success (~L12885): call EnzoPollingFix.confirmChat(chat.id, backendId) so the registry maps the local id to the backend id. handleAskResp research branch (~L13260): call EnzoPollingFix.confirmTask(resp.task_id) and confirmChat(chat.id, chat.backendId) before startPoll().',
+    '4. startPoll (~L13154): replace v2get("/tasks/"+taskId+"/progress") with transport.getTaskProgress(taskId); replace the initial v2get("/tasks/"+taskId) with transport.getTask(taskId); replace fetchTaskSources(taskId) with transport.getTaskSources(taskId). Do NOT add a retry after a 404 — the transport already stopped that task.',
+    '5. Monitor M1 pollOnce (~L20582): route the events long-poll through transport.getChatEvents(state.chatId, sinceCursor); on err.code "chat-local-only" call stop(), never schedulePoll(). Same for pollProgressOnce (~L20669) via transport.getTaskProgress, listTasks (~L21125) via transport.getChatTasks, openTask/fetchTaskInternal/fetchSourcesInternal/taskControl (~L20826/L20856/L20875) via the transport methods. Remove the comment claiming a 404 "still proves the backend is up" as a reason to retry.',
+    '6. syncMonitorChat (~L44263, setInterval 1200 ms) and backendAsk (~L13290) and openChatById (~L13840): pass the BACKEND id to EnzoMonitor.setChatId — activeChat().backendId resolved via EnzoPollingFix.resolveBackendId(activeChat().id) — never the local cmwr* id. When resolveBackendId returns null, do NOT call setChatId/start() at all.',
+    '7. Monitor restore() (~L19928): do NOT restore a persisted chatId into state.chatId and start polling it; restore history only, and re-confirm the chat through ensureBackendChat before any poll.',
+    '8. v2Control (~L12818) and stopGeneration (~L13824): guard with EnzoPollingFix.guardTaskId(t.taskId) / canSendControl(taskId, "cancel") before v2post("/tasks/"+taskId+"/cancel"); never send when the guard refuses.',
+    '9. Live Screen pollOnce (~L42544) / schedulePoll (~L42531): route task/progress/events through the transport; on a chat 404 skip only the events leg (keep task/progress while the task is known); on a task/progress 404 stop the loop. openLiveScreen (~L42840): resolve its chatId through the registry first; an unresolvable chat id means events polling stays off.',
+    '10. Lifecycle cancelTask (~L39442) and notifyBackendCancel (~L39288): reject when asId(taskId) is null (kills the String(undefined) -> "undefined" trap) and when the registry marks the task unknown or a cancel was already sent; never notify the backend for an unknown id.',
+    '11. postModify (~L25065, ~L29315) and agents fetchProgress (~L28495): route through transport.postTaskModify / getTaskProgress — both refuse empty ids with zero fetch calls.'
+  ];
+
+  var api = {
+    VERSION: VERSION,
+    asId: asId,
+    isNonEmptyId: isNonEmptyId,
+    is404: is404,
+    isTerminalTaskState: isTerminalTaskState,
+    createRegistry: createRegistry,
+    createTransport: createTransport,
+    createEventPoller: createEventPoller,
+    createProgressPoller: createProgressPoller,
+    createMonitorPoller: createMonitorPoller,
+    createLiveScreenPoller: createLiveScreenPoller,
+    install: install,
+    WIRING: WIRING,
+    /* Shared page-level registry used by install() and by the ask flow
+       helpers below. Tests create their own registries instead. */
+    _registry: createRegistry(),
+    confirmChat: function (localId, backendId) {
+      return api._registry.confirmChat(localId, backendId);
+    },
+    confirmTask: function (taskId) {
+      return api._registry.confirmTask(taskId);
+    },
+    markChatLocalOnly: function (chatId) {
+      return api._registry.markChatLocalOnly(chatId);
+    },
+    resolveBackendId: function (localId) {
+      return api._registry.resolveBackendId(localId);
+    },
+    guardTaskId: function (taskId) {
+      var id = asId(taskId);
+      if (!id) return { ok: false, reason: 'empty-task-id' };
+      if (api._registry.isTaskUnknown(id)) return { ok: false, reason: 'task-unknown' };
+      return { ok: true, taskId: id };
+    },
+    guardChatId: function (chatId) {
+      var id = asId(chatId);
+      if (!id) return { ok: false, reason: 'empty-chat-id' };
+      if (api._registry.isChatLocalOnly(id)) return { ok: false, reason: 'chat-local-only' };
+      return { ok: true, chatId: id, backendId: api._registry.resolveBackendId(id) };
+    },
+    canSendControl: function (taskId, action) {
+      return api._registry.canSendControl(taskId, action);
+    },
+    snapshot: function () {
+      return api._registry.snapshot();
+    }
+  };
+
+  return api;
+});
+</script>
+<script>
+/* v59-live-research-fix glue: one shared guarded transport + PollingFix install.
+   The transport is created once, on the shared EnzoPollingFix registry, with
+   the backend base resolved by EnzoPagesBackend for the host actually serving
+   this page (same-origin on enzoai.cu.gy, absolute backend URL elsewhere). */
+window.__enzoTransport59 = null;
+window.__enzoGetTransport59 = function () {
+  try {
+    if (!window.__enzoTransport59 && window.EnzoPollingFix && window.EnzoPagesBackend && typeof window.fetch === 'function') {
+      window.__enzoTransport59 = window.EnzoPollingFix.createTransport(window.fetch.bind(window), window.EnzoPollingFix._registry, { base: window.EnzoPagesBackend.getBackendBase() });
+    }
+  } catch (e) {}
+  return window.__enzoTransport59;
+};
+(function () {
+  var tries59 = 0;
+  function attempt59() {
+    tries59++;
+    try {
+      if (window.EnzoPollingFix) window.EnzoPollingFix.install();
+      if (window.EnzoMonitor) return true;
+    } catch (e) {}
+    return false;
+  }
+  if (attempt59()) return;
+  var iv59 = setInterval(function () {
+    if (attempt59() || tries59 > 120) clearInterval(iv59);
+  }, 500);
+})();
+</script>
 <script>/* PHONE LAYOUT GUARD — a phone is recognised by its hardware (touch +
    a short screen side of 540 CSS px or less), NOT by the layout viewport
    width. Some phone browsers report a wide ~980px viewport (desktop-site
@@ -33,7 +2498,7 @@
    that kept a cached copy), refresh once to the live version so a phone
    never stays stuck on an old layout. Fails silently when offline. */
 (function(){
-  var ME='v58-research-live', lastCheck=0;
+  var ME='v59-live-research-fix', lastCheck=0;
   function check(){
     var now=Date.now(); if(now-lastCheck<20000) return; lastCheck=now;
     try{
@@ -3013,7 +5478,7 @@ function resolveNewsLinks(results){
    except Google News redirect links, which are resolved to their direct
    publisher URLs first (see resolveNewsLinks above). */
 function serverSearch(query, limit){
-  return provOutcome(fetchJSONT('/api/search?q='+encodeURIComponent(query), 15000).then(function(j){
+  return provOutcome(fetchJSONT(window.EnzoPagesBackend.getSearchUrl('/api/search?q='+encodeURIComponent(query)), 15000).then(function(j){
     var arr=Array.isArray(j)?j:((j&&(j.results||j.items))||[]);
     var out=[];
     arr.forEach(function(r){
@@ -3045,7 +5510,7 @@ function fetchPageText(url){
    page can never support a claim about the article — it is flagged here and
    dropped by the relevance filter, never cited. */
 function fetchPageInfo(url){
-  return fetchJSONT('/api/fetch?url='+encodeURIComponent(url), 10000).then(function(j){
+  return fetchJSONT(window.EnzoPagesBackend.getSearchUrl('/api/fetch?url='+encodeURIComponent(url)), 10000).then(function(j){
     var t=j&&(j.text||j.content||j.extract||j.body);
     var fin=j&&(j.finalUrl||j.final_url||j.url||j.landedUrl);
     return {text:(typeof t==='string'?t:''), finalUrl:(typeof fin==='string'?fin:'')};
@@ -11988,7 +14453,7 @@ if (typeof window !== 'undefined') {
     if(st.voiceState==='listening' || st.isListening) return 'listening';
     if(st.voiceState==='processing') return 'thinking';
     if(window.player && player.paused) return 'paused';
-    if(st.isGenerating) return 'working';
+    if(st.isGenerating && (!window.EnzoTaskState59 || window.EnzoTaskState59.isActive())) return 'working';
     if(st.voiceLive && st.voiceState==='on') return 'connecting';
     if(Date.now()-bootAt<1200) return 'initializing';
     return 'online';
@@ -12718,7 +15183,8 @@ renderChatList();
 'use strict';
 function $(id){ return document.getElementById(id); }
 function escH(s){ return (typeof esc==='function') ? esc(s) : String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-var V2='/api/v2';
+var V2 = window.EnzoPagesBackend.getBackendBase();
+var transport59 = window.__enzoGetTransport59 ? window.__enzoGetTransport59() : null;
 var v2Up=null;               /* null = not checked yet, true = up, false = fallback in use */
 var v2ChatPromises={};       /* local chat id -> Promise<backend chat_id> */
 var v2ctxByChat={};          /* local chat id -> last ask ctx (for restore) */
@@ -12736,7 +15202,7 @@ function v2req(path, opts, timeoutMs){
   return fetch(V2+path, o).then(function(r){
     if(to) clearTimeout(to);
     return r.json().catch(function(){ return null; }).then(function(j){
-      if(!r.ok || !j || j.ok===false) throw new Error((j&&j.message)||('http '+r.status));
+      if(!r.ok || !j || j.ok===false){ var err59=new Error((j&&j.message)||('http '+r.status)); err59.status=r.status; throw err59; }
       return j;
     });
   }, function(e){ if(to) clearTimeout(to); throw e; });
@@ -12815,6 +15281,8 @@ function updatePanelExtras(){
 }
 function v2Control(action){
   var t=window.__v2Task; if(!t) return;
+  /* v59 (Piece 32 [8]): never send a control call for an empty or unknown task id. */
+  if(window.EnzoPollingFix){ var g59v=window.EnzoPollingFix.guardTaskId(t.taskId); if(!g59v.ok) return; if(action==='cancel' && !window.EnzoPollingFix.canSendControl(t.taskId, 'cancel')) return; }
   v2post('/tasks/'+t.taskId+'/'+action, {}).then(function(j){
     var nt=(j&&j.task)||{};
     t.state=nt.state||(action==='pause'?'paused':'running');
@@ -12886,6 +15354,7 @@ function ensureBackendChat(chat){
   if(v2ChatPromises[chat.id]) return v2ChatPromises[chat.id];
   var p=v2post('/chats', {title:(chat.title||'New Chat').slice(0,80)}).then(function(j){
     chat.backendId=j.chat_id||(j.chat&&j.chat.chat_id);
+    try{ if(chat.backendId && window.EnzoPollingFix) window.EnzoPollingFix.confirmChat(chat.id, chat.backendId); }catch(e){}
     delete v2ChatPromises[chat.id];
     saveChats();
     return chat.backendId;
@@ -12918,7 +15387,7 @@ function uploadChatFiles(chat, bid, files){
 }
 function fetchTaskSources(taskId){
   if(!taskId) return Promise.resolve([]);
-  return v2get('/tasks/'+taskId+'/sources', 15000).then(function(j){
+  return (transport59 ? transport59.getTaskSources(taskId) : v2get('/tasks/'+taskId+'/sources', 15000)).then(function(j){
     var out=[], seen={};
     (j.sources||[]).forEach(function(s){
       var u=s.final_url||'';
@@ -13151,8 +15620,10 @@ function fallbackLegacy(ctx){
 }
 
 /* ---------------- research task polling: real backend progress only ---------------- */
-function stopPoll(){ if(currentPoll){ clearTimeout(currentPoll.timer); currentPoll=null; } }
+function stopPoll(){ if(currentPoll){ try{ if(window.EnzoTaskState59) window.EnzoTaskState59.endBackendTask(currentPoll.taskId); }catch(e){} clearTimeout(currentPoll.timer); currentPoll=null; } }
 function startPoll(chat, taskId, ctx, initialTask){
+  try{ if(window.EnzoPollingFix) window.EnzoPollingFix.confirmTask(taskId); }catch(e){}
+  try{ if(window.EnzoTaskState59) window.EnzoTaskState59.beginBackendTask(taskId); }catch(e){}
   stopPoll();
   var poll={taskId:taskId, chatId:chat.id, timer:null, strikes:0};
   currentPoll=poll;
@@ -13168,10 +15639,10 @@ function startPoll(chat, taskId, ctx, initialTask){
     }
   }
   if(initialTask && initialTask.plan) applyPlan(initialTask);
-  else v2get('/tasks/'+taskId, 15000).then(applyPlan).catch(function(){});
+  else (transport59 ? transport59.getTask(taskId) : v2get('/tasks/'+taskId, 15000)).then(applyPlan).catch(function(){});
   function tick(){
     if(currentPoll!==poll) return;
-    v2get('/tasks/'+taskId+'/progress', 15000).then(function(p){
+    (transport59 ? transport59.getTaskProgress(taskId) : v2get('/tasks/'+taskId+'/progress', 15000)).then(function(p){
       if(currentPoll!==poll) return;
       poll.strikes=0;
       try{ if(window.__enzoLifecycle) window.__enzoLifecycle.syncStatus(ctx.myRun, p.state); }catch(e){}
@@ -13180,7 +15651,7 @@ function startPoll(chat, taskId, ctx, initialTask){
       if(p.state==='completed' || p.state==='partially_completed'){
         stopPoll();
         try{ if(window.__enzoLifecycle) window.__enzoLifecycle.completeTask(ctx.myRun); }catch(e){}
-        v2get('/tasks/'+taskId, 20000).then(function(j){
+        (transport59 ? transport59.getTask(taskId) : v2get('/tasks/'+taskId, 20000)).then(function(j){
           var t=j.task||{}, r=t.result||{};
           var ans=r.answer||r.report||'';
           return fetchTaskSources(taskId).then(function(srcs){ return deliverAnswer(ctx, ans, srcs, 'research', taskId); });
@@ -13190,7 +15661,7 @@ function startPoll(chat, taskId, ctx, initialTask){
       if(p.state==='failed'){
         stopPoll();
         try{ if(window.__enzoLifecycle) window.__enzoLifecycle.failTask(ctx.myRun, 'backend-task-failed'); }catch(e){}
-        v2get('/tasks/'+taskId, 15000).then(function(j){
+        (transport59 ? transport59.getTask(taskId) : v2get('/tasks/'+taskId, 15000)).then(function(j){
           var r=(j.task&&j.task.result)||{};
           if(r.answer || r.report) return fetchTaskSources(taskId).then(function(srcs){ return deliverAnswer(ctx, r.answer||r.report, srcs, 'research', taskId); });
           deliverError(ctx);
@@ -13240,6 +15711,7 @@ function handleAskResp(ctx, resp){
   chat.pendingClarify=false; saveChats();
   if(resp.mode==='research' && resp.task_id){
     chat.backendTaskId=resp.task_id; saveChats();
+    try{ if(window.EnzoPollingFix){ window.EnzoPollingFix.confirmTask(resp.task_id); if(chat.backendId) window.EnzoPollingFix.confirmChat(chat.id, chat.backendId); } }catch(e){}
     startPoll(chat, resp.task_id, ctx, resp.task);
     return Promise.resolve();
   }
@@ -13262,7 +15734,7 @@ function backendAsk(text, viaVoice, forcedDeep){
   if(chat.messages.length===0) chat.title=text.slice(0,42);
   /* v53-monitor wiring: track this chat in the Live Research Monitor and
      record the one real client-side step — the question was sent. */
-  try{ if(window.EnzoMonitor){ EnzoMonitor.setChatId(chat.id); EnzoMonitor.start(); EnzoMonitor.noteFrontendStep({title:'Question sent', detail:'Question sent to ENZO for research.'}); } }catch(e){}
+  try{ if(window.EnzoMonitor){ var bid59ba=window.EnzoPollingFix?window.EnzoPollingFix.resolveBackendId(chat.id):null; if(bid59ba){ EnzoMonitor.setChatId(bid59ba); EnzoMonitor.start(); } EnzoMonitor.noteFrontendStep({title:'Question sent', detail:'Question sent to ENZO for research.'}); } }catch(e){}
   var lang=detectLang(text);
   pushUserMsg(chat, text, lang, viaVoice, files);
   renderChatList(); renderMessages(true); saveChats();
@@ -13288,6 +15760,9 @@ function backendAsk(text, viaVoice, forcedDeep){
     deliverClarify(ctx, (route.intent && route.intent.clarifyQuestion) || 'What would you like me to do?');
     return;
   }
+  /* v59-live-research-fix (Piece 33 [9]): honest-unreachable ask gate. Before ANY backend fetch for this ask, the resolved backend is checked once; a successful check is cached for the session, a failed check is re-run on the next ask (never cached as permanent). When the check blocks, the notice is shown in the chat in the user's language and the ask STOPS: nothing is sent, no normal-mode answer is presented as research, and the search proxy is not used as a silent substitute. This gate is in addition to the existing v2Up fallback line. */
+  var backendGate59 = window.__enzoBackendGate59 || (window.__enzoBackendGate59 = { ok: false });
+  function runBackendAsk59(){
   ensureBackendChat(chat).then(function(bid){
     ctx.bid=bid;
     return uploadChatFiles(chat, bid, files).then(function(uploaded){
@@ -13312,6 +15787,31 @@ function backendAsk(text, viaVoice, forcedDeep){
     if(myRun!==searchRunId) return;
     fallbackLegacy(ctx);
   });
+  }
+  if(backendGate59.ok){ runBackendAsk59(); }
+  else if(!window.EnzoPagesBackend){ runBackendAsk59(); }
+  else {
+    window.EnzoPagesBackend.checkBackendReachable().then(function(check59){
+      if(ctx.delivered || state.stopRequested || myRun!==searchRunId) return;
+      if(window.EnzoPagesBackend.shouldBlockAsk(check59)){
+        v2Up=false; setFallbackLine(true);
+        localizeAnswer(window.EnzoPagesBackend.buildUnavailableNotice(check59), lang).then(function(notice59){
+          if(ctx.delivered) return;
+          ctx.delivered=true;
+          hideTyping(); finishTasks(true); setCentreEnzo('error');
+          try{ if(window.__enzoLifecycle) window.__enzoLifecycle.failTask(myRun, 'backend-unreachable'); }catch(e){}
+          var msg59=aiMsgShell(ctx, notice59, {html:mdToHtml(notice59), error:true, sources:[], modeWhy:'Live research unavailable — the research backend could not be reached, so no research was run'});
+          chat.messages.push(msg59); saveChats();
+          if(activeChat()===chat) renderMessages();
+          setGenerating(false);
+          (window.EnaoV54Voice ? window.EnaoV54Voice.patchDirectSpeak(msg59, answersMode()) : maybeSpeak(msg59));
+        });
+        return;
+      }
+      backendGate59.ok=true;
+      runBackendAsk59();
+    });
+  }
 }
 
 /* ---------------- restore a chat's backend state on switch ---------------- */
@@ -13821,7 +16321,9 @@ window.stopGeneration=function(){
   if(t && (t.state==='running'||t.state==='paused')){
     var chat=activeChat();
     if(chat && t.chatId===chat.id){
-      v2post('/tasks/'+t.taskId+'/cancel', {}).catch(function(){});
+      var g59sg=window.EnzoPollingFix?window.EnzoPollingFix.guardTaskId(t.taskId):{ok:true};
+      var c59sg=!window.EnzoPollingFix || window.EnzoPollingFix.canSendControl(t.taskId, 'cancel');
+      if(g59sg.ok && c59sg) v2post('/tasks/'+t.taskId+'/cancel', {}).catch(function(){});
       stopPoll();
       t.state='cancelled';
       updatePanelExtras();
@@ -13834,7 +16336,7 @@ window.openChatById=function(id){
   var r=origOpenChatById(id);
   restoreBackendForChat(activeChat());
   /* v53-monitor wiring: active chat changed — retarget the monitor. */
-  try{ if(window.EnzoMonitor){ var _ac=activeChat(); EnzoMonitor.setChatId(_ac?_ac.id:null); EnzoMonitor.start(); } }catch(e){}
+  try{ if(window.EnzoMonitor){ var _ac=activeChat(); var _bid59=(_ac && window.EnzoPollingFix)?window.EnzoPollingFix.resolveBackendId(_ac.id):null; if(_bid59){ EnzoMonitor.setChatId(_bid59); EnzoMonitor.start(); } } }catch(e){}
   return r;
 };
 
@@ -14068,14 +16570,20 @@ window.askQuestion=function(text, viaVoice, forcedDeep){
     pushPair(chat, text, lang, viaVoice, PRIVATE_T[lang]||PRIVATE_T.en);
     return;
   }
+  /* v59-live-research-fix (Piece 31 [1]): EnzoResearchTriggers.shouldClarify runs FIRST, before garbledScore / CONFIRM_T / isDestructive. clarify === false means proceed: never confirm, never ask 'did you ask this?'. A research order goes straight to research (forced deep). When a confirmation does fire and clarify === true, result.question (already in the user's language) replaces CONFIRM_T.ask. */
+  var trig59a=null;
+  try{ if(text && window.EnzoResearchTriggers) trig59a=window.EnzoResearchTriggers.shouldClarify(text); }catch(e){}
+  if(trig59a && trig59a.clarify===false && trig59a.research && trig59a.research.research){
+    return innerAsk(text, viaVoice, (typeof forcedDeep==='boolean') ? forcedDeep : true);
+  }
   if(text && !state.pendingFiles.length && !(typeof smallTalkReply==='function' && smallTalkReply(text, lang))){
     var destructive=viaVoice && isDestructive(text);
-    var garbled=(lang!=='urdu') && garbledScore(text)===1;
+    var garbled=(trig59a && trig59a.clarify===false) ? false : ((lang!=='urdu') && garbledScore(text)===1);
     if(destructive || (viaVoice && garbled) || (!viaVoice && garbled && text.length>25)){
       if(!chat){ chat=createChat(text.slice(0,42)); }
       var interp=likelyMeaning(text);
       chat.pendingConfirm={original:text, interpreted:interp, viaVoice:!!viaVoice};
-      var q=destructive ? confT('destructive', lang)(interp) : confT('ask', lang)(interp);
+      var q=destructive ? confT('destructive', lang)(interp) : ((trig59a && trig59a.clarify===true && trig59a.question) ? trig59a.question : confT('ask', lang)(interp));
       pushPair(chat, text, lang, viaVoice, q);
       return;
     }
@@ -15420,6 +17928,22 @@ window.askQuestion=function(text, viaVoice, forcedDeep){
   if(raw.trim() && typeof forcedDeep!=='boolean'
      && !(typeof state!=='undefined' && state.pendingFiles && state.pendingFiles.length)
      && !(chat && (chat.pendingConfirm || chat.pendingClarify || chat.pendingReminder))){
+    /* v59-live-research-fix (Piece 31 [2]): EnzoResearchTriggers.shouldClarify runs FIRST, before vagueCheck / classifyIntent. clarify === false skips this gate entirely; a research order proceeds as Deep Research so it never receives the Normal badge (the kind is derived from the trigger result). clarify === true asks result.question, already in the user's language (clarifyQuestion() is the fallback). */
+    var trig59b=null;
+    try{ if(window.EnzoResearchTriggers) trig59b=window.EnzoResearchTriggers.shouldClarify(raw); }catch(e){}
+    if(trig59b && trig59b.clarify===false){
+      if(trig59b.research && trig59b.research.research) return innerGate(text, viaVoice, true);
+      return innerGate(text, viaVoice, forcedDeep);
+    }
+    if(trig59b && trig59b.clarify===true && trig59b.question){
+      if(!chat){ chat=createChat(raw.slice(0,42)); }
+      var lang59b=detectLang(raw);
+      var opts59b=contextOptions(chat, null);
+      chat.pendingClarifyLocal={original:raw, lang:lang59b, vague:true, opts:opts59b, trigReason:trig59b.reason};
+      saveChats();
+      pushClarifyPair(chat, raw, lang59b, viaVoice, trig59b.question || clarifyQuestion(raw, lang59b, chat, 'vague', opts59b));
+      return;
+    }
     var lang=detectLang(raw);
     var isSmall=false;
     try{ isSmall=(typeof smallTalkReply==='function') && !!smallTalkReply(raw, lang); }catch(e){}
@@ -19712,7 +22236,7 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
   /* Constants                                                           */
   /* ------------------------------------------------------------------ */
 
-  var API_BASE = '/api/v2'; // Same-origin, as the frontend does (V2='/api/v2').
+  var API_BASE = window.EnzoPagesBackend.getBackendBase();
   var STORAGE_KEY = 'enao_monitor_v1';
   var STORAGE_VERSION = 1;
   var LONG_POLL_TIMEOUT_MS = 30000; // Server holds at most 25 s.
@@ -19934,7 +22458,7 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
     var data = null;
     try { data = JSON.parse(raw); } catch (e) { return; }
     if (!isPlainObject(data) || data.version !== STORAGE_VERSION) return;
-    if (typeof data.chatId === 'string') state.chatId = data.chatId;
+    /* v59 (Piece 32 [7]): a persisted chatId is NOT restored into state.chatId and never polled — history only. The chat is re-confirmed through ensureBackendChat before any poll. */
     if (typeof data.activeTaskId === 'string') state.activeTaskId = data.activeTaskId;
     if (typeof data.since === 'number' && data.since >= 0) sinceCursor = data.since;
     if (Array.isArray(data.seenEventIds)) {
@@ -20587,9 +23111,8 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
       return; // No chat yet: nothing to poll. start() resumes on setChatId.
     }
     var chatId = state.chatId;
-    var url = '/chats/' + encodeURIComponent(chatId) +
-      '/events?since=' + sinceCursor;
-    httpJson(url, { timeoutMs: LONG_POLL_TIMEOUT_MS }).then(function (j) {
+    var eventsPromise59 = (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getChatEvents(chatId, sinceCursor) : httpJson('/chats/' + encodeURIComponent(chatId) + '/events?since=' + sinceCursor, { timeoutMs: LONG_POLL_TIMEOUT_MS }));
+    eventsPromise59.then(function (j) {
       if (!running || state.chatId !== chatId) return;
       backoffStep = 0;
       state.connected = true;
@@ -20611,8 +23134,10 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
         schedulePoll(0);
         return;
       }
-      // 404 (unknown chat) still proves the backend is up; anything else
-      // without a response means it is unreachable.
+      if (err && err.code === 'chat-local-only') { stop(); return; }
+      if (err && err.status === 404) { try { if (window.EnzoPollingFix) window.EnzoPollingFix.markChatLocalOnly(chatId); } catch (e) {} stop(); return; }
+      // Any other HTTP response means the backend answered; no response
+      // at all means it is unreachable.
       if (err && typeof err.status === 'number') state.backendAvailable = true;
       var delay = BACKOFF_MS[Math.min(backoffStep, BACKOFF_MS.length - 1)];
       backoffStep++;
@@ -20674,16 +23199,16 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
     ids.forEach(function (taskId) {
       if (progressInFlight[taskId]) return;
       progressInFlight[taskId] = true;
-      httpJson('/tasks/' + encodeURIComponent(taskId) + '/progress',
-        { timeoutMs: 15000 }).then(function (p) {
+      (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTaskProgress(taskId) : httpJson('/tasks/' + encodeURIComponent(taskId) + '/progress', { timeoutMs: 15000 })).then(function (p) {
         delete progressInFlight[taskId];
         if (!running) return;
         applyProgress(taskId, p);
         scheduleProgress();
-      }, function () {
+      }, function (err) {
         delete progressInFlight[taskId];
         if (!running) return;
-        scheduleProgress(); // Progress failure never stops the event loop.
+        if (err && (err.status === 404 || err.code === 'task-unknown' || err.code === 'empty-task-id')) return; // v59: a 404 stops progress polling for this task.
+        scheduleProgress(); // Other progress failures never stop the event loop.
       });
     });
   }
@@ -20823,8 +23348,7 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
   /* ------------------------------------------------------------------ */
 
   function fetchTaskInternal(taskId) {
-    return httpJson('/tasks/' + encodeURIComponent(taskId),
-      { timeoutMs: 15000 }).then(function (j) {
+    return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTask(taskId) : httpJson('/tasks/' + encodeURIComponent(taskId), { timeoutMs: 15000 })).then(function (j) {
       var raw = (j && isPlainObject(j.task)) ? j.task : j;
       var entry = mergeTask(raw);
       if (entry) { save(); notify(); }
@@ -20853,8 +23377,7 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
   }
 
   function fetchSourcesInternal(taskId) {
-    return httpJson('/tasks/' + encodeURIComponent(taskId) + '/sources',
-      { timeoutMs: 20000 }).then(function (j) {
+    return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTaskSources(taskId) : httpJson('/tasks/' + encodeURIComponent(taskId) + '/sources', { timeoutMs: 20000 })).then(function (j) {
       var entry = ensureTaskEntry(taskId);
       var rows = (j && Array.isArray(j.sources)) ? j.sources : [];
       entry.sources = rows.map(normaliseSource).filter(function (s) {
@@ -20875,11 +23398,7 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
   function taskControl(taskId, action) {
     if (!taskId) return Promise.reject(new Error('taskId is required'));
     var entry = ensureTaskEntry(taskId);
-    return httpJson('/tasks/' + encodeURIComponent(taskId) + '/' + action, {
-      method: 'POST',
-      body: {}, // Server tolerates (and ignores) an empty body.
-      timeoutMs: 15000
-    }).then(function (j) {
+    return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().postTaskControl(taskId, action) : httpJson('/tasks/' + encodeURIComponent(taskId) + '/' + action, { method: 'POST', body: {}, timeoutMs: 15000 })).then(function (j) {
       var raw = (j && isPlainObject(j.task)) ? j.task : null;
       if (raw) mergeTask(raw);
       else if (j && typeof j.state === 'string' && j.state) {
@@ -21122,8 +23641,7 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
 
   function listTasks() {
     if (!state.chatId) return Promise.resolve([]);
-    return httpJson('/chats/' + encodeURIComponent(state.chatId) + '/tasks',
-      { timeoutMs: 15000 }).then(function (j) {
+    return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getChatTasks(state.chatId) : httpJson('/chats/' + encodeURIComponent(state.chatId) + '/tasks', { timeoutMs: 15000 })).then(function (j) {
       var rows = (j && Array.isArray(j.tasks)) ? j.tasks
         : (Array.isArray(j) ? j : []);
       var out = [];
@@ -21143,8 +23661,7 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
     ensureTaskEntry(taskId);
     flushPendingClientSteps(taskId);
     return fetchTaskInternal(taskId).then(function () {
-      return httpJson('/tasks/' + encodeURIComponent(taskId) + '/progress',
-        { timeoutMs: 15000 }).then(function (p) {
+      return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTaskProgress(taskId) : httpJson('/tasks/' + encodeURIComponent(taskId) + '/progress', { timeoutMs: 15000 })).then(function (p) {
         applyProgress(taskId, p);
         return fetchSourcesInternal(taskId).catch(function () { return []; });
       }, function () {
@@ -24521,7 +27038,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EnaoConver
   /* Constants                                                           */
   /* ------------------------------------------------------------------ */
 
-  var API_BASE = '/api/v2';
+  var API_BASE = window.EnzoPagesBackend.getBackendBase();
   var BODY_CLASS = 'enzo-live-fullscreen';
   var PANEL_ID = 'enzoMonitorPanel';
   var BACKDROP_ID = 'enzoMonitorBackdrop';
@@ -25058,6 +27575,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EnaoConver
 
   function postModify(taskId, directive) {
     /* taskId is the current task id (activeTaskId) */
+    /* v59 (Piece 32 [11]): routed through the EnzoPollingFix transport — empty ids are refused with zero fetch calls. */
+    if (window.__enzoGetTransport59) return window.__enzoGetTransport59().postTaskModify(taskId, directive);
     var fetchFn = getFetch();
     if (!fetchFn) {
       return Promise.reject(new Error('fetch is not available'));
@@ -28071,7 +30590,7 @@ if (typeof module !== 'undefined' && module.exports) {
   /* Constants                                                           */
   /* ------------------------------------------------------------------ */
 
-  var API_BASE = '/api/v2';
+  var API_BASE = window.EnzoPagesBackend.getBackendBase();
   var PANEL_ID = 'enzoMonitorAgents';
   var LIST_ID = 'enzoMonitorAgentsList';
   var COUNT_ID = 'enzoMonitorAgentsCount';
@@ -28492,6 +31011,8 @@ if (typeof module !== 'undefined' && module.exports) {
     var id = taskId || currentTaskId;
     if (!fetchFn) return Promise.reject(new Error('fetch is not available'));
     if (!id) return Promise.reject(new Error('no-active-task'));
+    /* v59 (Piece 32 [11]): progress through the EnzoPollingFix transport. */
+    if (window.__enzoGetTransport59) return window.__enzoGetTransport59().getTaskProgress(id).then(function (j) { applyProgress(j); return j; });
     return fetchFn(API_BASE + '/tasks/' + encodeURIComponent(id) + '/progress', {
       method: 'GET'
     }).then(function (resp) {
@@ -29308,6 +31829,8 @@ if (typeof module !== 'undefined' && module.exports) {
   /* ------------------------------------------------------------------ */
 
   function postModify(taskId, directive) {
+    /* v59 (Piece 32 [11]): routed through the EnzoPollingFix transport — empty ids are refused with zero fetch calls. */
+    if (window.__enzoGetTransport59) return window.__enzoGetTransport59().postTaskModify(taskId, directive);
     var fetchFn = getFetch();
     if (!fetchFn) {
       return Promise.reject(new Error('fetch is not available'));
@@ -39036,7 +41559,7 @@ var INDICATOR_LABELS = {
   validating: 'Checking\u2026'
 };
 
-var DEFAULT_API_BASE = '/api/v2';
+var DEFAULT_API_BASE = window.EnzoPagesBackend.getBackendBase();
 
 /* ---------- small helpers ---------- */
 function lcTrim(s) {
@@ -39290,6 +41813,11 @@ function createLifecycle(opts) {
      the record instead). Returns the promise, or null when no fetch
      implementation is available. */
   function notifyBackendCancel(rec) {
+    /* v59 (Piece 32 [10]): never notify the backend for an empty or unknown id, or when a cancel was already sent. */
+    if (typeof window !== 'undefined' && window.EnzoPollingFix) {
+      if (!window.EnzoPollingFix.asId(rec && rec.taskId)) return null;
+      if (!window.EnzoPollingFix.canSendControl(rec.taskId, 'cancel')) return null;
+    }
     if (!fetchFn) return null;
     if (rec.backendNotified) return rec.backendPromise;
     rec.backendNotified = true;
@@ -39440,7 +41968,9 @@ function createLifecycle(opts) {
      created straight in the cancelled state and the backend is still
      told (best effort). */
   function cancelTask(taskId, reason) {
-    var id = String(taskId);
+    /* v59 (Piece 32 [10]): asId kills the String(undefined) -> 'undefined' trap; an empty id is rejected, never recorded or sent. */
+    var id = (typeof window !== 'undefined' && window.EnzoPollingFix) ? window.EnzoPollingFix.asId(taskId) : String(taskId);
+    if (id === null || id === undefined || id === '') return { ok: false, taskId: taskId, rejected: true, reason: 'empty-task-id' };
     var rec = getRecord(id);
     if (!rec) {
       rec = newRecord(id);
@@ -40510,7 +43040,7 @@ function socSearchOnePlatform(platformId, query, fetcher) {
   var p = getPlatform(platformId);
   if (!p) return Promise.resolve([]);
   var siteQuery = 'site:' + p.domain + ' ' + query;
-  var url = '/api/search?q=' + socEncode(siteQuery);
+  var url = window.EnzoPagesBackend.getSearchUrl('/api/search?q=' + socEncode(siteQuery));
   return fetcher(url).then(function (payload) {
     var arr = [];
     if (Array.isArray(payload)) arr = payload;
@@ -40543,7 +43073,7 @@ function verifyResult(result, fetcher) {
   var copy = {};
   var k;
   for (k in result) if (socHas(result, k)) copy[k] = result[k];
-  var url = '/api/fetch?url=' + socEncode(result.url);
+  var url = window.EnzoPagesBackend.getSearchUrl('/api/fetch?url=' + socEncode(result.url));
   return fetchFn(url).then(function (payload) {
     var text = '';
     if (socIsPlainObject(payload)) {
@@ -41260,7 +43790,7 @@ function searchVideos(options) {
      only links that are actually video links. */
   var searchQuery = /\bvideo\b/i.test(query) ? query : query + ' video';
   var proxyP = Promise.resolve().then(function () {
-    return fetchJson('/api/search?q=' + encodeURIComponent(searchQuery));
+    return fetchJson(window.EnzoPagesBackend.getSearchUrl('/api/search?q=' + encodeURIComponent(searchQuery)));
   }).then(function (j) {
     var arr = Array.isArray(j) ? j : ((j && (j.results || j.items)) || []);
     var found = [];
@@ -41302,7 +43832,7 @@ function searchVideos(options) {
       if (!/^UC[A-Za-z0-9_-]{10,}$/.test(id)) return Promise.resolve([]);
       var feedUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=' + id;
       return Promise.resolve().then(function () {
-        return fetchText('/api/fetch?url=' + encodeURIComponent(feedUrl));
+        return fetchText(window.EnzoPagesBackend.getSearchUrl('/api/fetch?url=' + encodeURIComponent(feedUrl)));
       }).then(function (text) {
         return parseYouTubeRss(text, name);
       }).catch(function () { return []; });
@@ -41323,7 +43853,7 @@ function searchVideos(options) {
   var ddgP = Promise.resolve().then(function () {
     var pageUrl = 'https://html.duckduckgo.com/html/?q=' +
       encodeURIComponent(searchQuery) + '&iax=videos&ia=videos';
-    return fetchText('/api/fetch?url=' + encodeURIComponent(pageUrl));
+    return fetchText(window.EnzoPagesBackend.getSearchUrl('/api/fetch?url=' + encodeURIComponent(pageUrl)));
   }).then(function (html) {
     if (isDdgChallenge(html)) {
       record('ddg-video-html', 'blocked', 0,
@@ -41605,8 +44135,8 @@ if (typeof module !== 'undefined' && module.exports) {
 
   var VERSION = '24-livescreen v1.0 (enao-research-live, 22 Nov 2026)';
 
-  var API_BASE = '/api/v2';
-  var FETCH_BASE_DEFAULT = '/api/fetch';
+  var API_BASE = window.EnzoPagesBackend.getBackendBase();
+  var FETCH_BASE_DEFAULT = window.EnzoPagesBackend.getSearchUrl('/api/fetch');
   var BODY_CLASS = 'enzo-livescreen-open';
   var ROOT_ID = 'enzoLiveScreen';
   var CSS_ID = 'enzoLiveScreenCss';
@@ -42063,6 +44593,7 @@ if (typeof module !== 'undefined' && module.exports) {
     S.pollIntervalMs = (opts && typeof opts.pollIntervalMs === 'number' && opts.pollIntervalMs > 0)
       ? opts.pollIntervalMs : POLL_INTERVAL_MS;
     S.autoPoll = !(opts && opts.autoPoll === false);
+    S.eventsOff59 = false;
     S.onClose = (opts && typeof opts.onClose === 'function') ? opts.onClose : null;
   }
 
@@ -42552,13 +45083,14 @@ if (typeof module !== 'undefined' && module.exports) {
     var chain = Promise.resolve();
 
     chain = chain.then(function () {
-      return httpGet(taskUrl(taskId));
+      return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTask(taskId) : httpGet(taskUrl(taskId)));
     }).then(function (j) {
       var task = (j && j.task) ? j.task : j;
       applyTaskData(task);
       S.connected = true;
       S.error = null;
     }, function (err) {
+      if (err && err.status === 404) { S.autoPoll = false; stopPollTimer(); } // v59: a task 404 stops the Live Screen poll loop.
       S.error = err && err.message ? err.message : 'Task request failed.';
     });
 
@@ -42566,19 +45098,20 @@ if (typeof module !== 'undefined' && module.exports) {
        then reflects the latest real event, not the progress snapshot
        taken a moment earlier. */
     chain = chain.then(function () {
-      return httpGet(progressUrl(taskId));
+      return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTaskProgress(taskId) : httpGet(progressUrl(taskId)));
     }).then(function (p) {
       applyProgressData(p);
-    }, function () { /* progress is best-effort; task + events already spoke */ });
+    }, function (err) { if (err && err.status === 404) { S.autoPoll = false; stopPollTimer(); } /* v59: a progress 404 stops the loop; other progress failures are best-effort */ });
 
-    if (chatId) {
+    if (chatId && !S.eventsOff59) {
       chain = chain.then(function () {
-        return httpGet(eventsUrl(chatId, S.sinceCursor));
+        return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getChatEvents(chatId, S.sinceCursor) : httpGet(eventsUrl(chatId, S.sinceCursor)));
       }).then(function (j) {
         applyEventsData(j);
         S.connected = true;
         S.error = null;
       }, function (err) {
+        if (err && (err.status === 404 || err.code === 'chat-local-only')) S.eventsOff59 = true; // v59: a chat 404 skips only the events leg; task/progress keep polling while the task is known.
         S.error = err && err.message ? err.message : 'Events request failed.';
       });
     }
@@ -42843,7 +45376,10 @@ if (typeof module !== 'undefined' && module.exports) {
         }
       } catch (e) { /* chat stays unknown; events polling is skipped */ }
     }
+    /* v59 (Piece 32 [9]): resolve the chat id through the registry first; an unresolvable (local-only) chat id means events polling stays off. */
+    if (chatId && window.EnzoPollingFix) { chatId = window.EnzoPollingFix.resolveBackendId(chatId); }
     resetState(id, chatId, opts || {});
+    if (!chatId) S.eventsOff59 = true;
     if (!keyListenerAttached && doc.addEventListener) {
       doc.addEventListener('keydown', onKeyDown);
       keyListenerAttached = true;
@@ -44158,8 +46694,8 @@ if (typeof module !== 'undefined' && module.exports) {
 
   function fetchJson58(url){ if(typeof fetchJSONT==='function') return fetchJSONT(url, 15000); return fetch(url).then(function(r){ return r.json(); }); }
   function fetchText58(url){ return fetchJson58(url).then(function(j){ return (j && typeof j.text==='string') ? j.text : ''; }); }
-  function search58(query){ return fetchJson58('/api/search?q='+encodeURIComponent(query)).then(function(j){ var arr=[]; if(Array.isArray(j)) arr=j; else if(j) arr=j.results||j.items||[]; return arr; }); }
-  function fetch58(url){ return fetchJson58('/api/fetch?url='+encodeURIComponent(url)); }
+  function search58(query){ return fetchJson58(window.EnzoPagesBackend.getSearchUrl('/api/search?q='+encodeURIComponent(query))).then(function(j){ var arr=[]; if(Array.isArray(j)) arr=j; else if(j) arr=j.results||j.items||[]; return arr; }); }
+  function fetch58(url){ return fetchJson58(window.EnzoPagesBackend.getSearchUrl('/api/fetch?url='+encodeURIComponent(url))); }
   window.__enzoResearchDeps={ fetchJson:fetchJson58, fetchText:fetchText58, search:search58, fetch:fetch58 };
 
   window.__enzoPendingMedia=null;
@@ -44228,8 +46764,13 @@ if (typeof module !== 'undefined' && module.exports) {
     b.textContent='Live Screen';
     b.addEventListener('click', function(){
       var taskId=null, chatId=null;
-      try{ if(window.EnzoMonitor && typeof window.EnzoMonitor.getState==='function'){ var st=window.EnzoMonitor.getState(); taskId=st && st.activeTaskId; chatId=st && st.chatId; } }catch(e){}
-      if(!taskId){ if(typeof toast==='function') toast('No active research task right now - start a research question first, then open the Live Screen.'); return; }
+      /* v59: the task id comes from EnzoTaskState59 — the SAME active-task state the Searching indicator, the status pill and the Live Video control read — so this button never claims 'no active task' while a search or video task is running, and never tells the user to start a question they already asked. Messages are in the user's language. */
+      var lg59='en'; try{ lg59=(typeof window.__enzoUserLang==='function')?window.__enzoUserLang():'en'; }catch(e){}
+      var T59={ en:{busy:'ENZO is working on that right now — the result will appear in the chat. The Live Screen opens for backend research tasks.', none:'No active task right now.'}, roman:{busy:'ENZO abhi isi par kaam kar raha hai — nateeja chat mein aayega. Live Screen backend research task ke liye khulti hai.', none:'Abhi koi active task nahi hai.'}, urdu:{busy:'ENZO ابھی اسی پر کام کر رہا ہے — نتیجہ چیٹ میں آئے گا۔ Live Screen بیک اینڈ ریسرچ ٹاسک کے لیے کھلتی ہے۔', none:'ابھی کوئی فعال ٹاسک نہیں ہے۔'} };
+      var TT59=T59[lg59]||T59.en;
+      try{ if(window.EnzoTaskState59){ var act59=window.EnzoTaskState59.activeTask(); if(act59 && act59.taskId) taskId=act59.taskId; else if(act59 && act59.local){ if(typeof toast==='function') toast(TT59.busy); return; } } }catch(e){}
+      try{ if(window.EnzoMonitor && typeof window.EnzoMonitor.getState==='function'){ var st=window.EnzoMonitor.getState(); if(!taskId) taskId=st && st.activeTaskId; chatId=st && st.chatId; } }catch(e){}
+      if(!taskId){ if(typeof toast==='function') toast(TT59.none); return; }
       if(window.EnzoLiveScreen && typeof window.EnzoLiveScreen.openLiveScreen==='function') window.EnzoLiveScreen.openLiveScreen(taskId, {chatId:chatId});
     });
     anchor.parentNode.insertBefore(b, anchor.nextSibling);
@@ -44237,6 +46778,447 @@ if (typeof module !== 'undefined' && module.exports) {
   }
   var lsTries58=0;
   var lsTimer58=setInterval(function(){ lsTries58++; if(wireLiveScreenBtn58() || lsTries58>120) clearInterval(lsTimer58); }, 500);
+})();
+</script>
+<script>
+/* ============================================================================
+ * v59-live-research-fix ADDITIONS — three fixes in one place:
+ *
+ * 1) EnzoTaskState59 — ONE single source of truth for active-task state.
+ *    The 'Searching...' typing indicator, the 'ENZO IS WORKING' status pill,
+ *    the Live Screen button empty state, and the Live Video control ON/OFF
+ *    state ALL read this same state (the pill reads it via the source patch
+ *    in currentStatus(); the button and the live controls read it here).
+ *    Rules: no active task = no 'Searching...', no 'ENZO IS WORKING', Live
+ *    Video OFF. A task exists = the Live Screen opens that task. A video or
+ *    search request registers a real (local) task here the moment it starts
+ *    and clears it the moment it ends, fails or is cancelled.
+ *    HARNESS NOTE: indicator state and monitor empty-state must agree for
+ *    the same task id — for any task id, (typing indicator visible OR pill
+ *    WORKING) implies EnzoTaskState59.activeTask() is non-null, and
+ *    activeTask() === null implies no 'Searching...' indicator, pill not
+ *    WORKING, Live Video OFF, and the Live Screen button may show its
+ *    (localised) no-task message.
+ *
+ * 2) Play/video orders ('youtube per sidhu musy wala chalao', 'Sidhu Moose
+ *    Wala ka gana chalao', 'play a video of cats on youtube', 'youtube par
+ *    cricket highlights dikhao') are MEDIA orders, not research questions:
+ *    they run EnzoVideo.searchVideos directly, create a real task in
+ *    EnzoTaskState59, and deliver playable results in the chat. They are
+ *    never blocked by the research-task gate and never produce the
+ *    'start a research question first' message.
+ *
+ * 3) Capabilities self-description: 'aap kya kya kar sakte ho' and its
+ *    family (English / Urdu script / Roman Urdu) are answered DIRECTLY from
+ *    the ONE inventory below (EnzoCapabilities59.INVENTORY) — full detail,
+ *    in the user's language, honest limits included. Never research mode,
+ *    never a clarifying question.
+ * Style: plain ES5, no modules, zero emojis.
+ * ========================================================================== */
+(function () {
+  'use strict';
+
+  /* ------------------------------------------------------------------ */
+  /* 1) EnzoTaskState59 — single source of truth for active-task state   */
+  /* ------------------------------------------------------------------ */
+  var TERMINAL59 = { completed: 1, partially_completed: 1, failed: 1, cancelled: 1, done: 1 };
+  var backendTask59 = null;      /* {taskId, kind, at} — real backend task */
+  var localTasks59 = {};         /* localId -> {kind, at} — video/search tasks created on this page */
+  var localSeq59 = 0;
+  var searchInFlight59 = 0;
+  var searchKind59 = 'search';
+  var videoPlaying59 = false;
+  var genObservedSince59 = null;
+  var STUCK_MS59 = 90000;
+
+  function beginBackendTask(taskId) {
+    if (taskId) backendTask59 = { taskId: String(taskId), kind: 'research', at: Date.now() };
+  }
+  function endBackendTask(taskId) {
+    if (backendTask59 && (!taskId || backendTask59.taskId === String(taskId))) backendTask59 = null;
+  }
+  function beginLocalTask(kind) {
+    var id = 'local-' + (++localSeq59) + '-' + Date.now();
+    localTasks59[id] = { kind: kind || 'search', at: Date.now() };
+    return id;
+  }
+  function endLocalTask(id) { if (id) delete localTasks59[id]; }
+  function firstLocal59() {
+    for (var k in localTasks59) {
+      if (Object.prototype.hasOwnProperty.call(localTasks59, k)) {
+        return { taskId: null, kind: localTasks59[k].kind, local: true, localId: k };
+      }
+    }
+    return null;
+  }
+  function activeTask() {
+    if (backendTask59) return { taskId: backendTask59.taskId, kind: backendTask59.kind, backend: true };
+    var t = window.__v2Task;
+    if (t && t.taskId && (t.state === 'running' || t.state === 'paused')) {
+      return { taskId: String(t.taskId), kind: 'research', backend: true };
+    }
+    try {
+      var st = (window.EnzoMonitor && typeof window.EnzoMonitor.getState === 'function') ? window.EnzoMonitor.getState() : null;
+      if (st && st.activeTaskId) {
+        var e = st.tasks && st.tasks[st.activeTaskId];
+        var s = e && e.task && e.task.state;
+        if (!s || !TERMINAL59[s]) return { taskId: String(st.activeTaskId), kind: 'research', backend: true };
+      }
+    } catch (e) {}
+    var lt = firstLocal59();
+    if (lt) return lt;
+    if (searchInFlight59 > 0) return { taskId: null, kind: searchKind59, local: true };
+    if (videoPlaying59) return { taskId: null, kind: 'video', local: true };
+    try {
+      if (window.state && window.state.isGenerating) return { taskId: null, kind: 'answer', local: true };
+    } catch (e) {}
+    return null;
+  }
+  function isActive() { return !!activeTask(); }
+  window.EnzoTaskState59 = {
+    activeTask: activeTask,
+    isActive: isActive,
+    beginBackendTask: beginBackendTask,
+    endBackendTask: endBackendTask,
+    beginLocalTask: beginLocalTask,
+    endLocalTask: endLocalTask,
+    VERSION: 'v59-live-research-fix'
+  };
+
+  /* Every live search through window.searchWeb is a real task while it runs. */
+  try {
+    if (typeof window.searchWeb === 'function') {
+      var prevSW59 = window.searchWeb;
+      window.searchWeb = function (q, deep) {
+        searchInFlight59++;
+        searchKind59 = /\b(video|youtube|song|gana|music)\b/i.test(String(q || '')) ? 'video' : 'search';
+        var done59 = false;
+        function dec59() { if (!done59) { done59 = true; searchInFlight59 = Math.max(0, searchInFlight59 - 1); } }
+        try {
+          var r59 = prevSW59.apply(this, arguments);
+          if (r59 && typeof r59.then === 'function') r59.then(dec59, dec59); else dec59();
+          return r59;
+        } catch (e) { dec59(); throw e; }
+      };
+    }
+  } catch (e) {}
+
+  /* A video actually playing is a live video task. */
+  document.addEventListener('play', function (e) { if (e && e.target && e.target.tagName === 'VIDEO') videoPlaying59 = true; }, true);
+  document.addEventListener('pause', function (e) { if (e && e.target && e.target.tagName === 'VIDEO') videoPlaying59 = false; }, true);
+  document.addEventListener('ended', function (e) { if (e && e.target && e.target.tagName === 'VIDEO') videoPlaying59 = false; }, true);
+
+  /* ON-state styling for the live controls (View Live Research / Live Screen). */
+  try {
+    var css59 = document.createElement('style');
+    css59.id = 'enzoV59LiveOnCss';
+    css59.textContent = '#enzoMonitorBtn[data-on="true"],#enzoLiveScreenBtn[data-on="true"]{box-shadow:0 0 0 2px #22c55e inset}';
+    document.head.appendChild(css59);
+  } catch (e) {}
+
+  /* Sync loop: Live Video / live controls derive ON/OFF from the SAME
+     active-task state — never an independent flag, never reversed, never
+     stale. Plus the stuck-state watchdog: generating with NO task behind
+     it for over 90 s is cleared at this one choke point (indicator off,
+     generating off, centre state idle), so 'Searching...' and
+     'ENZO IS WORKING' can never outlive the task they belong to. */
+  function sync59() {
+    var act = activeTask();
+    var on = !!act;
+    try {
+      var ids59 = ['enzoMonitorBtn', 'enzoLiveScreenBtn'];
+      for (var i = 0; i < ids59.length; i++) {
+        var b = document.getElementById(ids59[i]);
+        if (b) b.setAttribute('data-on', on ? 'true' : 'false');
+      }
+      var lv = document.querySelectorAll('[data-live-video]');
+      for (var j = 0; j < lv.length; j++) lv[j].setAttribute('data-on', on ? 'true' : 'false');
+    } catch (e) {}
+    try {
+      var gen = !!(window.state && window.state.isGenerating);
+      var backed = !!(act && (act.backend || act.taskId || act.localId || searchInFlight59 > 0 || videoPlaying59));
+      if (gen && !backed) {
+        if (!genObservedSince59) genObservedSince59 = Date.now();
+        if (Date.now() - genObservedSince59 > STUCK_MS59) {
+          genObservedSince59 = null;
+          if (typeof hideTyping === 'function') hideTyping();
+          if (typeof setGenerating === 'function') setGenerating(false);
+          if (typeof setCentreEnzo === 'function') setCentreEnzo('idle');
+        }
+      } else {
+        genObservedSince59 = null;
+      }
+    } catch (e) {}
+  }
+  setInterval(sync59, 700);
+  sync59();
+
+  /* ------------------------------------------------------------------ */
+  /* Shared chat-delivery helpers (same message shapes the page uses)    */
+  /* ------------------------------------------------------------------ */
+  function tl59() {
+    try { return timeLabelFor(Date.now()); } catch (e) { return { daypart: '', daypartRoman: '', full: '' }; }
+  }
+  function langOf59(text) {
+    var l = 'en';
+    try { l = detectLang(text || ''); } catch (e) {}
+    if (l === 'english') l = 'en';
+    return (l === 'roman' || l === 'urdu') ? l : 'en';
+  }
+  function getChat59(text) {
+    var chat = null;
+    try { chat = activeChat(); } catch (e) {}
+    if (!chat) { try { chat = createChat(String(text || '').slice(0, 42)); } catch (e) {} }
+    return chat;
+  }
+  function pushUser59(chat, text, lang, viaVoice) {
+    var tl = tl59();
+    chat.messages.push({ role: 'user', text: text, lang: lang, viaVoice: !!viaVoice, ts: Date.now(), daypart: tl.daypart, daypartRoman: tl.daypartRoman, timeLabel: tl.full, files: [] });
+  }
+  function pushAi59(chat, text, lang, viaVoice, question, html, modeWhy) {
+    var tl = tl59();
+    var full = html || ((typeof mdToHtml === 'function') ? mdToHtml(text) : text);
+    var m = { role: 'ai', html: full, plain: text, viaVoice: !!viaVoice, question: question, sources: [], deep: false, modeWhy: modeWhy || '', auto: false, followups: [], lang: lang, ts: Date.now(), daypart: tl.daypart, daypartRoman: tl.daypartRoman, timeLabel: tl.full, _fullHtml: full };
+    chat.messages.push(m);
+    return m;
+  }
+  function render59() {
+    try { renderChatList(); } catch (e) {}
+    try { renderMessages(true); } catch (e) {}
+    try { saveChats(); } catch (e) {}
+  }
+  function speak59(m) {
+    try {
+      if (window.EnaoV54Voice) window.EnaoV54Voice.patchDirectSpeak(m, answersMode());
+      else if (typeof maybeSpeak === 'function') maybeSpeak(m);
+    } catch (e) {}
+  }
+  function esc59(s) { return (typeof esc === 'function') ? esc(s) : String(s == null ? '' : s); }
+
+  /* ------------------------------------------------------------------ */
+  /* 3) Capabilities — ONE inventory, kept in this single place          */
+  /* ------------------------------------------------------------------ */
+  var INVENTORY59 = {
+    can: [
+      { en: 'Live internet research with real sources: real links, publication dates, and only the source counts that were actually verified.',
+        roman: 'Live internet research asal sources ke saath: asal links, publication dates, aur sirf wohi source counts jo asal mein verify hue hon.',
+        urdu: 'لائیو انٹرنیٹ ریسرچ اصل ذرائع کے ساتھ: اصل لنکس، اشاعت کی تاریخیں، اور صرف وہی ذرائع گنتی جو اصل میں تصدیق شدہ ہو۔' },
+      { en: 'Deep research: a big question is split into parts, my own agents work on the parts, and the progress is visible in the Live Research Monitor and the Live Screen.',
+        roman: 'Deep research: bara sawal hisson mein bantta hai, mere apne agents un hisson par kaam karte hain, aur progress Live Research Monitor aur Live Screen mein nazar aati hai.',
+        urdu: 'ڈیپ ریسرچ: بڑا سوال حصوں میں بٹتا ہے، میرے اپنے ایجنٹس ان حصوں پر کام کرتے ہیں، اور پیش رفت لائیو ریسرچ مانیٹر اور لائیو اسکرین میں نظر آتی ہے۔' },
+      { en: 'Normal conversation and explanations from my own knowledge, without any search.',
+        roman: 'Aam guftagu aur wazahatain mere apne ilm se, baghair kisi search ke.',
+        urdu: 'عام گفتگو اور وضاحتیں میرے اپنے علم سے، بغیر کسی تلاش کے۔' },
+      { en: 'Voice: a question asked by voice is answered by voice; a typed question is answered in text. Live call conversation is also available.',
+        roman: 'Voice: voice se poocha gaya sawal voice mein jawab pata hai; likha hua sawal text mein. Live call par guftagu bhi ho sakti hai.',
+        urdu: 'آواز: آواز سے پوچھا گیا سوال آواز میں جواب پاتا ہے؛ لکھا ہوا سوال متن میں۔ لائیو کال پر گفتگو بھی ہو سکتی ہے۔' },
+      { en: 'Reminders: I can set reminders myself, and I speak them when they are due.',
+        roman: 'Reminders: main khud reminders laga sakta hoon, aur waqt par bol kar batata hoon.',
+        urdu: 'یاد دہانیاں: میں خود یاد دہانیاں لگا سکتا ہوں، اور وقت پر بول کر بتاتا ہوں۔' },
+      { en: 'Learning: I learn from our conversations; what I have learned is visible in Settings and can be deleted there.',
+        roman: 'Learning: main hamari guftagu se seekhta hoon; jo seekha hai wo Settings mein nazar aata hai aur wahan se delete bhi ho sakta hai.',
+        urdu: 'سیکھنا: میں ہماری گفتگو سے سیکھتا ہوں؛ جو سیکھا ہے وہ سیٹنگز میں نظر آتا ہے اور وہاں سے حذف بھی ہو سکتا ہے۔' },
+      { en: 'Videos: I can find and play videos from YouTube, Vimeo and Dailymotion with real links and thumbnails, and a playable player where the platform allows embedding.',
+        roman: 'Videos: main YouTube, Vimeo aur Dailymotion se videos dhoond kar chala sakta hoon — asal links aur thumbnails ke saath, aur jahan platform ijazat de wahan chalne wala player bhi.',
+        urdu: 'ویڈیوز: میں یوٹیوب، ویمیو اور ڈیلی موشن سے ویڈیوز ڈھونڈ کر چلا سکتا ہوں — اصل لنکس اور تھمب نیلز کے ساتھ، اور جہاں پلیٹ فارم اجازت دے وہاں چلنے والا پلیئر بھی۔' },
+      { en: 'Social research on public content only: YouTube, Reddit, Telegram, Threads, TikTok and Pinterest are partially implemented. Facebook, Instagram, X and LinkedIn need a login, and I say so plainly instead of pretending. Snapchat cannot be searched.',
+        roman: 'Social research sirf public content par: YouTube, Reddit, Telegram, Threads, TikTok aur Pinterest partially implemented hain. Facebook, Instagram, X aur LinkedIn ke liye login chahiye, aur main ye saaf kehta hoon, jhoota daawa nahi karta. Snapchat search nahi ho sakta.',
+        urdu: 'سوشل ریسرچ صرف پبلک مواد پر: یوٹیوب، ریڈیٹ، ٹیلیگرام، تھریڈز، ٹک ٹاک اور پنٹرسٹ جزوی طور پر نافذ ہیں۔ فیس بک، انسٹاگرام، ایکس اور لنکڈان کے لیے لاگ ان چاہیے، اور میں یہ صاف کہتا ہوں، جھوٹا دعویٰ نہیں کرتا۔ سنیپ چیٹ تلاش نہیں ہو سکتی۔' },
+      { en: 'My own SEO toolkit: 9 tools with my own 0 to 100 scores. DA, DR, PA, PR and traffic figures are not available to me.',
+        roman: 'Mera apna SEO toolkit: 9 tools, mere apne 0 se 100 scores ke saath. DA, DR, PA, PR aur traffic ke figures mere paas available nahi hain.',
+        urdu: 'میرا اپنا ایس ای او ٹول کٹ: 9 ٹولز، میرے اپنے 0 سے 100 اسکورز کے ساتھ۔ DA، DR، PA، PR اور ٹریفک کے اعداد میرے پاس دستیاب نہیں ہیں۔' },
+      { en: 'Building: websites and apps from a one-line order, built by my own agents and watchable live while they work. Everything I create is kept in the Library.',
+        roman: 'Building: ek line ke order par websites aur apps — mere apne agents banate hain aur kaam live dekha ja sakta hai. Jo kuch main banata hoon wo Library mein mehfooz rehta hai.',
+        urdu: 'تعمیر: ایک سطر کے حکم پر ویب سائٹس اور ایپس — میرے اپنے ایجنٹس بناتے ہیں اور کام لائیو دیکھا جا سکتا ہے۔ جو کچھ میں بناتا ہوں وہ لائبریری میں محفوظ رہتا ہے۔' },
+      { en: 'Settings, including voice ID: voice ID accepts only Raja\'s commands.',
+        roman: 'Settings, voice ID samait: voice ID sirf Raja ke commands qabool karti hai.',
+        urdu: 'سیٹنگز، وائس آئی ڈی سمیت: وائس آئی ڈی صرف راجہ کے احکامات قبول کرتی ہے۔' }
+    ],
+    limits: [
+      { en: 'I cannot read a whole website fully: I fetch one page at a time, about 6,000 characters per fetch.',
+        roman: 'Main poori website mukammal nahi parh sakta: ek waqt mein ek page, har fetch mein takreeban 6,000 characters.',
+        urdu: 'میں پوری ویب سائٹ مکمل نہیں پڑھ سکتا: ایک وقت میں ایک صفحہ، ہر فیچ میں تقریباً 6,000 حروف۔' },
+      { en: 'I cannot control your own browser or computer. The Live Screen shows my own research environment, not your device.',
+        roman: 'Main aap ke apne browser ya computer ko control nahi kar sakta. Live Screen mera apna research environment dikhati hai, aap ka device nahi.',
+        urdu: 'میں آپ کے اپنے براؤزر یا کمپیوٹر کو کنٹرول نہیں کر سکتا۔ لائیو اسکرین میرا اپنا ریسرچ ماحول دکھاتی ہے، آپ کا آلہ نہیں۔' },
+      { en: 'I cannot see private accounts, private messages or WhatsApp chats.',
+        roman: 'Main private accounts, private messages ya WhatsApp chats nahi dekh sakta.',
+        urdu: 'میں پرائیویٹ اکاؤنٹس، پرائیویٹ پیغامات یا واٹس ایپ چیٹس نہیں دیکھ سکتا۔' },
+      { en: 'My SEO scores will not equal Ahrefs, Semrush or Moz scores: the data and the method are different.',
+        roman: 'Mere SEO scores Ahrefs, Semrush ya Moz ke scores ke barabar nahi honge: data aur tareeqa mukhtalif hai.',
+        urdu: 'میرے ایس ای او اسکورز Ahrefs، Semrush یا Moz کے اسکورز کے برابر نہیں ہوں گے: ڈیٹا اور طریقہ مختلف ہے۔' },
+      { en: 'Voice ID and some mic behaviours are not yet verified on your device.',
+        roman: 'Voice ID aur kuch mic behaviours abhi aap ke device par verified nahi hain.',
+        urdu: 'وائس آئی ڈی اور کچھ مائیک رویے ابھی آپ کے آلے پر تصدیق شدہ نہیں ہیں۔' },
+      { en: 'Video durations are mostly unknown: no free source provides them.',
+        roman: 'Videos ki durations aksar maloom nahi hotin: koi free source ye nahi deta.',
+        urdu: 'ویڈیوز کی مدت اکثر معلوم نہیں ہوتی: کوئی مفت ذریعہ یہ نہیں دیتا۔' }
+    ]
+  };
+  var CAP_HEADS59 = {
+    en: { intro: 'Here is, in full detail, what I can do — and, just as plainly, where my limits are.', can: 'What I can do', limits: 'My limits' },
+    roman: { intro: 'Poori tafseel mein ye hai ke main kya kya kar sakta hoon — aur bilkul saaf taur par ye bhi ke meri limits kahan hain.', can: 'Main kya kar sakta hoon', limits: 'Meri limits' },
+    urdu: { intro: 'پوری تفصیل میں یہ ہے کہ میں کیا کیا کر سکتا ہوں — اور بالکل صاف طور پر یہ بھی کہ میری حدود کہاں ہیں۔', can: 'میں کیا کر سکتا ہوں', limits: 'میری حدود' }
+  };
+  function capAnswer59(lang) {
+    var L = (lang === 'urdu') ? 'urdu' : (lang === 'roman') ? 'roman' : 'en';
+    var H = CAP_HEADS59[L];
+    var lines = [H.intro, '', '**' + H.can + '**'];
+    INVENTORY59.can.forEach(function (it) { lines.push('- ' + it[L]); });
+    lines.push('', '**' + H.limits + '**');
+    INVENTORY59.limits.forEach(function (it) { lines.push('- ' + it[L]); });
+    return lines.join('\n');
+  }
+  var CAP_RE59 = [
+    /what (all )?(can|could) (you|u) do\b/,
+    /what (can|could) enzo do\b/,
+    /(your|ur) (capabilit|abilit|features|functions)\b/,
+    /(tumhare|tumhari|aapke|aapki|tumhara) features\b/,
+    /features (kya|kia) (hain|hai)\b/,
+    /(kya|kia) (kya|kia) kar (sakte|sakty|sakta) (ho|hain|hai)\b/,
+    /(aap|tum|tu) (kya|kia) kar (sakte|sakty|sakta) (ho|hain|hai)\b/,
+    /(aap|tum) (kya|kia) (kya|kia) kar (sakte|sakty|sakta)/,
+    /kis kis kaam (mein|mai) (madad|tum|aap)/,
+    /madad kar (sakte|sakty|sakta)/,
+    /(آپ|تم) کیا کیا کر سکتے/,
+    /کیا کیا کر سکتے (ہو|ہیں)/,
+    /آپ کیا کر سکتے ہیں/,
+    /تم کیا کر سکتے ہو/,
+    /فیچرز کیا ہیں/,
+    /کس کس کام میں مدد کر سکتے/
+  ];
+  function isCapabilitiesQuestion59(text) {
+    var raw = String(text || '');
+    var t = ' ' + raw.toLowerCase().replace(/\s+/g, ' ') + ' ';
+    for (var i = 0; i < CAP_RE59.length; i++) {
+      if (CAP_RE59[i].test(t) || CAP_RE59[i].test(raw)) return true;
+    }
+    return false;
+  }
+  function deliverCapabilities59(text, viaVoice) {
+    var lang = langOf59(text);
+    var chat = getChat59(text);
+    if (!chat) return false;
+    pushUser59(chat, text, lang, viaVoice);
+    var m = pushAi59(chat, capAnswer59(lang), lang, viaVoice, text, null, 'Capabilities — answered from ENZO\'s own capability inventory (conversation, no research)');
+    render59();
+    try { if (typeof setCentreEnzo === 'function') setCentreEnzo('idle'); } catch (e) {}
+    speak59(m);
+    return true;
+  }
+  window.EnzoCapabilities59 = { INVENTORY: INVENTORY59, isQuestion: isCapabilitiesQuestion59, answer: capAnswer59 };
+
+  /* ------------------------------------------------------------------ */
+  /* 2) Play/video orders — media orders, never research questions       */
+  /* ------------------------------------------------------------------ */
+  function playTopic59(text) {
+    var t = String(text || '').toLowerCase();
+    t = t.replace(/\b(youtube|yt|video|videos|gana|gaana|song|songs|geet|music|movie|film|please|plz|zara|bhai|yaar)\b/g, ' ');
+    t = t.replace(/\b(chalao|chala do|chalado|bajao|baja do|sunao|suna do|dikhao|dikha do|play|per|par|pe|pr|ka|ki|ke|a|an|the|of|on|for|mein|main)\b/g, ' ');
+    t = t.replace(/(یوٹیوب|ویڈیو|گانا|گانے|چلاؤ|چلا دو|بجاؤ|سناؤ|دکھاؤ|پر|کا|کی|کے)/g, ' ');
+    t = t.replace(/\s+/g, ' ').trim();
+    return t || String(text || '').trim();
+  }
+  function isPlayOrder59(text) {
+    var raw = String(text || '');
+    var t = ' ' + raw.toLowerCase() + ' ';
+    var playVerb = /\b(chalao|chala do|chalado|bajao|baja do|sunao|suna do|play)\b/.test(t);
+    var showVerb = /\b(dikhao|dikha do)\b/.test(t);
+    var mediaWord = /\b(youtube|yt|video|videos|gana|gaana|song|songs|geet|music|movie|film)\b/.test(t);
+    var urduPlay = /(چلاؤ|چلا دو|بجاؤ|سناؤ|دکھاؤ)/.test(raw);
+    var urduMedia = /(یوٹیوب|ویڈیو|گانا|گانے|موسیقی)/.test(raw);
+    var topic = playTopic59(raw);
+    var hasTopic = topic.length >= 3;
+    if (urduPlay && (urduMedia || hasTopic)) return true;
+    if (playVerb && (mediaWord || hasTopic)) return true;
+    if (showVerb && mediaWord) return true;
+    return false;
+  }
+  var VIDEO_TXT59 = {
+    en: { found: 'Here are the videos I found. Tap a result to play it.', none: 'I could not find a playable video for that — the video search returned no real video links. Try another name and I will search again.', fail: 'The video search could not run just now. Nothing was made up — try again in a moment.' },
+    roman: { found: 'Ye rahi videos jo mili. Chalane ke liye kisi result par tap karein.', none: 'Is par koi chalne wali video nahi mili — video search ne koi asal video link nahi diya. Koi aur naam bata dein, main dobara dhoond dunga.', fail: 'Video search is waqt nahi chal saki. Kuch banaya nahi gaya — thodi dair mein dobara koshish karein.' },
+    urdu: { found: 'یہ رہی ویڈیوز جو ملیں۔ چلانے کے لیے کسی نتیجے پر ٹیپ کریں۔', none: 'اس پر کوئی چلنے والی ویڈیو نہیں ملی — ویڈیو تلاش نے کوئی اصل ویڈیو لنک نہیں دیا۔ کوئی اور نام بتا دیں، میں دوبارہ ڈھونڈ دوں گا۔', fail: 'ویڈیو تلاش اس وقت نہیں چل سکی۔ کچھ بنایا نہیں گیا — تھوڑی دیر میں دوبارہ کوشش کریں۔' }
+  };
+  function runVideoOrder59(text, viaVoice) {
+    if (!window.EnzoVideo || typeof window.EnzoVideo.searchVideos !== 'function') return false;
+    var lang = langOf59(text);
+    var topic = playTopic59(text);
+    var chat = getChat59(text);
+    if (!chat) return false;
+    if (chat.messages.length === 0) { try { chat.title = String(text || '').slice(0, 42); } catch (e) {} }
+    pushUser59(chat, text, lang, viaVoice);
+    render59();
+    var localId = beginLocalTask('video');
+    try {
+      if (typeof setGenerating === 'function') setGenerating(true);
+      if (typeof showTyping === 'function') showTyping();
+      if (typeof setTypingStatus === 'function') setTypingStatus('Searching…');
+      if (typeof setCentreEnzo === 'function') setCentreEnzo('researching');
+    } catch (e) {}
+    var deps = window.__enzoResearchDeps || {};
+    var opts = { query: topic, maxResults: 6 };
+    if (typeof deps.fetchJson === 'function') opts.fetchJson = deps.fetchJson;
+    if (typeof deps.fetchText === 'function') opts.fetchText = deps.fetchText;
+    function finish59(out, failed) {
+      endLocalTask(localId);
+      var T = VIDEO_TXT59[lang] || VIDEO_TXT59.en;
+      var results = (out && Array.isArray(out.results)) ? out.results : [];
+      var plain, html = null;
+      if (results.length) {
+        plain = T.found + '\n' + results.map(function (r, i) { return (i + 1) + '. ' + (r.title || r.url || '') + (r.url ? ' — ' + r.url : ''); }).join('\n');
+        html = '<p>' + esc59(T.found) + '</p>';
+        results.forEach(function (r) {
+          try { html += window.EnzoVideo.videoCardHtml(r); }
+          catch (e) { if (r && r.url) html += '<p><a href="' + esc59(r.url) + '" target="_blank" rel="noopener">' + esc59(r.title || r.url) + '</a></p>'; }
+        });
+      } else {
+        plain = failed ? T.fail : T.none;
+      }
+      var m = pushAi59(chat, plain, lang, viaVoice, text, html, 'Video order — ENZO video search (media task, not a research task)');
+      try {
+        if (typeof hideTyping === 'function') hideTyping();
+        if (typeof setGenerating === 'function') setGenerating(false);
+        if (typeof setCentreEnzo === 'function') setCentreEnzo('idle');
+      } catch (e) {}
+      render59();
+      speak59(m);
+    }
+    try {
+      window.EnzoVideo.searchVideos(opts).then(function (out) { finish59(out, false); }, function () { finish59(null, true); });
+    } catch (e) {
+      finish59(null, true);
+    }
+    return true;
+  }
+  window.EnzoPlayOrder59 = { isPlayOrder: isPlayOrder59, topic: playTopic59 };
+
+  /* ------------------------------------------------------------------ */
+  /* Outermost ask wrapper: capabilities first, then play/video orders.  */
+  /* Both are conversation/media paths — never research, never clarify.  */
+  /* ------------------------------------------------------------------ */
+  var prevAsk59 = window.askQuestion;
+  if (typeof prevAsk59 === 'function') {
+    window.askQuestion = function (text, viaVoice, forcedDeep) {
+      try {
+        if (text && typeof forcedDeep !== 'boolean') {
+          var chat0 = null;
+          try { chat0 = activeChat(); } catch (e) {}
+          var pending0 = !!(chat0 && (chat0.pendingConfirm || chat0.pendingClarify || chat0.pendingClarifyLocal || chat0.pendingReminder));
+          var hasFiles = false;
+          try { hasFiles = !!(window.state && window.state.pendingFiles && window.state.pendingFiles.length); } catch (e) {}
+          if (!pending0 && !hasFiles) {
+            if (isCapabilitiesQuestion59(text)) {
+              if (deliverCapabilities59(text, viaVoice)) return;
+            }
+            if (isPlayOrder59(text)) {
+              if (runVideoOrder59(text, viaVoice)) return;
+            }
+          }
+        }
+      } catch (e) {}
+      return prevAsk59(text, viaVoice, forcedDeep);
+    };
+  }
 })();
 </script>
 <script>
@@ -44252,14 +47234,18 @@ if (typeof module !== 'undefined' && module.exports) {
     try{
       if(!window.EnzoMonitor) return;
       var ac=(typeof activeChat==='function')?activeChat():null;
-      var id=ac?ac.id:null;
+      /* v59 (Piece 32 [6]): the monitor is pointed at the BACKEND chat id only, resolved through the registry — never the local cmwr* id. Unresolvable means do not call setChatId/start at all. */
+      var id=(ac && window.EnzoPollingFix)?window.EnzoPollingFix.resolveBackendId(ac.id):null;
+      if(!id){ lastMonitorChatId=null; return; }
       if(id===lastMonitorChatId) return;
       lastMonitorChatId=id;
       EnzoMonitor.setChatId(id);
       EnzoMonitor.start();
+      try{ if(window.EnzoPollingFix) window.EnzoPollingFix.install(); }catch(e){}
     }catch(e){}
   }
   syncMonitorChat();
+  try{ if(window.EnzoPollingFix) window.EnzoPollingFix.install(); }catch(e){}
   setInterval(syncMonitorChat, 1200);
 })();
 </script>
@@ -44942,7 +47928,7 @@ function conversationReply(text, lang, ctx) {
     var endpoint=T.seoEndpointFor(cmd.kind);
     if(!endpoint){ var nl='That SEO command is not wired to an endpoint yet.'; seoDeliver55(chat, text, lang, viaVoice, nl, mdToHtml(nl)); return; }
     setGenerating(true); showTyping(); setTypingStatus('Running ENZO\u2019s own SEO tools…'); setCentreEnzo('researching');
-    fetch(endpoint, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(T.seoRequestBody(cmd))})
+    fetch(window.EnzoPagesBackend.getBackendUrl(endpoint), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(T.seoRequestBody(cmd))})
       .then(function(r){ return r.json().catch(function(){ return null; }).then(function(j){ if(!r.ok) throw new Error((j&&(j.message||j.error))||('HTTP '+r.status)); return j; }); })
       .then(function(payload){
         hideTyping(); setGenerating(false);
