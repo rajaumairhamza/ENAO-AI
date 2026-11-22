@@ -1,0 +1,227 @@
+
+/* P-F adapter additions: backend state line, live agent line, reminders, learned view */
+.v2-state-line{margin-top:8px;font-size:11.5px;line-height:1.5;color:#FCD34D;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.45);border-radius:9px;padding:7px 9px}
+.v2-agent-line{margin-top:9px;font-size:11.5px;line-height:1.55;color:var(--muted);border-top:1px dashed var(--line);padding-top:8px}
+.rem-note{font-size:11px;line-height:1.5;color:var(--muted);margin:9px 0 0}
+.rem-item{display:flex;gap:7px;align-items:flex-start;margin-top:8px}
+.rem-txt{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.rem-txt b{font-size:12.5px;color:var(--ink);word-break:break-word}
+.rem-txt span{font-size:11px;color:var(--muted)}
+.rem-txt .rem-missed{color:#FCD34D}
+.rem-item .enzo-tbtn{flex:0 0 auto}
+#remAlert{position:fixed;left:50%;transform:translateX(-50%);bottom:118px;z-index:1200;width:min(430px,calc(100vw - 24px));background:#0B1B33;border:1px solid rgba(0,217,255,.5);border-radius:14px;padding:14px 16px;box-shadow:0 18px 50px rgba(0,0,0,.55);color:#E0F2FE}
+#remAlert[hidden]{display:none}
+.rem-alert-k{font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:#00D9FF}
+.rem-alert-t{font-size:16px;font-weight:700;margin-top:5px;line-height:1.4;word-break:break-word}
+.rem-alert-w{font-size:12px;color:#94A3B8;margin-top:4px;line-height:1.5}
+.rem-alert-btns{display:flex;gap:7px;margin-top:11px;flex-wrap:wrap}
+.rem-alert-btns .enzo-tbtn{flex:1;min-width:100px}
+.learned-box{margin-top:18px;border-top:1px solid var(--line);padding-top:14px}
+.learned-box h4{margin:0 0 4px;font-size:14px;color:var(--ink)}
+.lrn-note{font-size:12px;color:var(--muted);line-height:1.55;margin:0 0 8px}
+.lrn-row{display:flex;gap:8px;align-items:baseline;justify-content:space-between;font-size:12.5px;padding:6px 0;border-bottom:1px dashed var(--line);color:var(--muted)}
+.lrn-row b{color:var(--ink);font-weight:600;text-align:right}
+.lrn-corr{display:flex;gap:8px;align-items:center;justify-content:space-between;font-size:12.5px;padding:5px 0;border-bottom:1px dashed var(--line);color:var(--ink)}
+.lrn-x{background:none;border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:11px;padding:2px 7px;cursor:pointer;flex:0 0 auto}
+.lrn-x:hover{color:#FCA5A5;border-color:rgba(239,68,68,.5)}
+.lrn-clear{margin-top:11px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.45);color:#FCA5A5;border-radius:9px;padding:8px 12px;font-size:12.5px;font-weight:700;cursor:pointer;width:100%}
+.lrn-toggle{flex:0 0 auto;background:rgba(0,217,255,.1);border:1px solid rgba(0,217,255,.4);color:#E0F2FE;border-radius:8px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;min-height:32px}
+
+/* ============ RIGHT PANEL ADDITIONS — menu, permissions, identity ============ */
+.enzo-menubar{display:flex;align-items:center;gap:9px;margin:0 0 4px}
+.enzo-menubtn{width:32px;height:32px;min-height:32px;border-radius:8px;border:1px solid rgba(0,217,255,.35);background:rgba(255,255,255,.06);color:#AAB8D0;display:grid;place-items:center;padding:0;cursor:pointer}
+.enzo-menubtn:hover{background:rgba(0,217,255,.14);color:#fff}
+.enzo-menubtn .ic{width:16px;height:16px}
+.enzo-menubar-t{font-size:11px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#AAB8D0}
+#panelMenu{display:flex;flex-direction:column}
+#panelMenu.closed{display:none}
+#panelMenu .enzo-task{margin-top:10px}
+.rp-sec{margin-top:12px;background:rgba(255,255,255,.04);border:1px solid rgba(0,217,255,.18);border-radius:12px;padding:11px 12px}
+#panelMenu .rp-sec{margin-top:10px}
+.rp-head{display:flex;align-items:center;gap:7px;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#AAB8D0;font-weight:800}
+.rp-head .ic{width:15px;height:15px;color:#00D9FF}
+.rp-runline{font-size:12.5px;line-height:1.5;color:#E0F2FE;margin:8px 0 1px}
+.rp-empty{font-size:11.5px;line-height:1.55;color:#8FA3C4;margin:8px 0 0}
+.rp-row{display:flex;justify-content:space-between;align-items:center;gap:9px;padding:8px 0;border-top:1px dashed rgba(170,184,208,.18)}
+[data-perm-list] .rp-row:first-of-type{margin-top:4px}
+.rp-row-t b{font-size:12.5px;color:#F8FAFC;display:block;line-height:1.3}
+.rp-row-t .sub{font-size:11px;color:#8FA3C4;display:block;line-height:1.4;margin-top:1px}
+.rp-right{display:flex;align-items:center;gap:7px;flex:0 0 auto}
+.rp-state{font-size:11px;font-weight:800}
+.rp-state.on{color:#4ADE80}.rp-state.off{color:#FCA5A5}.rp-state.ask{color:#FCD34D}
+.rp-btn{flex:0 0 auto;padding:5px 9px;min-height:28px;font-size:11px}
+.rp-id-flex{display:flex;gap:11px;align-items:center;margin-top:9px}
+.rp-finger{width:42px;height:42px;flex:0 0 42px;color:#00D9FF}
+.rp-finger svg{width:100%;height:100%}
+.rp-id-lines b{font-size:14px;color:#F8FAFC;display:block}
+.rp-id-lines span{font-size:11.5px;color:#AAB8D0;display:block;margin-top:1px}
+#rpIdRows{margin-top:6px}
+#rpIdRows .rp-row{font-size:11.5px;color:#8FA3C4}
+#rpIdRows .rp-row b{color:#E0F2FE;font-size:11.5px;text-align:right}
+/* ============ LIBRARY ============ */
+.lib-tools{display:flex;flex-direction:column;gap:9px;margin-top:6px}
+.lib-tools input{width:100%}
+.lib-chips{display:flex;gap:6px;flex-wrap:wrap}
+.lib-chip{padding:6px 12px;border-radius:99px;border:1px solid var(--line);background:var(--surface2);color:var(--muted);font:inherit;font-size:12.5px;font-weight:700;cursor:pointer;min-height:32px}
+.lib-chip.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.lib-count{font-size:12px;color:var(--muted);margin:10px 0 6px}
+.lib-layout{display:flex;gap:16px;align-items:flex-start}
+.lib-list{flex:0 0 290px;max-height:56vh;overflow:auto;display:flex;flex-direction:column;gap:7px;padding-right:2px}
+.lib-item{text-align:left;padding:10px 11px;border-radius:12px;border:1px solid var(--line);background:var(--surface);cursor:pointer;font:inherit;width:100%}
+.lib-item:hover{border-color:var(--accent)}
+.lib-item.active{border-color:var(--accent);background:var(--accent-soft)}
+.lib-item b{font-size:13px;color:var(--ink);display:block;line-height:1.35}
+.lib-meta{font-size:11px;color:var(--muted);display:block;margin-top:3px;line-height:1.45}
+.lib-badge{display:inline-block;font-size:9.5px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;border-radius:99px;padding:2px 7px;margin-bottom:5px;background:var(--accent-soft);color:var(--accent-dark)}
+.lib-view{flex:1;min-width:0;max-height:56vh;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:14px}
+.lib-view h4{margin:0 0 4px;font-size:16px;color:var(--ink);line-height:1.35}
+.lib-actions{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0}
+.lib-body{font-size:14px;line-height:1.65;color:var(--ink)}
+.lib-body img{max-width:100%;border-radius:10px}
+.lib-body table{border-collapse:collapse;width:100%;font-size:12.5px}
+.lib-body th,.lib-body td{border:1px solid var(--line);padding:5px 8px;text-align:left}
+.lib-empty{color:var(--muted);font-size:13.5px;line-height:1.6;padding:8px 2px}
+@media(max-width:640px){.lib-layout{flex-direction:column}.lib-list{flex:none;width:100%;max-height:32vh}.lib-view{width:100%;max-height:46vh}}
+/* ============ SETTINGS MENU (Muse-style sections) ============ */
+.setlayout{display:flex;gap:18px;margin-top:14px;align-items:flex-start}
+.setnav{flex:0 0 172px;display:flex;flex-direction:column;gap:3px}
+.setnav button{text-align:left;padding:9px 11px;border-radius:10px;border:1px solid transparent;background:transparent;color:var(--muted);font:inherit;font-size:13.5px;font-weight:600;cursor:pointer;min-height:38px}
+.setnav button:hover{background:var(--surface2);color:var(--ink)}
+.setnav button.active{background:var(--accent-soft);color:var(--ink);border-color:var(--line)}
+.setpanes{flex:1;min-width:0}
+.setpane{display:none}
+.setpane.active{display:block}
+.setpane>.setsec:first-child{margin-top:0;padding-top:0;border-top:0}
+@media(max-width:640px){.setlayout{flex-direction:column}.setnav{flex-direction:row;flex-wrap:wrap;flex:none;width:100%}.setnav button{flex:1 1 42%}}
+.kv-val{font-size:13px;color:var(--ink);font-weight:600;text-align:right}
+.mini-form{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0}
+.mini-form input,.mini-form select{flex:1;min-width:128px}
+.enzo-ava-row{display:flex;gap:12px;align-items:center;margin:10px 0}
+.enzo-ava-row img{width:56px;height:56px;border-radius:14px;object-fit:cover;border:1px solid var(--line)}
+.enzo-ava-row b{color:var(--ink);display:block}
+.enzo-ava-row span{font-size:12.5px;color:var(--muted);line-height:1.5;display:block}
+.setpane .rp-row{border-top:1px solid var(--line)}
+.setpane .rp-row-t b{color:var(--ink)}
+.setpane .rp-row-t .sub{color:var(--muted)}
+.setpane .rp-btn{border-color:var(--line);background:var(--surface2);color:var(--ink)}
+.setpane .rp-btn:hover{background:var(--accent-soft)}
+.setpane .rp-state.on{color:#15803d}.setpane .rp-state.off{color:#dc2626}.setpane .rp-state.ask{color:#b45309}
+/* ============ MOBILE LAYOUT FIX — true single column + slide-in drawers (≤820px only) ============
+   Desktop (>820px) is completely untouched: every rule below lives inside the
+   phone media query or styles elements that only exist for the drawers.
+   The drawers are fixed + translated off-canvas, so they OVERLAY the chat —
+   they can never squeeze it, and the page can never render wider than the
+   phone screen. ID selectors are used for the two panels because earlier
+   rebuild rules (#sidebar{display:flex}) outrank the old class-level
+   mobile hide rules — that specificity clash is what squeezed the layout. */
+.drawer-close{display:none;place-items:center;width:36px;height:36px;min-height:36px;border-radius:9px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.07);color:#fff;font-size:19px;line-height:1;padding:0;cursor:pointer;flex:0 0 36px}
+.drawer-backdrop{position:fixed;inset:0;background:rgba(3,8,20,.55);z-index:44;opacity:0;transition:opacity .25s ease}
+.drawer-backdrop[hidden]{display:none}
+.drawer-backdrop.show{opacity:1}
+@media(max-width:820px){
+  html,body{width:100%;max-width:100%;overflow-x:hidden}
+  body{display:block;height:100dvh}
+  /* The chat workspace is the ONLY in-flow column and fills the screen */
+  .main{width:100%;max-width:100%;min-width:0;height:100dvh}
+  .mainwrap,.scroll{min-width:0}
+  .wrap{max-width:100%;padding:20px 14px 16px}
+  /* LEFT SIDEBAR — slide-in drawer from the left, hidden by default */
+  #sidebar{position:fixed;top:0;left:0;bottom:0;width:min(320px,88vw);flex:none;z-index:46;transform:translateX(-105%);visibility:hidden;transition:transform .28s ease,visibility 0s linear .28s;box-shadow:14px 0 34px rgba(0,0,0,.45)}
+  #sidebar.open{transform:translateX(0);visibility:visible;transition:transform .28s ease}
+  /* A closed drawer is fully removed from the render (display:none), not
+     just parked off-canvas — nothing hidden-but-present for a phone user
+     or a screen reader to trip over. Opening plays a slide-in keyframe,
+     since a display flip cannot run the transform transition. */
+  #sidebar:not(.open){display:none}
+  #enzoPanel:not(.open){display:none}
+  #sidebar.open{animation:drawerInL .28s ease}
+  #enzoPanel.open{animation:drawerInR .28s ease}
+  body.sb-collapsed #sidebar{margin-left:0}
+  #sidebar .drawer-close{display:grid}
+  #sidebar .sb-collapse{width:36px;height:36px;min-height:36px;flex-basis:36px}
+  /* RIGHT COMPANION PANEL — slide-in drawer from the right, hidden by default;
+     the ENZO room scales to the drawer width instead of being squashed */
+  #enzoPanel{display:flex;position:fixed;top:0;right:0;bottom:0;width:min(340px,92vw);flex:none;z-index:46;transform:translateX(105%);visibility:hidden;transition:transform .28s ease,visibility 0s linear .28s;box-shadow:-14px 0 34px rgba(0,0,0,.45)}
+  #enzoPanel.open{transform:translateX(0);visibility:visible;transition:transform .28s ease}
+  #enzoPanel .drawer-close{display:grid;position:absolute;top:10px;right:48px;z-index:3;border-color:rgba(0,217,255,.35);background:rgba(255,255,255,.06);color:#AAB8D0}
+  .enzo-panel-mount{width:100%;height:min(308px,42vh);min-height:220px;flex:0 1 auto}
+  .enzo-fab{display:grid;z-index:40;bottom:calc(100px + env(safe-area-inset-bottom))}
+  /* Top bar — one tidy row: hamburger, clock, profile; nothing clipped */
+  .topbar{flex-wrap:nowrap;height:56px;min-height:56px;padding:6px 10px;gap:8px}
+  .topbar .spacer{display:block;flex:1 1 auto}
+  #expandBtn{display:none !important}
+  .menuBtn{display:grid;width:44px;height:44px;min-height:44px;flex:0 0 44px}
+  .liveclock{flex:0 1 auto;min-width:0}
+  .avatarbtn{flex:0 0 auto}
+  /* Chat header — title wraps, the model pill shrinks instead of clipping */
+  .ws-head{flex-wrap:wrap}
+  .modelwrap{max-width:100%;min-width:0}
+  .modelpill{max-width:100%}
+  .modelpill span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .modelmenu{max-width:calc(100vw - 28px)}
+  /* Messages — readable sizes at phone width */
+  .msg{gap:9px}
+  .bubble p,.ai-body,.ai-body p{font-size:15.5px}
+  /* Composer — full width, every tap target at least 44px, buttons never
+     overlap the text field */
+  .composer{padding:8px 10px calc(8px + env(safe-area-inset-bottom))}
+  .composer-inner{max-width:100%}
+  .composer-top{align-items:center;gap:6px}
+  .composer-top textarea{flex:1 1 auto;min-width:0;font-size:16px}
+  .micbtn,.sendbtn{width:48px;height:48px;min-height:48px;flex:0 0 48px}
+  .composer-top .cbtn,.composer-top #attachBtn{width:44px;height:44px;min-height:44px;flex:0 0 44px}
+  .attachmenu{max-width:calc(100vw - 20px)}
+}
+@media(max-width:400px){
+  .wrap{padding:16px 10px 14px}
+  .composer{padding-left:8px;padding-right:8px}
+  .composer-top{gap:5px}
+  .micbtn,.sendbtn{width:46px;height:46px;min-height:46px;flex-basis:46px}
+}
+/* ============ PHONE LAYOUT GUARD — the same single-column + drawer layout,
+   switched on by html.phone-forced (set in the head when the DEVICE is a
+   phone, even if its browser reports a desktop-width viewport). These rules
+   mirror the ≤820px block above; html.phone-forced outranks the ≥821px
+   desktop grid, so on a phone the chat is always the only in-flow column
+   and both panels stay off-canvas drawers. ============ */
+html.phone-forced,html.phone-forced body{max-width:100%;overflow-x:hidden}
+html.phone-forced body{display:block;height:100dvh}
+html.phone-forced .main{width:100%;max-width:100%;min-width:0;height:100dvh}
+html.phone-forced .mainwrap,html.phone-forced .scroll{min-width:0}
+html.phone-forced .wrap{max-width:100%;padding:20px 14px 16px}
+html.phone-forced #sidebar{position:fixed;top:0;left:0;bottom:0;width:min(320px,88vw);flex:none;z-index:46;transform:translateX(-105%);visibility:hidden;transition:transform .28s ease,visibility 0s linear .28s;box-shadow:14px 0 34px rgba(0,0,0,.45)}
+html.phone-forced #sidebar.open{transform:translateX(0);visibility:visible;transition:transform .28s ease}
+html.phone-forced body.sb-collapsed #sidebar{margin-left:0}
+html.phone-forced #sidebar .drawer-close{display:grid}
+html.phone-forced #sidebar .sb-collapse{width:36px;height:36px;min-height:36px;flex-basis:36px}
+html.phone-forced #enzoPanel{display:flex;position:fixed;top:0;right:0;bottom:0;width:min(340px,92vw);flex:none;z-index:46;transform:translateX(105%);visibility:hidden;transition:transform .28s ease,visibility 0s linear .28s;box-shadow:-14px 0 34px rgba(0,0,0,.45)}
+html.phone-forced #enzoPanel.open{transform:translateX(0);visibility:visible;transition:transform .28s ease}
+html.phone-forced #enzoPanel .drawer-close{display:grid;position:absolute;top:10px;right:48px;z-index:3;border-color:rgba(0,217,255,.35);background:rgba(255,255,255,.06);color:#AAB8D0}
+html.phone-forced .enzo-panel-mount{width:100%;height:min(308px,42vh);min-height:220px;flex:0 1 auto}
+html.phone-forced .enzo-fab{display:grid;z-index:40;bottom:calc(100px + env(safe-area-inset-bottom))}
+html.phone-forced .topbar{flex-wrap:nowrap;height:56px;min-height:56px;padding:6px 10px;gap:8px}
+html.phone-forced .topbar .spacer{display:block;flex:1 1 auto}
+html.phone-forced #expandBtn{display:none !important}
+html.phone-forced .menuBtn{display:grid;width:44px;height:44px;min-height:44px;flex:0 0 44px}
+html.phone-forced .liveclock{flex:0 1 auto;min-width:0}
+html.phone-forced .avatarbtn{flex:0 0 auto}
+html.phone-forced .ws-head{flex-wrap:wrap}
+html.phone-forced .modelwrap{max-width:100%;min-width:0}
+html.phone-forced .modelpill{max-width:100%}
+html.phone-forced .modelpill span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+html.phone-forced .modelmenu{max-width:calc(100vw - 28px)}
+html.phone-forced .msg{gap:9px}
+html.phone-forced .bubble p,html.phone-forced .ai-body,html.phone-forced .ai-body p{font-size:15.5px}
+html.phone-forced .composer{padding:8px 10px calc(8px + env(safe-area-inset-bottom))}
+html.phone-forced .composer-inner{max-width:100%}
+html.phone-forced .composer-top{align-items:center;gap:6px}
+html.phone-forced .composer-top textarea{flex:1 1 auto;min-width:0;font-size:16px}
+html.phone-forced .micbtn,html.phone-forced .sendbtn{width:48px;height:48px;min-height:48px;flex:0 0 48px}
+html.phone-forced .composer-top .cbtn,html.phone-forced .composer-top #attachBtn{width:44px;height:44px;min-height:44px;flex:0 0 44px}
+html.phone-forced .attachmenu{max-width:calc(100vw - 20px)}
+html.phone-forced #sidebar:not(.open){display:none}
+html.phone-forced #enzoPanel:not(.open){display:none}
+html.phone-forced #sidebar.open{animation:drawerInL .28s ease}
+html.phone-forced #enzoPanel.open{animation:drawerInR .28s ease}
+@keyframes drawerInL{from{transform:translateX(-105%)}to{transform:translateX(0)}}
+@keyframes drawerInR{from{transform:translateX(105%)}to{transform:translateX(0)}}

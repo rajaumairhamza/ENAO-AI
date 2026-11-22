@@ -1,0 +1,10 @@
+
+/* v56-universal — Standing Rules list in Settings (piece 09 rows) */
+.enzo-rules-list{margin-top:6px}
+.enzo-rules-row{display:flex;align-items:flex-start;gap:10px;padding:9px 10px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px;background:var(--surface2)}
+.enzo-rules-row .enzo-rules-main{flex:1;min-width:0}
+.enzo-rules-text{font-size:13.5px;font-weight:600;color:var(--ink);word-break:break-word}
+.enzo-rules-meta{font-size:11.5px;color:var(--muted);margin-top:2px}
+.enzo-rules-row.is-replaced{opacity:.55}
+.enzo-rules-delete{flex:none;background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:5px 10px;font-size:12px;font-weight:700;min-height:30px;cursor:pointer}
+.enzo-rules-delete:hover{color:#e5484d;border-color:#e5484d}

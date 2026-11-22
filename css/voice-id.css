@@ -1,0 +1,142 @@
+
+/* ============================================================================
+   ENAO AI master-intel — PIECE 04: voice identification (04-voice-id.css)
+   Styles for the Settings -> Voice & Avatar card built by
+   EnzoVoiceID.enrollmentHTML(). Dark navy design: transparent
+   backgrounds, light borders, no hard-coded white surfaces, so the
+   card blends into the existing settings panes. Zero emojis.
+   ========================================================================== */
+
+.voiceid-card {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  background: transparent;
+}
+
+.voiceid-note {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.voiceid-status {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.voiceid-list {
+  margin: 6px 0 4px;
+}
+
+.voiceid-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 13px;
+}
+
+.voiceid-row:first-child {
+  border-top: none;
+}
+
+.voiceid-name {
+  font-weight: 600;
+}
+
+.voiceid-tag {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 20px;
+  border: 1px solid rgba(45, 212, 191, 0.6);
+  color: #2dd4bf;
+}
+
+.voiceid-meta {
+  margin-left: auto;
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.voiceid-sec {
+  margin-top: 14px;
+}
+
+.voiceid-sec b {
+  display: block;
+  font-size: 13px;
+}
+
+.voiceid-sec span {
+  display: block;
+  font-size: 12px;
+  opacity: 0.8;
+  margin-top: 2px;
+}
+
+.voiceid-phrases {
+  margin-top: 8px;
+}
+
+.voiceid-phrase {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 13px;
+}
+
+.voiceid-phrase:first-child {
+  border-top: none;
+}
+
+.voiceid-phrase-text {
+  flex: 1;
+}
+
+.voiceid-done .voiceid-phrase-text {
+  opacity: 0.75;
+}
+
+.voiceid-phrase .actionbtn[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.voiceid-rec {
+  border-color: #f87171;
+  color: #f87171;
+}
+
+.voiceid-actions {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.voiceid-danger {
+  border-color: rgba(248, 113, 113, 0.6);
+  color: #f87171;
+}
+
+.voiceid-add {
+  margin-top: 8px;
+}
+
+.voiceid-add input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+}
