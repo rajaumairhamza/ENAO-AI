@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<meta name="enao-build" content="v59-live-research-fix">
+<meta name="enao-build" content="v61-deep-triggers-4lang">
+<meta name="enao-build" content="v60-universal-scope">
 <meta name="enao-build" content="v57-universal-intel">
 <meta name="enao-build" content="v55-master-intel">
 <meta name="enao-build" content="v56-universal">
@@ -597,10 +598,19 @@
  *   NO topic names appear anywhere in this file (Bitcoin lesson).
  *
  * PUBLIC API (pure functions, no DOM, no network, no dependencies):
- *   detectLanguage(text) -> 'urdu' | 'hindi' | 'roman' | 'en'
+ *   detectLanguage(text) -> 'urdu' | 'punjabi' | 'hindi' | 'roman' | 'en'
  *   isResearchOrder(text, context?)
  *     -> { research:boolean, reason:string, topic:string|null,
- *          lang:string, needsTopic:boolean, matched:string|null }
+ *          lang:string, needsTopic:boolean, matched:string|null,
+ *          source:string|null, sources:string[], deep?:boolean }
+ *   detectSource(text) -> { source:string|null, sources:string[] }
+ *     First named place in the message (canonical), or null = the
+ *     default: the whole internet + relevant sources. A name counts
+ *     only when named AS the place to search from (se/par/pe/from/
+ *     on/via/... beside it); a bare mention that is the TOPIC
+ *     ("YouTube kya hai") returns null. Priority: explicit platform
+ *     > google > social media > news > internet > video; two names
+ *     in one class -> the first named wins.
  *     context is optional: { currentTopic } or { state:{ currentTopic } }.
  *   clarifyQuestion(text, reason, lang) -> string (user's language)
  *   shouldClarify(text, context?)
@@ -636,6 +646,34 @@
  * STYLE: plain ES5, var + function declarations, no modules, matching
  * the existing artifact style. Zero emojis.
  * ========================================================================== */
+/* v61 addendum (22 Nov 2026, Raja ~4:55-4:57 PM PKT):
+ * - Four-language deep-research triggers (R13-R16): EN / Urdu script /
+ *   Punjabi Shahmukhi / Roman Urdu. Any of these in Raja's sentence is a
+ *   DEEP research order: research starts at once, never a clarifying
+ *   question. The research flow asks for the topic itself when none is
+ *   named. The trigger words are never the topic: they are stripped
+ *   from the extracted topic, and the topic comes from the rest of the
+ *   sentence.
+ * - Source/place extraction (detectSource): the sentence's place is
+ *   read together with the trigger (YouTube se / Google se / internet
+ *   par / social media se / ...). A name counts only as the PLACE
+ *   (se/par/pe/from/on/via/... beside it); a bare mention that is the
+ *   TOPIC returns null. result.source is the highest-priority named
+ *   place (explicit platform > google > social > news > internet >
+ *   video; first named wins inside one class), result.sources lists
+ *   all named places in position order, and null means the default:
+ *   the whole internet + relevant sources. Bare 'video' is the source
+ *   only when no place was named at all.
+ * - Bare-find exclusion (Raja's decision, 22 Nov ~4:57 PM): bare
+ *   "Find the best laptops" (English find + object, no research word)
+ *   is NOT research - a normal answer. Only explicit research orders
+ *   research. R10 keeps "find ... karo" and "look up"; bare "find out
+ *   ... about ..." is NOT research (Raja, 22 Nov 2026): it is a bare
+ *   find, like "find the best X". This aligns the
+ *   mirror with the artifact's intIsResearch and the backend
+ *   classifier, neither of which ever treated bare find as research.
+ * - Punjabi Shahmukhi is a fourth detected language ('punjabi').
+ */
 (function (global) {
 'use strict';
 
@@ -694,11 +732,14 @@ function hasDevanagari(text) { return /[\u0900-\u097F]/.test(String(text || ''))
    for a Roman Urdu order. Any ONE Roman-Urdu marker word is enough: these
    words do not occur in plain English text. (Pure English content words
    such as "websites" or "SEO" never cancel a Roman marker.) */
-var ROMAN_MARKER_RE = /\b(kya|kia|hai|hain|karo|kar|karke|batao|samjhao|kaam|kidhar|kahan|kab|tum|aap|mera|meri|mujhe|mujhay|ye|yeh|wo|woh|matlab|baare|bare|mein|nahi|nahin|abhi|aur|bhi|zara|theek|chahiye|dhoond\w*|dhund\w*|talaash|talash|khoj|dakho|dikha\w*|dekh\w*|nikaal\w*|nikal\w*|kasy|kaise|kaisy|karty|karte|par|pe|ko|ki|ke|ka|tha|thi|wala|wali|kahan|kidhar|kisko|kaunsa|konsa|kyun|kyu|kaisa|aj|kal|bohat|acha|achi|jaldi|bhai|yaar|shodh|tehqeeq|tahqeeq|jaanch|taftish|naye|naya|sab|acha|bata)\b/i;
+var ROMAN_MARKER_RE = /\b(kya|kia|hai|hain|karo|kar|karke|batao|samjhao|kaam|kidhar|kahan|kab|tum|aap|mera|meri|mujhe|mujhay|ye|yeh|wo|woh|matlab|baare|bare|mein|nahi|nahin|abhi|aur|bhi|zara|theek|chahiye|dhoond\w*|dhund\w*|talaash|talash|khoj|dakho|dikha\w*|dekh\w*|nikaal\w*|nikal\w*|kasy|kaise|kaisy|karty|karte|par|pe|ko|ki|ke|ka|tha|thi|wala|wali|kahan|kidhar|kisko|kaunsa|konsa|kyun|kyu|kaisa|aj|kal|bohat|acha|achi|jaldi|bhai|yaar|shodh|tehqeeq|tahqeeq|jaanch|taftish|naye|naya|sab|acha|bata|labho|vekho|tusi|tussi|se|seekho|sikho|faida|uthao|nazarandaz)\b/i;
 
 function detectLanguage(text) {
   var raw = String(text || '');
-  if (hasUrdu(raw)) return 'urdu';
+  if (hasUrdu(raw)) {
+    if (/لبھو|ویکھو|چھڈو|چکو|وکھ|توں|تسی|تواڈا|ایس\s+دے|پاسے|(?:^|\s)(وچ|نال|دا|وی|تے)(?:\s|$|[؟۔،؛!?.])/.test(raw)) return 'punjabi';
+    return 'urdu';
+  }
   if (hasDevanagari(raw)) return 'hindi';
   if (ROMAN_MARKER_RE.test(raw)) return 'roman';
   return 'en';
@@ -714,12 +755,12 @@ function detectLanguage(text) {
 var DEMO_W = { wo: 1, woh: 1, ye: 1, yeh: 1, us: 1, uss: 1, iss: 1, un: 1,
   wohi: 1, yehi: 1, usi: 1, isi: 1, unhi: 1, inhi: 1, that: 1, this: 1,
   it: 1, those: 1, these: 1, them: 1, same: 1, wala: 1, wali: 1, wale: 1,
-  waala: 1, cheez: 1, thing: 1, stuff: 1, kaam: 1, kam: 1, kuch: 1,
+  waala: 1, cheez: 1, thing: 1, stuff: 1, idea: 1, kaam: 1, kam: 1, kuch: 1,
   something: 1, anything: 1, doosra: 1, dusra: 1, doosri: 1, pehla: 1,
   pahla: 1, pehli: 1, another: 1, other: 1, pichla: 1, pichli: 1,
   agla: 1, agli: 1, jo: 1, is: 1, topic: 1, subject: 1, baat: 1,
   mawzu: 1, mozuh: 1, dono: 1,
-  'یہ': 1, 'وہ': 1, 'اس': 1, 'اسی': 1, 'وہی': 1, 'یہی': 1, 'ان': 1,
+  'یہ': 1, 'وہ': 1, 'اس': 1, 'اسی': 1, 'وہی': 1, 'یہی': 1, 'ایس': 1, 'ان': 1,
   'کام': 1, 'چیز': 1, 'کچھ': 1, 'والا': 1, 'والی': 1, 'دوسرا': 1,
   'پہلا': 1, 'نمبر': 1, 'موضوع': 1, 'بات': 1,
   'यह': 1, 'वह': 1, 'इस': 1, 'उस': 1, 'काम': 1, 'चीज़': 1, 'बात': 1 };
@@ -737,6 +778,9 @@ var VERB_W = { kar: 1, karo: 1, kr: 1, kro: 1, karna: 1, krna: 1, kardo: 1,
   bola: 1, kaha: 1, dekho: 1, dekh: 1, dekhao: 1, dakho: 1,
   dhoond: 1, dhoondh: 1, dhund: 1, talaash: 1, talash: 1, khoj: 1,
   research: 1, investigate: 1, investigates: 1, investigated: 1,
+  explore: 1, browse: 1, discover: 1, analyze: 1, analyse: 1,
+  investigation: 1, comparison: 1, seekho: 1, sikho: 1, labho: 1, vekho: 1,
+  learn: 1, study: 1, gather: 1, faida: 1, uthao: 1, nazarandaz: 1,
   search: 1, google: 1, find: 1, check: 1, verify: 1, compare: 1,
   tehqeeq: 1, tahqeeq: 1, shodh: 1, jaanch: 1, taftish: 1,
   chahiye: 1, milega: 1, milegi: 1, milenge: 1, milta: 1, milti: 1,
@@ -745,30 +789,231 @@ var VERB_W = { kar: 1, karo: 1, kr: 1, kro: 1, karna: 1, krna: 1, kardo: 1,
   'بنا': 1, 'بناؤ': 1, 'بتاؤ': 1, 'بتا': 1, 'لگا': 1, 'لگاؤ': 1,
   'دیکھو': 1, 'دکھاؤ': 1, 'ڈھونڈ': 1, 'تلاش': 1, 'ریسرچ': 1,
   'تحقیق': 1, 'گوگل': 1, 'چاہیے': 1, 'تیار': 1, 'کرو': 1, 'کر': 1,
-  'کے': 1, 'کرکے': 1,
+  'کے': 1, 'کرکے': 1, 'سرچ': 1, 'سیکھو': 1, 'جانچ': 1, 'دریافت': 1,
+  'موازنہ': 1, 'فائدہ': 1, 'اٹھاؤ': 1, 'لبھو': 1, 'ویکھو': 1,
+  'سکھو': 1, 'چکو': 1, 'چھڈو': 1,
   'करो': 1, 'कर': 1, 'दो': 1, 'ढूंढ': 1, 'खोज': 1, 'शोध': 1 };
-var FILLER_W = { please: 1, plz: 1, zara: 1, bhai: 1, yaar: 1, ab: 1,
+var FILLER_W = { please: 1, plz: 1, zara: 1, bhai: 1, yaar: 1, ab: 1, let: 1, lets: 1,
   abhi: 1, jaldi: 1, mera: 1, meri: 1, mere: 1, mujhe: 1, mujhay: 1,
   aap: 1, tum: 1, tu: 1, ko: 1, se: 1, ka: 1, ki: 1, ke: 1, hai: 1,
   hain: 1, tha: 1, thi: 1, na: 1, bhi: 1, to: 1, aur: 1, and: 1,
-  the: 1, a: 1, an: 1, my: 1, me: 1, you: 1, just: 1, now: 1, right: 1,
+  the: 1, koi: 1, ya: 1, a: 1, an: 1, my: 1, me: 1, you: 1, just: 1, now: 1, right: 1,
   for: 1, of: 1, on: 1, in: 1, up: 1, out: 1, is: 1, are: 1, was: 1,
   were: 1, kya: 1, kia: 1, kyu: 1, kyun: 1, kab: 1, kahan: 1,
   kidhar: 1, kaise: 1, kaisa: 1, konsa: 1, kaunsa: 1, kaun: 1,
   who: 1, what: 1, when: 1, where: 1, why: 1, how: 1, which: 1,
-  par: 1, per: 1, pe: 1, mein: 1, baare: 1, bare: 1, about: 1,
+  par: 1, per: 1, pe: 1, mein: 1, baare: 1, bare: 1, about: 1, mat: 1,
   'پر': 1, 'سے': 1, 'کو': 1, 'کا': 1, 'کی': 1, 'کے': 1, 'ہے': 1,
   'ہیں': 1, 'میں': 1, 'بارے': 1, 'مجھے': 1, 'میرا': 1, 'میری': 1,
-  'آپ': 1, 'کیسے': 1, 'کرتے': 1, 'ہیں': 1, 'یہ': 1, 'وہ': 1,
+  'آپ': 1, 'کیسے': 1, 'کرتے': 1, 'ہیں': 1, 'یہ': 1, 'وہ': 1, 'مت': 1, 'کوئی': 1, 'یا': 1, 'بھی': 1, 'نال': 1, 'وچ': 1, 'تے': 1, 'وی': 1, 'نہ': 1,
   'पर': 1, 'से': 1, 'को': 1, 'का': 1, 'की': 1, 'के': 1, 'में': 1, 'है': 1 };
 var MODIFIER_W = { deep: 1, detailed: 1, latest: 1, recent: 1, newest: 1,
-  taaza: 1, taza: 1, 'تفصیلی': 1, 'تازہ': 1, 'تازہ ترین': 1 };
+  taaza: 1, taza: 1, 'تفصیلی': 1, 'تازہ': 1, 'تازہ ترین': 1,
+  thoroughly: 1, deeply: 1, continuously: 1, everything: 1, every: 1,
+  all: 1, possible: 1, possibilities: 1, possibility: 1,
+  worldwide: 1, related: 1, available: 1, different: 1, various: 1,
+  entire: 1, whole: 1, complete: 1, angle: 1, angles: 1, aspect: 1,
+  potential: 1, world: 1, around: 1,
+  tamam: 1, har: 1, pehlu: 1, duniya: 1, bhar: 1, mojood: 1, mumkin: 1,
+  'مکمل': 1, 'تمام': 1, 'ہر': 1, 'ممکن': 1,
+  'دنیا': 1, 'بھر': 1, 'موجود': 1, 'متعلق': 1, 'پہلو': 1, 'پاسے': 1,
+  'پوری': 1, 'حل': 1, 'علم': 1, 'دستیاب': 1, 'ذرائع': 1, 'حاصل': 1 };
+
+/* SOURCE_W: place/platform words. A place is not a topic: these are
+   stripped by objectVerdict like verbs. 'news' is deliberately NOT
+   here - news is a subject as often as a place ("latest news" is a
+   topic). 'web' is deliberately NOT here either - "web development"
+   is a topic, and the default search already is the whole web.
+   Phrases (social media, فیس بک, ...) are handled by regex in
+   detectSource / extractTopic, not by this token set. */
+var SOURCE_W = { youtube: 1, yt: 1, google: 1, instagram: 1, facebook: 1,
+  fb: 1, tiktok: 1, twitter: 1, reddit: 1, linkedin: 1, pinterest: 1,
+  snapchat: 1, telegram: 1, threads: 1, vimeo: 1, dailymotion: 1,
+  wikipedia: 1, wiki: 1, internet: 1, online: 1, x: 1,
+  'یوٹیوب': 1, 'گوگل': 1, 'انٹرنیٹ': 1, 'انسٹاگرام': 1, 'فیسبک': 1,
+  'ٹکٹاک': 1, 'ٹویٹر': 1, 'ایکس': 1, 'ریڈٹ': 1, 'پنٹرسٹ': 1,
+  'تھریڈز': 1, 'ویمیو': 1, 'وکیپیڈیا': 1 };
+
+/* Source/place patterns, in canonical form. A 'free' pattern is a
+   place by itself (bare 'online', 'duniya bhar'); a 'video' pattern
+   is the fallback source, counted only when no place was named.
+   Every other pattern counts only when named AS the place to search
+   from — see placeMarkerNear below. detectSource returns the
+   highest-priority named place (source) plus ALL named places in
+   position order (sources). null means the default: the whole
+   internet + relevant sources. */
+var SOURCE_PATTERNS = [
+  { re: /social\s+media/gi, canon: 'social-media' },
+  { re: /\byoutube\b/gi, canon: 'youtube' },
+  { re: /\byt\b/gi, canon: 'youtube' },
+  { re: /\bgoogle\b/gi, canon: 'google' },
+  { re: /\binstagram\b/gi, canon: 'instagram' },
+  { re: /\bfacebook\b/gi, canon: 'facebook' },
+  { re: /\bfb\b/gi, canon: 'facebook' },
+  { re: /\btiktok\b/gi, canon: 'tiktok' },
+  { re: /\btwitter\b/gi, canon: 'x' },
+  { re: /\bx\b/gi, canon: 'x' },
+  { re: /\breddit\b/gi, canon: 'reddit' },
+  { re: /\blinkedin\b/gi, canon: 'linkedin' },
+  { re: /\bpinterest\b/gi, canon: 'pinterest' },
+  { re: /\bsnapchat\b/gi, canon: 'snapchat' },
+  { re: /\btelegram\b/gi, canon: 'telegram' },
+  { re: /\bthreads\b/gi, canon: 'threads' },
+  { re: /\bvimeo\b/gi, canon: 'vimeo' },
+  { re: /\bdailymotion\b/gi, canon: 'dailymotion' },
+  { re: /\bwikipedia\b/gi, canon: 'wikipedia' },
+  { re: /\bwiki\b/gi, canon: 'wikipedia' },
+  { re: /\binternet\b/gi, canon: 'internet', free: true },
+  { re: /\bonline\b/gi, canon: 'internet', free: true },
+  { re: /\bweb\b/gi, canon: 'internet' },
+  { re: /\bworldwide\b/gi, canon: 'internet', free: true },
+  { re: /duniya\s+bhar/gi, canon: 'internet', free: true },
+  { re: /\bnews\b/gi, canon: 'news' },
+  { re: /\bvideos?\b/gi, canon: 'video', video: true },
+  { re: /سوشل\s+میڈیا/g, canon: 'social-media' },
+  { re: /یوٹیوب/g, canon: 'youtube' },
+  { re: /گوگل/g, canon: 'google' },
+  { re: /انسٹاگرام/g, canon: 'instagram' },
+  { re: /فیس\s+بک|فیسبک/g, canon: 'facebook' },
+  { re: /ٹک\s+ٹاک|ٹکٹاک/g, canon: 'tiktok' },
+  { re: /ٹویٹر|ایکس/g, canon: 'x' },
+  { re: /ریڈٹ/g, canon: 'reddit' },
+  { re: /لنکڈ\s+ان/g, canon: 'linkedin' },
+  { re: /پنٹرسٹ/g, canon: 'pinterest' },
+  { re: /سنیپ\s+چیٹ/g, canon: 'snapchat' },
+  { re: /ٹیلی\s+گرام/g, canon: 'telegram' },
+  { re: /تھریڈز/g, canon: 'threads' },
+  { re: /ویمیو/g, canon: 'vimeo' },
+  { re: /ڈیلی\s+موشن/g, canon: 'dailymotion' },
+  { re: /وکیپیڈیا/g, canon: 'wikipedia' },
+  { re: /انٹرنیٹ/g, canon: 'internet', free: true },
+  { re: /آن\s*لائن/g, canon: 'internet', free: true },
+  { re: /دنیا\s*بھر/g, canon: 'internet', free: true },
+  { re: /نیوز|خبریں|خبروں/g, canon: 'news' },
+  { re: /ویڈیو/g, canon: 'video', video: true }
+];
+
+/* Place markers. A named place counts only when named AS the place to
+   search from. Markers AFTER the name: se / par / pe (Roman 'per' is
+   folded to 'par'), from / via / through, Urdu سے / پر / پے,
+   Punjabi توں / تے / وچ (Roman Punjabi ton / toon / te). Markers
+   BEFORE the name: from / on / via / through / in / at, allowing
+   'the' between marker and name ("from the internet"). Two extras:
+   'google' followed by karo/kar/do names Google as a verb, and a
+   platform followed by video/videos names it as the source of those
+   videos — but only in an order (a search/show verb in the sentence),
+   never in a definition question. */
+var PLACE_AFTER = { se: 1, par: 1, pe: 1, from: 1, via: 1, through: 1,
+  'سے': 1, 'پر': 1, 'پے': 1, 'توں': 1, 'تے': 1, 'وچ': 1,
+  ton: 1, toon: 1, te: 1 };
+var PLACE_BEFORE = { from: 1, on: 1, via: 1, through: 1, in: 1, at: 1 };
+var VIDEO_AFTER_W = { video: 1, videos: 1, 'ویڈیو': 1 };
+var ORDER_VERB_RE = /\b(dhoond\w*|dhund\w*|talaash|talash|khoj|search|find|show|play|chalao|chala|dikhao|dikha|dekho|dekh|nikal\w*|nikaal\w*|chahiye|batao|seekho|labho|vekho|research|google)\b/i;
+var ORDER_VERB_URDU_RE = /ڈھونڈ|دکھاؤ|دیکھو|تلاش|چاہیے|سیکھو|لبھو|ویکھو|چلاؤ|بتاؤ|ریسرچ|تحقیق/;
+
+function cleanTok(tok) {
+  return String(tok).toLowerCase()
+    .replace(/^[?!.,;:'"()\[\]{}_\/\\\-–—~…؟۔،؛]+/g, '')
+    .replace(/[?!.,;:'"()\[\]{}_\/\\\-–—~…؟۔،؛]+$/g, '');
+}
+function tokensAfter(text, end) {
+  var parts = text.slice(end, end + 40).split(/\s+/), out = [], i, c;
+  for (i = 0; i < parts.length; i++) {
+    c = cleanTok(parts[i]);
+    if (c) out.push(c);
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+function tokensBefore(text, start) {
+  var parts = text.slice(Math.max(0, start - 28), start).split(/\s+/), out = [], i, c;
+  for (i = parts.length - 1; i >= 0; i--) {
+    c = cleanTok(parts[i]);
+    if (c) out.unshift(c);
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+function hasOrderVerb(text) {
+  return ORDER_VERB_RE.test(text) || ORDER_VERB_URDU_RE.test(text);
+}
+function placeMarkerNear(text, start, end, canon) {
+  var after = tokensAfter(text, end), before = tokensBefore(text, start), i;
+  for (i = 0; i < after.length; i++) if (PLACE_AFTER[after[i]]) return true;
+  for (i = 0; i < before.length; i++) {
+    if (before[i] !== 'the' && PLACE_BEFORE[before[i]]) return true;
+  }
+  if (canon === 'google' && after.length &&
+      (after[0] === 'karo' || after[0] === 'kar' || after[0] === 'do' || after[0] === 'karke')) return true;
+  return false;
+}
+
+/* Priority: an explicitly named platform beats google, google beats
+   generic social media, social beats news, news beats the internet,
+   and bare video is last. Two names in one class -> first named wins. */
+var PLATFORM_CANON = { youtube: 1, instagram: 1, facebook: 1, tiktok: 1,
+  x: 1, reddit: 1, linkedin: 1, pinterest: 1, snapchat: 1, telegram: 1,
+  threads: 1, vimeo: 1, dailymotion: 1, wikipedia: 1 };
+function sourceRank(canon) {
+  if (PLATFORM_CANON[canon]) return 0;
+  if (canon === 'google') return 1;
+  if (canon === 'social-media') return 2;
+  if (canon === 'news') return 3;
+  if (canon === 'internet') return 4;
+  return 5;
+}
+
+function detectSource(text) {
+  var raw = String(text || '');
+  /* Roman 'per' is the same marker as 'par'; folding it here keeps
+     every index intact (same length), so match positions still refer
+     to the original text. */
+  var folded = raw.replace(/\bper\b/gi, 'par');
+  var found = [], i, m, re, pat;
+  for (i = 0; i < SOURCE_PATTERNS.length; i++) {
+    pat = SOURCE_PATTERNS[i];
+    re = pat.re;
+    re.lastIndex = 0;
+    while ((m = re.exec(folded)) !== null) {
+      found.push({ index: m.index, end: m.index + m[0].length,
+        canon: pat.canon, free: !!pat.free, video: !!pat.video });
+      if (m[0].length === 0) break;
+    }
+  }
+  found.sort(function (a, b) { return a.index - b.index; });
+  var orderVerb = hasOrderVerb(folded);
+  var kept = [], f, after;
+  for (i = 0; i < found.length; i++) {
+    f = found[i];
+    if (f.free) { kept.push(f); continue; }
+    if (f.video) continue;
+    if (placeMarkerNear(folded, f.index, f.end, f.canon)) { kept.push(f); continue; }
+    if (PLATFORM_CANON[f.canon] || f.canon === 'google') {
+      after = tokensAfter(folded, f.end);
+      if (after.length && VIDEO_AFTER_W[after[0]] && orderVerb) kept.push(f);
+    }
+  }
+  /* Bare video is the source only when no place was named at all. */
+  if (!kept.length) {
+    for (i = 0; i < found.length; i++) {
+      f = found[i];
+      if (!f.video) continue;
+      if (placeMarkerNear(folded, f.index, f.end, f.canon) || orderVerb) { kept.push(f); break; }
+    }
+  }
+  var sources = [], seen = {}, best = null, bestRank = 99;
+  for (i = 0; i < kept.length; i++) {
+    if (!seen[kept[i].canon]) { seen[kept[i].canon] = true; sources.push(kept[i].canon); }
+    if (sourceRank(kept[i].canon) < bestRank) { bestRank = sourceRank(kept[i].canon); best = kept[i].canon; }
+  }
+  return { source: best, sources: sources };
+}
 
 /* Information nouns: the "chahiye" (want) family is a research order
    only when the wanted thing is information (websites, sources, videos,
    a report). "mujhe paani chahiye" (I want water) is not research. */
-var INFO_NOUN_RE = /\b(websites?|web\s*sites?|sites?|sources?|references?|papers?|videos?|report|articles?|links?|info|information|data|list|names?|numbers?|prices?|news|details?|detail|tafseel|maloomat)\b/;
-var INFO_NOUN_URDU_RE = /ویب\s*سائٹس?|ذرائع|ویڈیو|رپورٹ|مضمون|لنک|معلومات|فہرست/;
+var INFO_NOUN_RE = /\b(websites?|web\s*sites?|sites?|sources?|references?|papers?|videos?|report|articles?|links?|info|information|knowledge|data|list|names?|numbers?|prices?|news|details?|detail|tafseel|maloomat)\b/;
+var INFO_NOUN_URDU_RE = /ویب\s*سائٹس?|ذرائع|ویڈیو|رپورٹ|مضمون|لنک|معلومات|فہرست|علم/;
 
 /* ---------- object verdict ----------
    After stripping demo / verb / filler / modifier words, what is left?
@@ -788,7 +1033,7 @@ function objectVerdict(normed, ctxTopic) {
   for (i = 0; i < toks.length; i++) {
     w = toks[i];
     if (DEMO_W[w]) { hasDemo = true; continue; }
-    if (VERB_W[w] || FILLER_W[w] || MODIFIER_W[w]) continue;
+    if (VERB_W[w] || FILLER_W[w] || MODIFIER_W[w] || SOURCE_W[w]) continue;
     if (w.length < 2 && !/^\d+$/.test(w)) continue;
     content.push(w);
   }
@@ -815,20 +1060,49 @@ function orderVerdict(normed, ctxTopic, reason, matched) {
   return { research: true, reason: reason, topic: null, needsTopic: true, matched: matched, _content: [] };
 }
 
+/* A deep-research order (R13-R16) resolves WITHOUT the demo rule:
+   even a pronoun-only or bare object is research - the research flow
+   asks for the missing topic itself. That is the 22 Nov 2026 rule for
+   these explicit phrases ("Search for it", "research it thoroughly"):
+   they never clarify, never go normal. */
+function deepOrderVerdict(normed, ctxTopic, reason, matched) {
+  var v = objectVerdict(normed, ctxTopic);
+  if (v.kind === 'content') {
+    return { research: true, reason: reason, topic: null, needsTopic: false, matched: matched, _content: v.content, _deep: true };
+  }
+  return { research: true, reason: reason, topic: null, needsTopic: true, matched: matched, _content: [], _deep: true };
+}
+
 /* ---------- topic extraction (best effort, advisory only) ---------- */
 function extractTopic(text) {
   var t = ' ' + foldDigits(String(text || '')) + ' ';
+  /* Topic-less negative orders name no topic: strip the phrase so
+     the topic comes back null and the research flow asks for it. */
+  t = t.replace(/\bdon'?t\s+leave\s+any\s+(possibility|possibilities)\s+unexplored\b/gi, ' ');
+  t = t.replace(/\bleave\s+no\s+stone\s+unturned\b/gi, ' ');
   t = t.replace(/\b(within|in|under)\s+\d{1,4}\s*(minutes?|mins?|minute)\b/gi, ' ');
   t = t.replace(/\b\d{1,4}\s*(minute|mint|min)\s*(mein|main|ke\s+andar)\b/gi, ' ');
   t = t.replace(/\b(please|braah|baraah)\b/gi, ' ');
   t = t.replace(/\b(deep\s+)?research\s+(on|about|par|ke\s+baare\s+mein)\s+/gi, ' ');
   t = t.replace(/^\s*(is\s+par|us\s+par|is\s+ke\s+baare\s+mein|اس\s+پر|اس\s+کے\s+بارے\s+میں)\s*(research|ریسرچ|تحقیق)\s*(karo|kar|karke|kar\s+ke\s+do|کرو|کر|کریں|کر\s*کے)?\s*/gi, ' ');
-  t = t.replace(/^\s*(research|investigate|investigation|find|search|explore|look\s+up|google|dhoond\w*|dhund\w*|khoj|shodh|tehqeeq|tahqeeq|jaanch|taftish|talaash|talash|ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|शोध|खोज|ढूंढ)\s*(karo|kar|karke|do|ke\s+do|kar\s+ke\s+do|کرو|کر|کریں|کر\s*کے|دو|کے|بتاؤ|دے|لو|करो|कर|करें|दो)?\s*/gi, ' ');
+  t = t.replace(/^\s*(research|investigate|investigation|find|search|explore|look\s+up|google|dhoond\w*|dhund\w*|khoj|shodh|tehqeeq|tahqeeq|jaanch|taftish|talaash|talash|ریسرچ|تحقیق|ڈھونڈ\S*|تلاش|گوگل|शोध|खोज|ढूंढ)\s*(karo|kar|karke|do|ke\s+do|kar\s+ke\s+do|کرو|کر|کریں|کر\s*کے|دو|کے|بتاؤ|دے|لو|करो|कर|करें|दो)?\s*/gi, ' ');
   t = t.replace(/\b(per|par|pe)\s+(dakho|dikhao|dekho|dekh|دیکھو|دکھاؤ)\b/gi, ' ');
   t = t.replace(/\b(kasy|kaise|kaisy|kesay|kese)\s+(karty|karte)\s+(han|hain)\b/gi, ' ');
   t = t.replace(/\b(kaise|kaisy)\s+(karte|karti)\s+(hain|hai)\b/gi, ' ');
   t = t.replace(/\s+(karo|kar|do|ke\s+do|kar\s+ke\s+do|karke|کرو|کر|دو|کر\s*کے)\s*$/gi, ' ');
   t = t.replace(/\s+(batao|batayein|dikhao|dekho|دیکھو|دکھاؤ|بتاؤ)\s*$/gi, ' ');
+  /* v61 strip pass: trigger words, quantifiers and source words are
+     never the topic. Bare 'search' / 'find' are NOT stripped here:
+     they are nouns as often as verbs ("search engines", "find the
+     best...") and the object verdict rejects a leftover verb. Source
+     words ARE stripped: the source is captured separately by
+     detectSource, so the topic keeps only the subject. */
+  t = t.replace(/\b(dhoond\w*|dhund\w*|talaash|talash|khoj|research|researching|investigat\w*|explore\w*|brows\w*|discover\w*|analy[sz]\w*|learn\w*|study\w*|gather\w*|seekho|sikho|labho|vekho|check|compare|verify|dikhao|dikha|dekho|dekh|nikaal\w*|nikal\w*|tehqeeq|tahqeeq|shodh|jaanch|taftish|chahiye|karo|kar|karke|do|ke|de|dena|batao|investigation|comparison|websites?|sources?|resources?|find|thoroughly|deeply|continuously|everything|every|all|possible|possibilities|possibility|options?|solutions?|information|knowledge|worldwide|related|available|different|various|entire|whole|complete|faida|uthao|nazarandaz|mat|angles?|aspect|about|for|on|social\s+media|around|search\s+(karo|kar|karke|do|ke\s+do)|google\s+(karo|kar|karke|do)|find\s+(karo|kar|karke|do|ke\s+do)|youtube|yt|google|instagram|facebook|fb|tiktok|twitter|reddit|linkedin|pinterest|snapchat|telegram|threads|vimeo|dailymotion|wikipedia|wiki|internet|online|x)\b/gi, ' ');
+  t = t.replace(/(سرچ|سیکھو|جانچ|دریافت|موازنہ|فائدہ|اٹھاؤ|نظر|انداز|لبھو|ویکھو|سکھو|چکو|چھڈو|مکمل|تمام|ہر|ممکن\S*|معلومات|دنیا|بھر|موجود|متعلق|پہلو|پاسے|مختلف|وکھ|سارے|امکانات|امکان|ویب\s*سائٹس?|ڈھونڈ\S*|تلاش|تحقیق|ریسرچ|چاہیے|دیکھو|دکھاؤ|کرو|کر|دو|دے|دینا|بتاؤ|یوٹیوب|گوگل|انٹرنیٹ|انسٹاگرام|فیسبک|فیس\s+بک|ٹک\s+ٹاک|ٹکٹاک|ٹویٹر|ایکس|ریڈٹ|لنکڈ\s+ان|پنٹرسٹ|سنیپ\s+چیٹ|ٹیلی\s+گرام|تھریڈز|ویمیو|ڈیلی\s+موشن|وکیپیڈیا|سوشل\s+میڈیا|آن\s+لائن)/g, ' ');
+  t = t.replace(/^\s*(?:(the|a|an|for|from|in|about|on|par|per|pe|se)\s+)+/gi, ' ');
+  t = t.replace(/^\s*(?:(سے|پر|پے|کا|کی|کے|کو|میں|بارے|توں|تے|وچ|دے|نال|دی|دا)\s+)+/g, ' ');
+  t = t.replace(/(\s+(se|par|pe|per|ka|ki|ke|ko|mein|main|about|on|from|for|of))+\s*$/gi, ' ');
+  t = t.replace(/(\s+(سے|پر|پے|کا|کی|کے|کو|میں|بارے|توں|تے|وچ|دے|نال|دی|دا))+\s*$/g, ' ');
   t = trim(t.replace(/[?!.,;:'"()\[\]{}]+/g, ' ').replace(/\s+/g, ' '));
   if (!t) return null;
   if (/^(it|that|this|these|those|them|ye|yeh|wo|woh|us|is|isi|usi)$/i.test(t)) return null;
@@ -854,7 +1128,8 @@ function isDefinitionOfResearch(text, normed) {
    definition-of-research guard (e.g. "research ka matlab kya hai,
    dhoond ke do" still orders a search). */
 function hasIndependentOrder(normed, raw) {
-  if (/\b(dhoond\w*|dhund\w*|talaash|talash|khoj|search|google|nikal\w*|nikaal\w*|compare|verify|check)\b/.test(normed)) return true;
+  if (/\b(dhoond\w*|dhund\w*|talaash|talash|khoj|search|google|nikal\w*|nikaal\w*|compare|verify|check|explore\w*|brows\w*|discover\w*|analy[sz]\w*|learn\w*|study|gather|seekho|sikho|labho|vekho)\b/.test(normed)) return true;
+  if (/سرچ|سیکھو|جانچ|دریافت|موازنہ|لبھو|ویکھو|سکھو/.test(raw)) return true;
   if (/\b(dekho|dekh|dikhao|dikha|dekhna|dekhein)\b/.test(normed)) return true;
   if (/\d{1,4}\s*(sources?|websites?|sites?|references?|papers?)\b/.test(normed)) return true;
   if (/ڈھونڈ|تلاش|گوگل|دیکھو|دکھاؤ|ریسرچ\s*(کرو|کر)/.test(raw)) return true;
@@ -976,13 +1251,14 @@ function isResearchOrder(text, context) {
   var n = normed;
   var folded = foldDigits(raw);
   var ctxTopic = contextTopic(context);
-  var none = { research: false, reason: 'no-research-signal', topic: null, lang: lang, needsTopic: false, matched: null };
+  var src = detectSource(raw);
+  var none = { research: false, reason: 'no-research-signal', topic: null, lang: lang, needsTopic: false, matched: null, source: src.source, sources: src.sources };
   if (!trim(raw)) return none;
 
   /* Guard: a question ABOUT the word research is a definition, unless
      an independent order verb is also present. */
   if (isDefinitionOfResearch(raw, n) && !hasIndependentOrder(n, raw)) {
-    return { research: false, reason: 'definition-of-research', topic: null, lang: lang, needsTopic: false, matched: null };
+    return { research: false, reason: 'definition-of-research', topic: null, lang: lang, needsTopic: false, matched: null, source: src.source, sources: src.sources };
   }
 
   var v;
@@ -990,9 +1266,9 @@ function isResearchOrder(text, context) {
      "dhoond") names nothing to investigate: NOT research. The gate may
      ask which topic. This guard must run before the verb families, or
      the bare-imperative rule below would claim the lone word. */
-  if (/^(research|search|tehqeeq|tahqeeq|shodh|khoj|dhoond|dhund|talaash|talash|google|find|check|verify|compare)\.?$/.test(trim(n)) ||
-      /^(ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|शोध|खोज|ढूंढ)$/.test(trim(raw))) {
-    return { research: false, reason: 'research-word-no-topic', topic: null, lang: lang, needsTopic: false, matched: null };
+  if (/^(research|search|tehqeeq|tahqeeq|shodh|khoj|dhoond|dhund|talaash|talash|google|find|check|verify|compare|explore|browse|discover|analy[sz]e|learn|study|gather|seekho|sikho|labho|vekho)\.?$/.test(trim(n)) ||
+      /^(ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|سرچ|سیکھو|جانچ|دریافت|موازنہ|لبھو|ویکھو|سکھو|शोध|खोज|ढूंढ)$/.test(trim(raw))) {
+    return { research: false, reason: 'research-word-no-topic', topic: null, lang: lang, needsTopic: false, matched: null, source: src.source, sources: src.sources };
   }
   /* R1. Source count on its own ("100 websites", "50 authentic
      sources", "۱۰۰ ویب سائٹس"). The screenshot order fires here. */
@@ -1014,7 +1290,101 @@ function isResearchOrder(text, context) {
      matches the backend classifier, where step 6b (source count) still
      runs after the mirror guard. */
   if (isDefinition(raw, n)) {
-    return { research: false, reason: 'definition-question', topic: null, lang: lang, needsTopic: false, matched: null };
+    return { research: false, reason: 'definition-question', topic: null, lang: lang, needsTopic: false, matched: null, source: src.source, sources: src.sources };
+  }
+
+  /* "What is the best ..." is a recommendation question, never a
+     deep-research order - it asks for the best way/thing, not for
+     research. The deep families below skip it; the old families
+     still run. */
+  var bestQ = /^\s*(what\s+is|what's|which\s+is)\s+the\s+best\b/.test(n);
+  /* R13-R16. Four-language deep-research triggers (22 Nov 2026, Raja):
+     any of these phrases is a DEEP research order in any language.
+     They run BEFORE R2-R12 on purpose: the old families return
+     NOT-research for a pronoun-only object ("research it"), but these
+     explicit phrases research anyway (deepOrderVerdict) - the research
+     flow asks for the missing topic itself. Never a clarifying
+     question, never a normal answer. */
+  /* R13. English deep triggers. */
+  if (!bestQ && (/\bsearch\s+for\s+(it|that|this|them)\b/.test(n) ||
+      (/\b(research|investigat\w*)\b/.test(n) && /\b(thoroughly|deeply|everything|worldwide|in\s+depth|every|all|possibilities|options|har|pehlu|angle)\b/.test(n)) ||
+      /\bcompare\b.{0,24}\b(different|multiple|various|all)\b.{0,16}\bsources?\b/.test(n) ||
+      /\bsearch\b.{0,16}\b(deeply|thoroughly|in\s+depth)\b/.test(n) ||
+      /\bexplore\b.{0,30}\b(internet|web|websites?|sources?|options|possibilities|everything|all|deeply|thoroughly|about|related|worldwide)\b/.test(n) ||
+      /\b(internet|web)\b.{0,20}\bexplore\b/.test(n) ||
+      /\bbrows\w*\b.{0,24}\b(websites?|web|internet|different)\b/.test(n) ||
+      /\bstudy\b.{0,30}\b(online|internet|web|resources?|sources?|material)\b/.test(n) ||
+      /\blearn\b.{0,24}\b(from|through|via)\b.{0,24}\b(internet|online|web)\b/.test(n) ||
+      /\blearn\b.{0,20}\b(continuously|always)\b/.test(n) ||
+      /\bdiscover\w*\b.{0,30}\b(information|possibilities|everything|all|options|solutions|available)\b/.test(n) ||
+      /\banaly[sz]\w*\b.{0,24}\b(everything|all|data|information|options|results)\b/.test(n) ||
+      /\bgather\b.{0,24}\b(knowledge|information|data|sources?)\b/.test(n) ||
+      /\bfind\b.{0,24}\b(every|all)\b.{0,16}\b(possible\s+)?(solutions?|options?|possibilities|answers?)\b/.test(n) ||
+      /\bdon\s*t\s+leave\s+any\b.{0,30}\b(unexplored|unresearched|unchecked)\b/.test(n) ||
+      /\bleave\s+no\b.{0,24}\b(stone\s+unturned|possibility\s+unexplored)\b/.test(n))) {
+    v = deepOrderVerdict(n, ctxTopic, 'explicit-deep-research', 'deep-research-en');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R14. Urdu-script deep triggers. */
+  if (!bestQ && (/سرچ\s*(کرو|کر|کریں)/.test(raw) || /انٹرنیٹ\s*(پر|سے)\s*سرچ/.test(raw) ||
+      /انٹرنیٹ\s*سے\s*سیکھو/.test(raw) || /آن\s*لائن\s*(ذرائع\s*سے)?\s*سیکھو/.test(raw) ||
+      /معلومات\s*حاصل\s*(کرو|کر|کریں)/.test(raw) ||
+      /جانچ\s*(کرو|کر|کریں)/.test(raw) || /دریافت\s*(کرو|کر|کریں)/.test(raw) ||
+      /موازنہ\s*(کرو|کر|کریں)/.test(raw) ||
+      (/فائدہ\s*(اٹھاؤ|اٹھائیں)/.test(raw) && /(علم|معلومات)/.test(raw)) ||
+      (/نظر\s*انداز\s*مت\s*کرو/.test(raw) && /(امکان|معلومات|حل|کوئی)/.test(raw)))) {
+    v = deepOrderVerdict(n, ctxTopic, 'explicit-deep-research', 'deep-research-urdu');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R15. Punjabi Shahmukhi deep triggers. A bare vekho / sikho + topic
+     is a research order too (41-fix, 22 Nov 2026): the noun/source
+     qualifier was dropping "vekho X" and "sikho X". A lone vekho /
+     sikho is still caught by the lone-word guard above, never here. */
+  if (!bestQ && (/لبھو/.test(raw) ||
+      /ویکھو/.test(raw) ||
+      /سکھو/.test(raw) ||
+      (/فائدہ\s*چکو/.test(raw) && /(علم|معلومات)/.test(raw)) ||
+      (/نہ\s*چھڈو/.test(raw) && /(امکان|معلومات|حل|کوئی)/.test(raw)))) {
+    v = deepOrderVerdict(n, ctxTopic, 'explicit-deep-research', 'deep-research-punjabi');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R16. Roman Urdu deep triggers (incl. Roman Punjabi labho/vekho). */
+  if (!bestQ && ((/\bexplore\b.{0,12}\b(karo|kar|ke\s+do|kar\s+ke\s+do)\b/.test(n) ||
+      /\bexplore\b.{0,30}\b(internet|web|websites?|sources?|options|possibilities|everything|all|deeply|thoroughly|about|related|worldwide)\b/.test(n)) ||
+      /\b(seekho|sikho)\b/.test(n) ||
+      /\bcomparison\b.{0,12}\b(karo|kar|ke\s+do|kar\s+ke\s+do)\b/.test(n) ||
+      (/\bfaida\b.{0,20}\buthao\b/.test(n) && /\b(knowledge|information|ilm|maloomat)\b/.test(n)) ||
+      (/\bnazarandaz\s+mat\s+karo\b/.test(n) && /\b(possibility|information|solution|koi)\b/.test(n)) ||
+      /\blabho\b/.test(n) ||
+      /\bvekho\b/.test(n))) {
+    v = deepOrderVerdict(n, ctxTopic, 'explicit-deep-research', 'deep-research-roman');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+
+  /* R13b. Bare explore / discover / analyze + topic (EN/Roman): the
+     deep patterns above need a qualifier (internet, everything, ...);
+     a plain verb + a real topic is still a research order. Placed
+     AFTER R13-R16 so the deep rules keep first shot at their phrases.
+     Uses orderVerdict, so a lone verb or a demonstrative-only object
+     still does NOT research; "the best" after the verb stays a bare
+     find-style recommendation, not research. Runs after the definition
+     guard, so "explore ka matlab kya hai" stays a definition. */
+  if (!bestQ && /\b(explore|discover|analy[sz]e)\b/.test(n) &&
+      !/\b(explore|discover|analy[sz]e)\b[^.]{0,20}\bthe\s+best\b/.test(n)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-explore-order', 'explore-order');
+    /* Demonstrative-only object ("explore this idea", "let's explore
+       this idea") is guftagu, not an order: return the neutral
+       no-signal result, NOT the pronoun-no-topic reason, or the gate
+       would ask "which topic?" for a casual remark. A real topic
+       still researches; a bare verb still researches with needsTopic. */
+    if (!v.research) return none;
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+  /* R6b. "comparison" noun: "make a comparison of X and Y" is the
+     same order as "compare X and Y". (R6 below keeps the verb.) */
+  if (/\bcomparison\b/.test(n)) {
+    v = orderVerdict(n, ctxTopic, 'explicit-verify-order', 'verify-order');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
   }
 
   /* R2. Research verbs: research / investigate / tehqeeq / shodh (+ karo
@@ -1055,12 +1425,21 @@ function isResearchOrder(text, context) {
   /* R8. "chahiye" orders — only when the wanted thing is information
      (websites / sources / videos / report / ...), or a chat topic is
      known. Bare "ye mujhe chahiye" names nothing: not research. */
+  /* R8 fix (22 Nov 2026): when the wanted thing IS an info noun
+     ("mujhe ye websites chahiye", "مجھے یہ ذرائع چاہیے"), a demo
+     verdict only means no subject was named - the info noun is a
+     real object, so the order still researches and the flow asks
+     which topic (needsTopic = true, topic = null). */
   if (/\bchahiye\b/.test(n)) {
-    if (INFO_NOUN_RE.test(n) || INFO_NOUN_URDU_RE.test(raw) || ctxTopic) {
+    var infoNoun = INFO_NOUN_RE.test(n) || INFO_NOUN_URDU_RE.test(raw);
+    if (infoNoun || ctxTopic) {
       v = orderVerdict(n, ctxTopic, 'explicit-want-order', 'chahiye-order');
+      if (!v.research && infoNoun) {
+        v = { research: true, reason: 'explicit-want-order', matched: 'chahiye-order', _content: [] };
+      }
       return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
     }
-    return { research: false, reason: 'chahiye-no-topic', topic: null, lang: lang, needsTopic: false, matched: 'chahiye-order' };
+    return { research: false, reason: 'chahiye-no-topic', topic: null, lang: lang, needsTopic: false, matched: 'chahiye-order', source: src.source, sources: src.sources };
   }
   /* R9. Where-to-find orders: "batao kahan se milega", "kahan milega". */
   if (/\bkahan\b.{0,24}\b(milega|milegi|milenge|milta|milti|mile)\b/.test(n) ||
@@ -1068,8 +1447,16 @@ function isResearchOrder(text, context) {
     v = orderVerdict(n, ctxTopic, 'explicit-where-to-find', 'where-to-find');
     return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
   }
-  /* R10. Find / look-up orders (English). */
-  if (/\bfind\s+out\b.{0,18}\babout\b/.test(n) || /\bfind\b/.test(n) || /\blook\s+up\b/.test(n)) {
+  /* R10. Find / look-up orders (English). Bare "find the best X" is
+     NOT research (Raja's decision, 22 Nov 2026 ~4:57 PM): only the
+     explicit forms below research - "find out ... about ...",
+     "find ... karo", and "look up". ("Find out about X" names an
+     explicit subject to investigate, unlike a bare "find the best";
+     "find out" is itself the discovery verb, like "discover".) */
+  if (/\bfind\s+out\b.{0,18}\babout\b/.test(n) ||
+      /\bfind\b.{0,30}\b(karo|kar|ke\s+do|kar\s+ke\s+do)\b/.test(n) ||
+      /\b(karo|kar)\b.{0,30}\bfind\b/.test(n) ||
+      /\blook\s+up\b/.test(n)) {
     v = orderVerdict(n, ctxTopic, 'explicit-find-order', 'find-order');
     return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
   }
@@ -1078,7 +1465,7 @@ function isResearchOrder(text, context) {
     v = orderVerdict(n, ctxTopic, 'explicit-research-verb', 'research-verb-urdu');
     return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
   }
-  if (/ڈھونڈ\s*(دو|کے|کر|بتاؤ|دے|لو)/.test(raw) || /تلاش\s*(کرو|کر|کر\s*کے)/.test(raw) ||
+  if (/ڈھونڈ/.test(raw) || /تلاش\s*(کرو|کر|کر\s*کے)/.test(raw) ||
       /گوگل\s*(کرو|کر)/.test(raw) || /انٹرنیٹ\s*(سے|پر)\s*ڈھونڈ/.test(raw)) {
     v = orderVerdict(n, ctxTopic, 'explicit-search-order', 'search-order-urdu');
     return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
@@ -1093,6 +1480,9 @@ function isResearchOrder(text, context) {
   }
   if (/مجھے.{0,20}چاہیے/.test(raw) && (INFO_NOUN_URDU_RE.test(raw) || ctxTopic)) {
     v = orderVerdict(n, ctxTopic, 'explicit-want-order', 'chahiye-order-urdu');
+    if (!v.research && INFO_NOUN_URDU_RE.test(raw)) {
+      v = { research: true, reason: 'explicit-want-order', matched: 'chahiye-order-urdu', _content: [] };
+    }
     return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
   }
   /* R12. Devanagari orders (mirrors the backend classifier). */
@@ -1105,6 +1495,7 @@ function isResearchOrder(text, context) {
 
   function finish(research, reason, textArg, langArg, ctx, matched, verdict) {
     var topic = null, needsTopic = false;
+    var s = detectSource(textArg);
     if (research) {
       topic = extractTopic(textArg);
       if (!topic && ctx) topic = ctx;
@@ -1113,7 +1504,9 @@ function isResearchOrder(text, context) {
       if (verdict && verdict.research && verdict._content && verdict._content.length === 0) needsTopic = true;
       if (topic) needsTopic = false;
     }
-    return { research: research, reason: reason, topic: topic, lang: langArg, needsTopic: needsTopic, matched: matched };
+    var out = { research: research, reason: reason, topic: topic, lang: langArg, needsTopic: needsTopic, matched: matched, source: s.source, sources: s.sources };
+    if (verdict && verdict._deep) out.deep = true;
+    return out;
   }
 }
 
@@ -1127,66 +1520,76 @@ var CLARIFY_T = {
     en: function () { return 'What would you like me to do?'; },
     roman: function () { return 'Aap kya karwana chahte hain?'; },
     urdu: function () { return 'آپ کیا کروانا چاہتے ہیں؟'; },
-    hindi: function () { return 'आप क्या करवाना चाहते हैं?'; }
+    hindi: function () { return 'आप क्या करवाना चाहते हैं?'; },
+    punjabi: function () { return 'تسی کی کروانا چاہندے او؟'; }
   },
   'research-word-no-topic': {
     en: function () { return 'Which topic should I look into?'; },
     roman: function () { return 'Main kis topic par kaam karoon?'; },
     urdu: function () { return 'میں کس موضوع پر کام کروں؟'; },
-    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; }
+    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; },
+    punjabi: function () { return 'میں کس موضوع تے کم کراں؟'; }
   },
   'pronoun-only-no-topic': {
     en: function () { return 'Which topic should I look into?'; },
     roman: function () { return 'Main kis topic par kaam karoon?'; },
     urdu: function () { return 'میں کس موضوع پر کام کروں؟'; },
-    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; }
+    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; },
+    punjabi: function () { return 'میں کس موضوع تے کم کراں؟'; }
   },
   'tell-more-no-topic': {
     en: function () { return 'Which topic should I look into?'; },
     roman: function () { return 'Main kis topic par kaam karoon?'; },
     urdu: function () { return 'میں کس موضوع پر کام کروں؟'; },
-    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; }
+    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; },
+    punjabi: function () { return 'میں کس موضوع تے کم کراں؟'; }
   },
   'research-verb-pronoun-no-topic': {
     en: function () { return 'Which topic should I look into?'; },
     roman: function () { return 'Main kis topic par kaam karoon?'; },
     urdu: function () { return 'میں کس موضوع پر کام کروں؟'; },
-    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; }
+    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; },
+    punjabi: function () { return 'میں کس موضوع تے کم کراں؟'; }
   },
   'chahiye-no-topic': {
     en: function () { return 'Which topic should I look into?'; },
     roman: function () { return 'Main kis topic par kaam karoon?'; },
     urdu: function () { return 'میں کس موضوع پر کام کروں؟'; },
-    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; }
+    hindi: function () { return 'मैं किस विषय पर काम करूँ?'; },
+    punjabi: function () { return 'میں کس موضوع تے کم کراں؟'; }
   },
   'bare-topic-fragment': {
     en: function (t) { return 'What would you like to know about "' + t + '"?'; },
     roman: function (t) { return '"' + t + '" ke baare mein aap kya jaanna chahte hain?'; },
     urdu: function (t) { return '"' + t + '" کے بارے میں آپ کیا جاننا چاہتے ہیں؟'; },
-    hindi: function (t) { return '"' + t + '" के बारे में आप क्या जानना चाहते हैं?'; }
+    hindi: function (t) { return '"' + t + '" के बारे में आप क्या जानना चाहते हैं?'; },
+    punjabi: function (t) { return '"' + t + '" دے بارے وچ تسی کی جاننا چاہندے او؟'; }
   },
   'no-referent': {
     en: function (a, b) { return a && b ? 'Do you mean "' + a + '" or "' + b + '"?' : 'Which task do you mean?'; },
     roman: function (a, b) { return a && b ? 'Aap ka matlab "' + a + '" hai ya "' + b + '"?' : 'Aap kis kaam ki baat kar rahe hain?'; },
     urdu: function (a, b) { return a && b ? 'آپ کا مطلب "' + a + '" ہے یا "' + b + '"؟' : 'آپ کس کام کی بات کر رہے ہیں؟'; },
-    hindi: function (a, b) { return a && b ? 'आपका मतलब "' + a + '" है या "' + b + '"?' : 'आप किस काम की बात कर रहे हैं?'; }
+    hindi: function (a, b) { return a && b ? 'आपका मतलब "' + a + '" है या "' + b + '"?' : 'आप किस काम की बात कर रहे हैं?'; },
+    punjabi: function (a, b) { return a && b ? 'تواڈا مطلب "' + a + '" اے یا "' + b + '"؟' : 'تسی کس کم دی گل کر رہے او؟'; }
   },
   'destructive-unclear-target': {
     en: function () { return 'What exactly do you want me to delete or send?'; },
     roman: function () { return 'Aap kya delete ya send karna chahte hain?'; },
     urdu: function () { return 'آپ کیا حذف یا بھیجنا چاہتے ہیں؟'; },
-    hindi: function () { return 'आप क्या हटाना या भेजना चाहते हैं?'; }
+    hindi: function () { return 'आप क्या हटाना या भेजना चाहते हैं?'; },
+    punjabi: function () { return 'تسی کی حذف یا بھیجنا چاہندے او؟'; }
   },
   'generic': {
     en: function () { return 'Could you say a little more about what you would like me to do?'; },
     roman: function () { return 'Aap kis baare mein baat kar rahe hain?'; },
     urdu: function () { return 'آپ کس بارے میں بات کر رہے ہیں؟'; },
-    hindi: function () { return 'आप किस बारे में बात कर रहे हैं?'; }
+    hindi: function () { return 'आप किस बारे में बात कर रहे हैं?'; },
+    punjabi: function () { return 'تسی کس بارے وچ گل کر رہے او؟'; }
   }
 };
 
 function clarifyQuestion(text, reason, lang, options) {
-  var L = (lang === 'urdu' || lang === 'hindi' || lang === 'roman') ? lang : 'en';
+  var L = (lang === 'urdu' || lang === 'hindi' || lang === 'roman' || lang === 'punjabi') ? lang : 'en';
   var group = CLARIFY_T[reason] ? reason : 'generic';
   var g = CLARIFY_T[group];
   var fn = g[L] || g.en;
@@ -1210,8 +1613,8 @@ var COMMON_VERBS = { is: 1, are: 1, was: 1, were: 1, do: 1, does: 1,
 function ambiguousReason(text, normed, ctxTopic) {
   var t = trim(text), n = normed;
   if (!t) return 'empty-message';
-  if (/^(research|search|tehqeeq|tahqeeq|shodh|khoj|dhoond|dhund|talaash|talash|google|find|check|verify|compare)\.?$/.test(trim(n))) return 'research-word-no-topic';
-  if (/^(ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|शोध|खोज|ढूंढ)$/.test(t)) return 'research-word-no-topic';
+  if (/^(research|search|tehqeeq|tahqeeq|shodh|khoj|dhoond|dhund|talaash|talash|google|find|check|verify|compare|explore|browse|discover|analy[sz]e|learn|study|gather|seekho|sikho|labho|vekho)\.?$/.test(trim(n))) return 'research-word-no-topic';
+  if (/^(ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|سرچ|سیکھو|جانچ|دریافت|موازنہ|لبھو|ویکھو|سکھو|शोध|खोज|ढूंढ)$/.test(t)) return 'research-word-no-topic';
   if (!ctxTopic) {
     if (/\b(research|search|find|look\s+up|google|verify|check)\s+(it|that|this|them)\s*[?!.]*$/.test(n)) return 'pronoun-only-no-topic';
     if (/^\s*tell\s+me\s+(more\s+)?about\s+(it|that|this|them)\s*[?!.]*$/.test(n)) return 'pronoun-only-no-topic';
@@ -1225,7 +1628,10 @@ function ambiguousReason(text, normed, ctxTopic) {
   var toks = tokensOf(n);
   if (toks.length > 0 && toks.length <= 14) {
     var v = objectVerdict(n, ctxTopic);
-    if (v.kind === 'demo') return 'no-referent';
+    /* A "let's ..." suggestion ("let's explore this idea") is guftagu,
+       not an unclear referent: never clarify it. (41-fix: 'let' is a
+       filler word, so such a sentence verdicts as demo here.) */
+    if (v.kind === 'demo' && !/^\s*let\s+s\s/.test(n)) return 'no-referent';
   }
   if (toks.length >= 1 && toks.length <= 3) {
     var hasVerb = false, j;
@@ -1274,6 +1680,7 @@ var api = {
   clarifyQuestion: clarifyQuestion,
   shouldClarify: shouldClarify,
   extractTopic: extractTopic,
+  detectSource: detectSource,
   normRoman: normRoman,
   conversationKind: conversationKind,
   isDefinition: isDefinition
@@ -2498,7 +2905,7 @@ window.__enzoGetTransport59 = function () {
    that kept a cached copy), refresh once to the live version so a phone
    never stays stuck on an old layout. Fails silently when offline. */
 (function(){
-  var ME='v59-live-research-fix', lastCheck=0;
+  var ME='v61-deep-triggers-4lang', lastCheck=0;
   function check(){
     var now=Date.now(); if(now-lastCheck<20000) return; lastCheck=now;
     try{
@@ -47114,22 +47521,28 @@ if (typeof module !== 'undefined' && module.exports) {
   function playTopic59(text) {
     var t = String(text || '').toLowerCase();
     t = t.replace(/\b(youtube|yt|video|videos|gana|gaana|song|songs|geet|music|movie|film|please|plz|zara|bhai|yaar)\b/g, ' ');
-    t = t.replace(/\b(chalao|chala do|chalado|bajao|baja do|sunao|suna do|dikhao|dikha do|play|per|par|pe|pr|ka|ki|ke|a|an|the|of|on|for|mein|main)\b/g, ' ');
-    t = t.replace(/(یوٹیوب|ویڈیو|گانا|گانے|چلاؤ|چلا دو|بجاؤ|سناؤ|دکھاؤ|پر|کا|کی|کے)/g, ' ');
+    t = t.replace(/\b(chalao|chala do|chalado|bajao|baja do|sunao|suna do|dikhao|dikha do|dekho|dekhna|play|show|watch|me|per|par|pe|pr|ka|ki|ke|a|an|the|of|on|for|mein|main)\b/g, ' ');
+    t = t.replace(/(یوٹیوب|ویڈیو|گانا|گانے|چلاؤ|چلا دو|بجاؤ|سناؤ|دکھاؤ|دیکھو|پر|کا|کی|کے)/g, ' ');
     t = t.replace(/\s+/g, ' ').trim();
-    return t || String(text || '').trim();
+    if (t) return t;
+    var m = String(text || '').toLowerCase().match(/\b(youtube|yt|video|videos|instagram|tiktok|facebook|twitter|reddit|linkedin|pinterest|snapchat|telegram|threads|vimeo|dailymotion|reels|reel|shorts|short|stories|story|clips|clip|live|stream|gana|gaana|song|songs|geet|music|movie|film)\b/g);
+    if (m && m.length) return m.join(' ');
+    return String(text || '').trim();
   }
   function isPlayOrder59(text) {
     var raw = String(text || '');
     var t = ' ' + raw.toLowerCase() + ' ';
+    if (/live\s+(screen|research|view|monitor)/.test(t)) return false;
     var playVerb = /\b(chalao|chala do|chalado|bajao|baja do|sunao|suna do|play)\b/.test(t);
-    var showVerb = /\b(dikhao|dikha do)\b/.test(t);
-    var mediaWord = /\b(youtube|yt|video|videos|gana|gaana|song|songs|geet|music|movie|film)\b/.test(t);
+    var showVerb = /\b(dikhao|dikha do|dekho|dekhna|show|watch)\b/.test(t);
+    var mediaWord = /\b(youtube|yt|video|videos|instagram|tiktok|facebook|twitter|reddit|linkedin|pinterest|snapchat|telegram|threads|vimeo|dailymotion|reels|reel|shorts|short|stories|story|clips|clip|live|stream|gana|gaana|song|songs|geet|music|movie|film)\b/.test(t);
     var urduPlay = /(چلاؤ|چلا دو|بجاؤ|سناؤ|دکھاؤ)/.test(raw);
-    var urduMedia = /(یوٹیوب|ویڈیو|گانا|گانے|موسیقی)/.test(raw);
+    var urduShow = /(دکھاؤ|دیکھو)/.test(raw);
+    var urduMedia = /(یوٹیوب|ویڈیو|گانا|گانے|موسیقی|انسٹاگرام|ٹک ٹاک|فیس بک|ریلز|شارٹس|سٹوریز|کلپ|فلم|مووی)/.test(raw);
     var topic = playTopic59(raw);
     var hasTopic = topic.length >= 3;
     if (urduPlay && (urduMedia || hasTopic)) return true;
+    if (urduShow && urduMedia) return true;
     if (playVerb && (mediaWord || hasTopic)) return true;
     if (showVerb && mediaWord) return true;
     return false;
