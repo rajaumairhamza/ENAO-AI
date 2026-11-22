@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
+<meta name="enao-build" content="v62-backend-fix">
 <meta name="enao-build" content="v62-learning">
 <meta name="enao-build" content="v62-identity">
 <meta name="enao-build" content="v60-universal-scope">
@@ -5771,7 +5772,7 @@ window.__enzoGetTransport59 = function () {
    that kept a cached copy), refresh once to the live version so a phone
    never stays stuck on an old layout. Fails silently when offline. */
 (function(){
-  var ME='v62-identity', lastCheck=0;
+  var ME='v62-backend-fix', lastCheck=0;
   function check(){
     var now=Date.now(); if(now-lastCheck<20000) return; lastCheck=now;
     try{
@@ -7852,6 +7853,1531 @@ html[data-theme="dark"] .composer-box:focus-within{border-color:var(--line);box-
 <div class="toast" id="toast"></div>
 
 <script>
+/* == ASSEMBLED PIECE 42 — 42-reachability-core.js (v62-backend-fix) == */
+/* ================= 42-reachability-core =================
+   Single source of truth for backend reachability (piece 42).
+   Live v61 defect it fixes: v2health() did ONE fetch with a 6s timeout
+   and on ANY failure set v2Up=false + showed "Platform backend
+   unreachable", and two more call sites did the same unconditionally.
+   One transient blip (slow network, pool saturation from polling) put
+   the UI into a stuck fallback state even while the backend was healthy.
+
+   ACCURACY RULE (Raja, 22 Nov 2026 ~6:57 PM PKT): the status shown must
+   always match the real backend state. This module therefore:
+     - NEVER declares the backend down on fewer than 3 failed attempts
+       (attempts at ~0s, ~1.5s, ~4s, each with its own ~6s timeout).
+     - NEVER declares the backend up without a probe that actually
+       succeeded (HTTP 2xx AND a healthy body, per checkBackendReachable).
+       A 2xx with a bad/unreadable body, an HTTP error, a timeout and a
+       network failure are all failures, never "up".
+     - NEVER claims "up" from a cleared cache: resetFailure() moves the
+       state to 'unknown', not 'up'; only a fresh successful probe can
+       set 'up' again.
+     - NEVER shows a stale verdict as current: while a probe sequence is
+       running the status is 'checking' (not the old 'up'/'down'), and
+       getState()/isStale() expose lastCheckAt so a caller can tell a
+       stale reading from a fresh one.
+     - onChange fires ONLY on a real settled-status change (up<->down,
+       plus the very first 'down', since the banner starts hidden and
+       the first 'up' changes nothing visible); never on every probe,
+       never twice for the same status, never for 'checking'.
+
+   ES5 style (var, function declarations), no dependencies, no emoji.
+   Reuses window.EnzoPagesBackend.getBackendBase() when present (else
+   '/api/v2') and calls its checkBackendReachable() once per attempt.
+   The piece-33 API (checkBackendReachable, shouldBlockAsk,
+   describeCheck) is NOT changed. Guarded against double instantiation.
+   ================================================================ */
+(function (root, factory) {
+  var g = (typeof window !== 'undefined') ? window
+    : (typeof global !== 'undefined') ? global : this;
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = factory(g);
+  } else {
+    root.EnzoBackendHealth = factory(g);
+  }
+})(this, function (root) {
+  'use strict';
+
+  /* Double-instantiation guard: a second <script> include returns the
+     existing instance instead of building a second state machine. */
+  if (root.__enzoBackendHealth) return root.__enzoBackendHealth;
+
+  var DEFAULT_TIMEOUT_MS = 6000;      /* per-attempt timeout, as v2health used */
+  var DEFAULT_RETRY_DELAYS = [1500, 2500]; /* attempt 2 at ~1.5s, attempt 3 at ~4s */
+  var DEFAULT_MAX_ATTEMPTS = 3;
+  var DEFAULT_DOWN_INTERVAL_MS = 15000; /* re-probe while down */
+  var DEFAULT_UP_INTERVAL_MS = 60000;   /* light re-probe while up */
+  var DEFAULT_STALE_AFTER_MS = 120000;  /* a verdict older than this is stale */
+
+  function nowMs() { return Date.now(); }
+  function isoNow() { return new Date().toISOString(); }
+  function isFn(f) { return typeof f === 'function'; }
+
+  function createInstance(opts) {
+    opts = opts || {};
+    var timeoutMs = (typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0)
+      ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
+    var retryDelays = (opts.retryDelays instanceof Array && opts.retryDelays.length)
+      ? opts.retryDelays : DEFAULT_RETRY_DELAYS;
+    var maxAttempts = (typeof opts.maxAttempts === 'number' && opts.maxAttempts > 0)
+      ? opts.maxAttempts : DEFAULT_MAX_ATTEMPTS;
+    var downIntervalMs = (typeof opts.downIntervalMs === 'number' && opts.downIntervalMs > 0)
+      ? opts.downIntervalMs : DEFAULT_DOWN_INTERVAL_MS;
+    var upIntervalMs = (typeof opts.upIntervalMs === 'number' && opts.upIntervalMs > 0)
+      ? opts.upIntervalMs : DEFAULT_UP_INTERVAL_MS;
+    var staleAfterMs = (typeof opts.staleAfterMs === 'number' && opts.staleAfterMs > 0)
+      ? opts.staleAfterMs : DEFAULT_STALE_AFTER_MS;
+    var fetchFnOpt = isFn(opts.fetchFn) ? opts.fetchFn : null;
+    var hostnameOpt = (typeof opts.hostname === 'string') ? opts.hostname : undefined;
+    var setTimeoutFn = isFn(opts.setTimeoutFn) ? opts.setTimeoutFn : setTimeout;
+    var clearTimeoutFn = isFn(opts.clearTimeoutFn) ? opts.clearTimeoutFn : clearTimeout;
+    var nowFn = isFn(opts.nowFn) ? opts.nowFn : nowMs;
+
+    /* ---- state (the single source of truth) ---- */
+    var status = 'unknown';           /* 'unknown'|'up'|'down'|'checking' */
+    var lastSettled = null;           /* last settled ('up'/'down') verdict; survives 'unknown'/'checking' so a flip after resetFailure still notifies */
+    var lastOkAt = null;              /* ms epoch of last successful probe */
+    var lastFailAt = null;            /* ms epoch of last failed verdict */
+    var lastCheckAt = null;           /* ms epoch of last completed verdict */
+    var lastReason = '';
+    var lastStatus = '';
+    var lastProbe = null;             /* last single-attempt result {reachable, status, reason, httpStatus, base} -- used to build the honest unavailable notice */
+    var consecutiveFailures = 0;      /* failed attempts since last success */
+    var totalAttempts = 0;            /* probe attempts made, all time */
+    var listeners = [];
+    var inflight = null;              /* in-flight checkHealth promise */
+    var timer = null;                 /* background-loop timer */
+    var loopRunning = false;
+
+    function getBackendBase() {
+      try {
+        if (root.EnzoPagesBackend && isFn(root.EnzoPagesBackend.getBackendBase)) {
+          return root.EnzoPagesBackend.getBackendBase();
+        }
+      } catch (e) {}
+      return '/api/v2';
+    }
+
+    /* Set a settled status ('up'/'down') and notify ONLY on a real change
+       of settled status. Transitions to/from 'checking'/'unknown' never
+       notify: the UI must not flicker on a probe that has not decided.
+       The banner starts hidden, so the very first 'up' changes nothing
+       visible and does not fire; the very first 'down' must show the
+       banner and does fire once. After that, only real up<->down flips
+       fire -- never twice for the same status. lastSettled survives a
+       resetFailure, so a recovery after a cleared failure still fires. */
+    function setSettled(next, reason) {
+      var prevSettled = lastSettled;
+      lastSettled = next;
+      status = next;
+      if (next === 'up') { lastOkAt = nowFn(); }
+      if (next === 'down') { lastFailAt = nowFn(); }
+      lastCheckAt = nowFn();
+      if (typeof reason === 'string') lastReason = reason;
+      var mustFire = (prevSettled !== null && prevSettled !== next) ||
+        (prevSettled === null && next === 'down');
+      if (mustFire) {
+        var i;
+        for (i = 0; i < listeners.length; i++) {
+          try { listeners[i](next, getState()); } catch (e) {}
+        }
+      }
+    }
+
+    /* One probe attempt. Returns a Promise of a checkBackendReachable-style
+       result { reachable, status, reason, httpStatus }. Uses piece 33 when
+       present; otherwise a direct GET <base>/health with the same honesty
+       rules (2xx + {ok:true} only). Never rejects. */
+    function probeOnce(o) {
+      var pages = root.EnzoPagesBackend;
+      if (pages && isFn(pages.checkBackendReachable)) {
+        var checkOpts = { timeoutMs: o.timeoutMs };
+        if (fetchFnOpt) checkOpts.fetchFn = fetchFnOpt;
+        if (o.fetchFn) checkOpts.fetchFn = o.fetchFn;
+        if (hostnameOpt !== undefined) checkOpts.hostname = hostnameOpt;
+        if (o.hostname !== undefined) checkOpts.hostname = o.hostname;
+        try {
+          return Promise.resolve(pages.checkBackendReachable(checkOpts))
+            .then(function (c) {
+              if (!c || typeof c !== 'object') {
+                return { reachable: false, status: 'unreachable', reason: 'Empty health-check result.', httpStatus: null };
+              }
+              return {
+                reachable: c.reachable === true,
+                status: c.status || (c.reachable === true ? 'ok' : 'unreachable'),
+                reason: c.reason || '',
+                httpStatus: (typeof c.httpStatus === 'number') ? c.httpStatus : null
+              };
+            }, function (err) {
+              return { reachable: false, status: 'unreachable', reason: (err && err.message) ? String(err.message) : 'Health check failed.', httpStatus: null };
+            });
+        } catch (e) {
+          return Promise.resolve({ reachable: false, status: 'unreachable', reason: 'Health check threw.', httpStatus: null });
+        }
+      }
+      /* No piece 33: direct fetch with our own timeout. */
+      var fetchFn = o.fetchFn || fetchFnOpt || root.fetch;
+      if (!isFn(fetchFn)) {
+        return Promise.resolve({ reachable: false, status: 'no-fetch', reason: 'This environment cannot make network requests.', httpStatus: null });
+      }
+      var url = getBackendBase() + '/health';
+      var ctl = null, timerId = null, settled = false;
+      function settle(r) {
+        if (settled) return r;
+        settled = true;
+        if (timerId) clearTimeoutFn(timerId);
+        return r;
+      }
+      try {
+        if (typeof root.AbortController !== 'undefined') {
+          ctl = new root.AbortController();
+          timerId = setTimeoutFn(function () { try { ctl.abort(); } catch (e) {} }, o.timeoutMs);
+        }
+      } catch (e) {}
+      var req = { signal: ctl ? ctl.signal : undefined };
+      var p;
+      try { p = fetchFn(url, req); } catch (e) {
+        return Promise.resolve(settle({ reachable: false, status: 'unreachable', reason: 'Health request could not be sent.', httpStatus: null }));
+      }
+      return Promise.resolve(p).then(function (resp) {
+        if (!resp || typeof resp.status !== 'number') {
+          return settle({ reachable: false, status: 'unreachable', reason: 'No HTTP response from the backend.', httpStatus: null });
+        }
+        if (resp.status < 200 || resp.status >= 300) {
+          return settle({ reachable: false, status: 'http-error', reason: 'The backend answered with HTTP ' + resp.status + ' instead of a healthy reply.', httpStatus: resp.status });
+        }
+        if (isFn(resp.json)) {
+          return resp.json().then(function (j) {
+            if (j && j.ok === true) {
+              return settle({ reachable: true, status: 'ok', reason: '', httpStatus: resp.status });
+            }
+            return settle({ reachable: false, status: 'bad-health', reason: 'The backend answered, but its health reply was not a healthy one.', httpStatus: resp.status });
+          }, function () {
+            return settle({ reachable: false, status: 'bad-health', reason: 'The backend answered, but its health reply could not be read.', httpStatus: resp.status });
+          });
+        }
+        return settle({ reachable: true, status: 'ok', reason: '', httpStatus: resp.status });
+      }, function (err) {
+        var name = (err && err.name) || '';
+        if (name === 'AbortError' || name === 'TimeoutError') {
+          return settle({ reachable: false, status: 'timeout', reason: 'The backend did not answer within the time allowed.', httpStatus: null });
+        }
+        return settle({ reachable: false, status: 'unreachable', reason: 'The backend could not be reached from this page.', httpStatus: null });
+      });
+    }
+
+    function wait(ms) {
+      return new Promise(function (resolve) { setTimeoutFn(resolve, ms); });
+    }
+
+    /* Full verdict: up to maxAttempts attempts with backoff. A single
+       success at any attempt means reachable. Unreachable is declared
+       ONLY after every attempt has failed. Never rejects. */
+    function checkHealth(callOpts) {
+      if (inflight) return inflight;
+      callOpts = callOpts || {};
+      var o = {
+        timeoutMs: (typeof callOpts.timeoutMs === 'number' && callOpts.timeoutMs > 0) ? callOpts.timeoutMs : timeoutMs,
+        maxAttempts: (typeof callOpts.maxAttempts === 'number' && callOpts.maxAttempts > 0) ? callOpts.maxAttempts : maxAttempts,
+        retryDelays: (callOpts.retryDelays instanceof Array && callOpts.retryDelays.length) ? callOpts.retryDelays : retryDelays,
+        fetchFn: isFn(callOpts.fetchFn) ? callOpts.fetchFn : null,
+        hostname: (typeof callOpts.hostname === 'string') ? callOpts.hostname : undefined
+      };
+      var attemptsMade = 0;
+      var last = { reachable: false, status: 'unreachable', reason: '', httpStatus: null };
+      var wasDown = (status === 'down');
+      /* While a verdict is pending, the honest status is 'checking' --
+         except when already 'down', where the banner stays until a probe
+         actually succeeds (no flicker, no false recovery). */
+      if (!wasDown && status !== 'checking') status = 'checking';
+
+      function attempt(n) {
+        attemptsMade++;
+        totalAttempts++;
+        return probeOnce(o).then(function (r) {
+          last = r;
+          lastStatus = r.status;
+          lastReason = r.reason || '';
+          lastProbe = { reachable: r.reachable === true, status: r.status, reason: r.reason || '', httpStatus: r.httpStatus, base: getBackendBase() };
+          if (r.reachable === true) {
+            consecutiveFailures = 0;
+            setSettled('up', '');
+            return { reachable: true, attempts: attemptsMade, lastStatus: lastStatus, lastReason: lastReason, checkedAt: isoNow() };
+          }
+          consecutiveFailures++;
+          if (n + 1 < o.maxAttempts) {
+            var delay = o.retryDelays[n] !== undefined ? o.retryDelays[n]
+              : o.retryDelays[o.retryDelays.length - 1];
+            return wait(delay).then(function () { return attempt(n + 1); });
+          }
+          setSettled('down', lastReason);
+          return { reachable: false, attempts: attemptsMade, lastStatus: lastStatus, lastReason: lastReason, checkedAt: isoNow() };
+        });
+      }
+      inflight = attempt(0).then(function (res) { inflight = null; return res; });
+      return inflight;
+    }
+
+    /* Background loop: one timer, rescheduled after each probe so probes
+       never overlap. While 'down', a full 3-attempt probe every 15s until
+       reachable (onChange('up') fires, no reload). While 'up', one light
+       single-attempt probe every 60s; a failure only moves to 'checking'
+       and runs the full 3-attempt sequence before any UI change. */
+    function scheduleNext() {
+      if (!loopRunning) return;
+      if (timer) { clearTimeoutFn(timer); timer = null; }
+      var delay = (status === 'down') ? downIntervalMs : upIntervalMs;
+      timer = setTimeoutFn(function () {
+        timer = null;
+        if (!loopRunning) return;
+        if (inflight) { scheduleNext(); return; } /* never overlap a manual check */
+        if (status === 'down') {
+          checkHealth().then(function () { scheduleNext(); });
+        } else {
+          /* Light probe: one attempt only. Success keeps 'up'; failure
+             hands over to the full sequence (checkHealth) which decides. */
+          probeOnce({ timeoutMs: timeoutMs, maxAttempts: 1 }).then(function (r) {
+            totalAttempts++;
+            lastStatus = r.status; lastReason = r.reason || '';
+            lastProbe = { reachable: r.reachable === true, status: r.status, reason: r.reason || '', httpStatus: r.httpStatus, base: getBackendBase() };
+            if (r.reachable === true) {
+              consecutiveFailures = 0;
+              lastStatus = r.status; lastReason = '';
+              if (status !== 'up') setSettled('up', '');
+              else { lastOkAt = nowFn(); lastCheckAt = nowFn(); }
+              scheduleNext();
+            } else {
+              consecutiveFailures++;
+              if (status !== 'checking') status = 'checking';
+              checkHealth().then(function () { scheduleNext(); });
+            }
+          });
+        }
+      }, delay);
+    }
+
+    function getState() {
+      return {
+        status: status,
+        lastOkAt: lastOkAt,
+        lastFailAt: lastFailAt,
+        lastCheckAt: lastCheckAt,
+        consecutiveFailures: consecutiveFailures,
+        attempts: totalAttempts,
+        lastStatus: lastStatus,
+        lastReason: lastReason,
+        lastProbe: lastProbe
+      };
+    }
+
+    var instance = {
+      checkHealth: checkHealth,
+      getState: getState,
+      onChange: function (fn) {
+        if (!isFn(fn)) return function () {};
+        listeners.push(fn);
+        return function () {
+          var i = listeners.indexOf(fn);
+          if (i !== -1) listeners.splice(i, 1);
+        };
+      },
+      /* Clears a cached failure (used by Retry Search). Accuracy: this
+         NEVER claims the backend is up -- it moves to 'unknown' and the
+         next probe decides. No onChange fires for the clearing itself. */
+      resetFailure: function () {
+        consecutiveFailures = 0;
+        lastFailAt = null;
+        lastReason = '';
+        lastStatus = '';
+        if (status === 'down' || status === 'checking') status = 'unknown';
+        if (timer) { clearTimeoutFn(timer); timer = null; }
+        if (loopRunning) scheduleNext();
+      },
+      /* True when no verdict has been completed within maxAgeMs (or no
+         verdict ever). A stale 'up' must not be presented as current. */
+      isStale: function (maxAgeMs) {
+        var limit = (typeof maxAgeMs === 'number' && maxAgeMs > 0) ? maxAgeMs : staleAfterMs;
+        if (lastCheckAt === null) return true;
+        return (nowFn() - lastCheckAt) > limit;
+      },
+      start: function () {
+        if (loopRunning) return;
+        loopRunning = true;
+        /* Immediate full verdict on start, then the background loop. */
+        checkHealth().then(function () { scheduleNext(); });
+      },
+      stop: function () {
+        loopRunning = false;
+        if (timer) { clearTimeoutFn(timer); timer = null; }
+      },
+      getBackendBase: getBackendBase,
+      /* Test/internal seam: build an independent instance with its own
+         state (used by the harness so tests never share the singleton). */
+      _create: createInstance,
+      _defaults: {
+        timeoutMs: DEFAULT_TIMEOUT_MS,
+        retryDelays: DEFAULT_RETRY_DELAYS,
+        maxAttempts: DEFAULT_MAX_ATTEMPTS,
+        downIntervalMs: DEFAULT_DOWN_INTERVAL_MS,
+        upIntervalMs: DEFAULT_UP_INTERVAL_MS,
+        staleAfterMs: DEFAULT_STALE_AFTER_MS
+      }
+    };
+    return instance;
+  }
+
+  var singleton = createInstance({});
+  root.__enzoBackendHealth = singleton;
+  return singleton;
+});
+/* == END PIECE 42 == */
+</script>
+<script>
+/* == ASSEMBLED PIECE 43 — 43-askpath-retry.js (v62-backend-fix) == */
+/* ============================================================================
+ * EnzoAskRecovery — piece 43-askpath-retry (ENAO AI / ENZO, live build
+ * v61-deep-triggers-4lang)
+ *
+ * PROBLEM (verified in the live v61 artifact enao-ai.html, 48,870 lines):
+ * Raja's screenshot (22 Nov 2026, 6:53 PM PKT) showed TWO failures at once:
+ *   (1) "The search service is temporarily unavailable. Please try again
+ *       later." + a "Retry Search" button — the fallback search path failed
+ *       on its own while the real backend was healthy the whole time.
+ *   (2) "Retry Search" just re-ran the question in the SAME mode, and when
+ *       v2Up===false the ask wrapper routed straight to the legacy fallback
+ *       (line 16722) WITHOUT ever re-probing the backend. Retry could never
+ *       rescue a falsely-flagged backend.
+ * Root causes: fallbackLegacy() sets v2Up=false unconditionally at entry
+ * (line 15955); the ask-gate block sets v2Up=false on ONE failed check
+ * (line 16204); the runBackendAsk59() chain catch falls back on ANY single
+ * error (lines 16192-16196). One slow ask = permanent fallback until the
+ * 60-second recheck (line 16755).
+ *
+ * STANDING RULE (Raja, 22 Nov 2026 ~6:57 PM PKT — ACCURACY RULE):
+ * "ENZO ko accurate banao — chahe jo bhi ho, kisi bhi tarah se ENZO ghalti
+ * na kare." For this piece that means: the fallback NEVER silently gives a
+ * wrong answer; every fallback answer carries a plain label saying it is
+ * fallback, not research; anything that cannot be verified is stated
+ * plainly, never guessed and never fabricated. validateFallbackAnswer()
+ * enforces this, and the test suite treats a wrong fallback answer, or a
+ * fallback presented as research, as FAIL.
+ *
+ * SERVER EVIDENCE (parent checked the live server): the backend has been
+ * running continuously since 5:37 PM, NRestarts=0, every request HTTP 200.
+ * The screenshot's "unreachable" was the FRONTEND's fault, not the backend
+ * stopping. This piece therefore treats "backend down" as a claim that must
+ * be re-proven with fresh multi-attempt checks before any fallback runs.
+ *
+ * WHAT THIS MODULE DOES (and does NOT do):
+ *  - probeBackend(): fresh multi-attempt health check FIRST, before any
+ *    fallback decision. Prefers window.EnzoBackendHealth (piece 42) when
+ *    present — its checkHealth() ALREADY probes with multiple attempts
+ *    internally (maxAttempts 3, delays [1500, 2500] by default), so it
+ *    is called ONCE and its verdict is used as-is; the caller's
+ *    attempts/delays only override piece 42's defaults when explicitly
+ *    given. Else window.EnzoPagesBackend.checkBackendReachable retried
+ *    3x with backoff. Never throws; always resolves a verdict object.
+ *  - retryAsk(): the new Retry Search behaviour — re-probe first; on
+ *    reachable run the REAL backend ask path, never legacy; only on
+ *    sustained unreachable fall back, with the honest one-line notice
+ *    attached and background re-probing armed.
+ *  - guardedAsk(): wraps one backend attempt so a SINGLE failed request
+ *    (timeout, network error, one 500) NEVER flips the app into fallback
+ *    mode — it re-probes with backoff first; fallback only after the
+ *    multi-attempt check fails.
+ *  - fallbackNotice() / applyFallbackLabel(): the honest fallback label
+ *    (en / roman / urdu). A fallback answer must NEVER be presented as a
+ *    researched answer.
+ *  - validateFallbackAnswer(): accuracy guard — wrong fallback answer =
+ *    FAIL, fallback called research = FAIL.
+ *  - Does NOT touch voice/language code (no voice-speak call sites
+ *    anywhere in this file). Does NOT change the P-F backend ask itself,
+ *    only its error / retry routing. Does NOT own backend state — state
+ *    lives in piece 42 (EnzoBackendHealth): its checkHealth() verdict
+ *    already drives the shared state, so this module only reports
+ *    verdicts; the injected setUp(up, probe) hook is a seam for
+ *    environments without piece 42 and is wired as a no-op when
+ *    piece 42 is present (see WIRING-43.md).
+ *
+ * STYLE: UMD / IIFE, ES5, no dependencies, no emoji.
+ * ========================================================================== */
+(function (root, factory) {
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = factory();
+  } else {
+    root.EnzoAskRecovery = factory();
+  }
+})(typeof window !== 'undefined' ? window : this, function () {
+  'use strict';
+
+  var VERSION = '43-askpath-retry-v1';
+
+  /* Backoff between probe attempts: attempt 1 fails -> wait 400ms ->
+     attempt 2 fails -> wait 1200ms -> attempt 3. Total worst case ~1.6s
+     plus the checks themselves. Deliberately short: a retry must feel
+     instant, and the checks are single /health GETs. */
+  var DEFAULT_DELAYS_MS = [400, 1200];
+  var DEFAULT_ATTEMPTS = 3;
+  var DEFAULT_BG_INTERVAL_MS = 30000;
+
+  /* ------------------------------------------------------------------ */
+  /* Honest fallback label — one plain line, user's language aware,      */
+  /* same three languages as ERR_TXT (enao-ai.html line ~15932).          */
+  /* It says all three facts in one line: backend could not be reached,  */
+  /* this answer is fallback search only (NOT live research), and real    */
+  /* research resumes automatically on recovery. No scary banner, no     */
+  /* "temporarily unavailable" wording, no fake research label.           */
+  /* ------------------------------------------------------------------ */
+  var FALLBACK_NOTICE = {
+    en: 'The platform backend could not be reached, so this answer uses the built-in fallback search only — not live research — and it will keep retrying in the background; real research resumes automatically as soon as the backend is reachable again.',
+    roman: 'Platform backend se rabta nahi ho saka, is liye ye jawab sirf built-in fallback search se hai — live research nahi — aur ye background mein dobara koshish karta rahega; backend wapas milte hi asal research khud ba khud dobara shuru ho jayegi.',
+    urdu: 'پلیٹ فارم بیک اینڈ سے رابطہ نہیں ہو سکا، اس لیے یہ جواب صرف بلٹ ان فال بیک سرچ سے ہے — لائیو ریسرچ نہیں — اور یہ پس منظر میں دوبارہ کوشش کرتا رہے گا؛ بیک اینڈ واپس ملتے ہی اصل ریسرچ خود بخود دوبارہ شروع ہو جائے گی۔'
+  };
+
+  /* Short modeWhy suffix for a fallback message. The live artifact
+     already uses this honest wording at line ~16024; keep it identical
+     so old and new fallback messages read the same. */
+  var FALLBACK_MODE_WHY = 'fallback search (platform backend unreachable)';
+
+  function normLang(lang) {
+    if (lang === 'urdu' || lang === 'roman') return lang;
+    return 'en';
+  }
+
+  function fallbackNotice(lang) {
+    return FALLBACK_NOTICE[normLang(lang)];
+  }
+
+  function fallbackModeWhy(routeLabel) {
+    var label = (routeLabel && String(routeLabel)) || 'Answer';
+    return label + ' — ' + FALLBACK_MODE_WHY;
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  /* One plain line as HTML for the assembler to prepend to a fallback
+     answer. A plain <p>, deliberately NOT the notice-warn banner that
+     the screenshot showed. */
+  function fallbackNoticeHtml(lang) {
+    return '<p class="fallback-note">' + escapeHtml(fallbackNotice(lang)) + '</p>';
+  }
+
+  function defaultSleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function isPlainObject(v) {
+    return !!v && typeof v === 'object' && !Array.isArray(v);
+  }
+
+  /* Normalise whatever a health check returns into a boolean verdict.
+     Accepts: true/false, {reachable:true/false}, {ok:true/false},
+     {status:'ok'}, or a thrown / undefined result (unreachable). */
+  function verdictOf(result) {
+    if (result === true) return true;
+    if (result === false || result == null) return false;
+    if (typeof result === 'object') {
+      if (typeof result.reachable === 'boolean') return result.reachable;
+      if (typeof result.ok === 'boolean') return result.ok;
+      if (typeof result.status === 'string') return result.status === 'ok';
+    }
+    return false;
+  }
+
+  function reasonOf(result) {
+    if (isPlainObject(result) && typeof result.reason === 'string' && result.reason) return result.reason;
+    if (isPlainObject(result) && typeof result.status === 'string' && result.status) return result.status;
+    return '';
+  }
+
+  /* Find a callable single-check function, in priority order:
+     1. opts.check — explicit function injected by the caller / tests.
+     2. opts.health (window.EnzoBackendHealth, piece 42) — try its
+        known method names in order; first one that is a function wins.
+        NOTE: piece 42's real entry point is checkHealth(), which is
+        handled separately in probeBackend (it already retries
+        internally, so it must be called ONCE, not wrapped in this
+        module's retry loop). The names below are the fallback for
+        health-like objects without checkHealth.
+     3. opts.pagesBackend (window.EnzoPagesBackend) — its
+        checkBackendReachable, which the live artifact inlines at
+        lines ~250-330 and which returns {reachable, status, ...}.
+     Returns null when no check mechanism exists at all. */
+  function resolveSingleCheck(opts) {
+    var health = opts.health;
+    var pages = opts.pagesBackend;
+    var names, i, fn;
+    if (typeof opts.check === 'function') {
+      return function () { return opts.check(opts.timeoutMs); };
+    }
+    if (health && typeof health === 'object') {
+      names = ['check', 'probe', 'checkBackendReachable', 'isReachable', 'health'];
+      for (i = 0; i < names.length; i++) {
+        fn = health[names[i]];
+        if (typeof fn === 'function') {
+          return (function (f) {
+            return function () { return f.call(health, opts.timeoutMs); };
+          })(fn);
+        }
+      }
+    }
+    if (pages && typeof pages.checkBackendReachable === 'function') {
+      return function () {
+        var arg = (typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0)
+          ? { timeoutMs: opts.timeoutMs } : undefined;
+        return pages.checkBackendReachable(arg);
+      };
+    }
+    return null;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* probeBackend(opts) — the one fact this whole piece stands on.       */
+  /* Runs a FRESH multi-attempt health check and resolves (never         */
+  /* rejects) {reachable, attempts, lastCheck, lastReason}.              */
+  /* opts: {check|health|pagesBackend, attempts=3, delays=[400,1200],    */
+  /*        sleep (fn ms->Promise, default setTimeout), timeoutMs}.      */
+  /* A single failed attempt proves NOTHING — only all attempts failing   */
+  /* proves unreachable. When no check mechanism exists at all,          */
+  /* attempts is 0 and reachable is false with reason                    */
+  /* 'no-health-check-available'; callers treat that as UNKNOWN and try  */
+  /* the real backend ask once (see retryAsk / guardedAsk), because      */
+  /* silently falling back with no evidence would be the exact bug       */
+  /* this piece fixes.                                                   */
+  /* ------------------------------------------------------------------ */
+  function probeBackend(opts) {
+    opts = opts || {};
+    var attempts = (typeof opts.attempts === 'number' && opts.attempts > 0)
+      ? Math.floor(opts.attempts) : DEFAULT_ATTEMPTS;
+    var delays = Array.isArray(opts.delays) && opts.delays.length
+      ? opts.delays : DEFAULT_DELAYS_MS;
+    var sleep = (typeof opts.sleep === 'function') ? opts.sleep : defaultSleep;
+
+    /* Piece 42 fast path: EnzoBackendHealth.checkHealth() ALREADY runs
+       a full multi-attempt probe internally (maxAttempts 3, retryDelays
+       [1500, 2500], timeout 6000ms by default) and drives the shared
+       backend state from its verdict. Calling it once IS the
+       multi-attempt check — wrapping it in this module's retry loop
+       would run up to 9 checks for one verdict. resetFailure() first
+       clears any cached failure (piece 42 documents it as the Retry
+       Search seam: it moves state to 'unknown', never claims 'up').
+       The caller's attempts/delays only override piece 42's defaults
+       when explicitly given; otherwise piece 42's tuning stands. */
+    var health = opts.health;
+    if (health && typeof health.checkHealth === 'function') {
+      if (typeof health.resetFailure === 'function') {
+        try { health.resetFailure(); } catch (e) {}
+      }
+      var co = {};
+      if (typeof opts.attempts === 'number' && opts.attempts > 0) co.maxAttempts = Math.floor(opts.attempts);
+      if (Array.isArray(opts.delays) && opts.delays.length) co.retryDelays = opts.delays;
+      if (typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0) co.timeoutMs = opts.timeoutMs;
+      var p42;
+      try {
+        p42 = Promise.resolve(health.checkHealth(co));
+      } catch (e) {
+        p42 = Promise.resolve(null);
+      }
+      return p42.then(function (result) {
+        var ok = verdictOf(result);
+        var n = (result && typeof result.attempts === 'number' && result.attempts > 0) ? result.attempts : 1;
+        var why = '';
+        if (!ok && result && typeof result === 'object') {
+          why = result.lastReason || result.reason || result.lastStatus || result.status || 'unreachable';
+        }
+        return { reachable: ok, attempts: n, lastCheck: result, lastReason: ok ? '' : String(why) };
+      }, function () {
+        return { reachable: false, attempts: 1, lastCheck: null, lastReason: 'checkHealth-threw' };
+      });
+    }
+
+    var single = resolveSingleCheck(opts);
+    if (!single) {
+      return Promise.resolve({
+        reachable: false, attempts: 0, lastCheck: null,
+        lastReason: 'no-health-check-available'
+      });
+    }
+    var tried = 0;
+    var lastCheck = null;
+    var lastReason = '';
+    function oneAttempt() {
+      tried++;
+      var p;
+      try {
+        p = Promise.resolve(single());
+      } catch (e) {
+        p = Promise.resolve(null);
+      }
+      return p.then(function (result) {
+        lastCheck = result;
+        if (verdictOf(result)) {
+          return { reachable: true, attempts: tried, lastCheck: lastCheck, lastReason: '' };
+        }
+        lastReason = reasonOf(result) || 'unreachable';
+        if (tried >= attempts) {
+          return { reachable: false, attempts: tried, lastCheck: lastCheck, lastReason: lastReason };
+        }
+        var wait = delays[Math.min(tried - 1, delays.length - 1)];
+        return sleep(wait).then(oneAttempt);
+      }, function () {
+        /* A throwing check is one failed attempt, never a crash. */
+        lastCheck = null;
+        lastReason = 'check-threw';
+        if (tried >= attempts) {
+          return { reachable: false, attempts: tried, lastCheck: null, lastReason: lastReason };
+        }
+        var wait2 = delays[Math.min(tried - 1, delays.length - 1)];
+        return sleep(wait2).then(oneAttempt);
+      });
+    }
+    return oneAttempt();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* armBackgroundRecovery(opts) — "it will keep retrying in the         */
+  /* background". Re-probes on an interval until the backend answers,    */
+  /* then stops itself and calls onRecovered. Returns {stop, ticks}.     */
+  /* opts: {probe (probeBackend opts), intervalMs=30000, intervalFn,     */
+  /*        clearIntervalFn, onRecovered, setUp}. The interval only ever  */
+  /* runs ONE single check per tick (attempts: 1) so it never hammers    */
+  /* the backend; the full 3-attempt probe is for on-demand decisions.   */
+  /* ------------------------------------------------------------------ */
+  function armBackgroundRecovery(opts) {
+    opts = opts || {};
+    var intervalMs = (typeof opts.intervalMs === 'number' && opts.intervalMs > 0)
+      ? opts.intervalMs : DEFAULT_BG_INTERVAL_MS;
+    var setInt = (typeof opts.intervalFn === 'function') ? opts.intervalFn : setInterval;
+    var clearInt = (typeof opts.clearIntervalFn === 'function') ? opts.clearIntervalFn : clearInterval;
+    var ticks = 0;
+    var stopped = false;
+    var handle = null;
+    function stop() {
+      if (stopped) return;
+      stopped = true;
+      if (handle != null) { try { clearInt(handle); } catch (e) {} handle = null; }
+    }
+    function tick() {
+      if (stopped) return null;
+      ticks++;
+      var probeOpts = {};
+      var k;
+      for (k in opts.probe || {}) { if (Object.prototype.hasOwnProperty.call(opts.probe, k)) probeOpts[k] = opts.probe[k]; }
+      probeOpts.attempts = 1;
+      return probeBackend(probeOpts).then(function (probe) {
+        if (stopped) return;
+        if (probe.reachable) {
+          stop();
+          if (typeof opts.setUp === 'function') { try { opts.setUp(true, probe); } catch (e) {} }
+          if (typeof opts.onRecovered === 'function') { try { opts.onRecovered(probe); } catch (e) {} }
+        }
+      });
+    }
+    handle = setInt(tick, intervalMs);
+    return { stop: stop, ticks: function () { return ticks; } };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* retryAsk(question, opts) — the NEW Retry Search behaviour.          */
+  /*   (a) Force a FRESH multi-attempt backend health check FIRST. The   */
+  /*       cached v2Up flag and backendGate59.ok are NEVER trusted here. */
+  /*   (b) Reachable -> run the REAL backend ask path (opts.runBackend,  */
+  /*       wired by the assembler to the P-F runBackendAsk59 route),     */
+  /*       never the legacy fallback.                                    */
+  /*   (c) Sustained unreachable (all attempts fail) -> opts.runFallback */
+  /*       only, with the honest one-line notice attached; background    */
+  /*       re-probing is armed so real research resumes on recovery.     */
+  /*   (d) No health-check mechanism at all (probe.attempts === 0) ->    */
+  /*       UNKNOWN, not down: attempt the real backend ask once. A       */
+  /*       failed ask is then handled by guardedAsk; silently falling    */
+  /*       back with zero evidence would repeat the screenshot bug.      */
+  /* Resolves {path:'backend'|'fallback'|'error', probe, notice?, ...}.  */
+  /* Never rejects for ask/health outcomes. opts.runBackend /            */
+  /* opts.runFallback are injected by the assembler (see WIRING-43.md);  */
+  /* when a hook is missing the outcome still reports the honest path.   */
+  /* ------------------------------------------------------------------ */
+  function retryAsk(question, opts) {
+    opts = opts || {};
+    var q = (question == null) ? '' : String(question);
+    if (!q.trim()) {
+      return Promise.resolve({ path: 'error', reason: 'empty-question', probe: null, notice: null });
+    }
+    var lang = normLang(opts.lang);
+    var probeOpts = opts.probe || {};
+    if (!probeOpts.health && typeof window !== 'undefined' && window.EnzoBackendHealth) probeOpts.health = window.EnzoBackendHealth;
+    if (!probeOpts.pagesBackend && typeof window !== 'undefined' && window.EnzoPagesBackend) probeOpts.pagesBackend = window.EnzoPagesBackend;
+    if (typeof opts.sleep === 'function') probeOpts.sleep = opts.sleep;
+    if (typeof opts.attempts === 'number') probeOpts.attempts = opts.attempts;
+    if (Array.isArray(opts.delays)) probeOpts.delays = opts.delays;
+    if (typeof opts.check === 'function') probeOpts.check = opts.check;
+    return probeBackend(probeOpts).then(function (probe) {
+      var unknown = (probe.attempts === 0);
+      if (probe.reachable || unknown) {
+        if (typeof opts.setUp === 'function') { try { opts.setUp(true, probe); } catch (e) {} }
+        if (typeof opts.runBackend === 'function') {
+          var out;
+          try {
+            out = opts.runBackend(q, { deep: !!opts.deep, viaVoice: !!opts.viaVoice, lang: lang, recovered: true, probe: probe, unknownProbe: unknown });
+          } catch (e) {
+            return { path: 'backend', probe: probe, notice: null, runError: String(e && e.message || e) };
+          }
+          return Promise.resolve(out).then(function () {
+            return { path: 'backend', probe: probe, notice: null, unknownProbe: unknown };
+          });
+        }
+        return { path: 'backend', probe: probe, notice: null, unknownProbe: unknown, runBackendMissing: true };
+      }
+      /* Sustained unreachable: fallback, honestly labelled. */
+      var notice = fallbackNotice(lang);
+      if (typeof opts.setUp === 'function') { try { opts.setUp(false, probe); } catch (e) {} }
+      var bg = null;
+      if (opts.armBackground !== false) {
+        bg = armBackgroundRecovery({
+          probe: probeOpts,
+          intervalMs: opts.bgIntervalMs,
+          intervalFn: opts.intervalFn,
+          clearIntervalFn: opts.clearIntervalFn,
+          setUp: opts.setUp,
+          onRecovered: opts.onRecovered
+        });
+      }
+      if (typeof opts.runFallback === 'function') {
+        var fbOut;
+        try {
+          fbOut = opts.runFallback(q, { deep: !!opts.deep, viaVoice: !!opts.viaVoice, lang: lang, notice: notice, probe: probe, backgroundRecovery: bg });
+        } catch (e) {
+          return { path: 'fallback', probe: probe, notice: notice, backgroundRecovery: bg, runError: String(e && e.message || e) };
+        }
+        return Promise.resolve(fbOut).then(function () {
+          return { path: 'fallback', probe: probe, notice: notice, backgroundRecovery: bg };
+        });
+      }
+      return { path: 'fallback', probe: probe, notice: notice, backgroundRecovery: bg, runFallbackMissing: true };
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* guardedAsk(ctx, opts) — wrap the existing ask entry so ONE failed   */
+  /* request NEVER flips the app into fallback mode.                     */
+  /*   attempt(ctx)        — one backend attempt; the assembler passes   */
+  /*                         runBackendAsk59 (safe to re-run:             */
+  /*                         ensureBackendChat is cached and              */
+  /*                         uploadChatFiles skips already-uploaded       */
+  /*                         files — enao-ai.html lines 15759-15790).    */
+  /*   runFallback(ctx)    — fallbackLegacy, called ONLY after the       */
+  /*                         multi-attempt probe fails. The ctx it gets  */
+  /*                         carries ctx.fallbackNotice (one plain line, */
+  /*                         ctx.lang) and ctx.fallback = true.          */
+  /*   setUp(up, probe)    — piece-42 state hook; NEVER called with     */
+  /*                         false on a single failure. Only after the   */
+  /*                         sustained probe failure.                    */
+  /*   maxBackendAttempts  — backend tries total (default 2: the first   */
+  /*                         failure + one retry after a good re-probe). */
+  /* Resolves {path:'backend'|'fallback', recovered, attempts, probe,    */
+  /* notice?}. Never rejects for ask/health outcomes.                    */
+  /* ------------------------------------------------------------------ */
+  function guardedAsk(ctx, opts) {
+    opts = opts || {};
+    var maxBackendAttempts = (typeof opts.maxBackendAttempts === 'number' && opts.maxBackendAttempts > 0)
+      ? Math.floor(opts.maxBackendAttempts) : 2;
+    var probeOpts = opts.probe || {};
+    if (!probeOpts.health && typeof window !== 'undefined' && window.EnzoBackendHealth) probeOpts.health = window.EnzoBackendHealth;
+    if (!probeOpts.pagesBackend && typeof window !== 'undefined' && window.EnzoPagesBackend) probeOpts.pagesBackend = window.EnzoPagesBackend;
+    if (typeof opts.sleep === 'function') probeOpts.sleep = opts.sleep;
+    if (typeof opts.check === 'function') probeOpts.check = opts.check;
+    var lang = normLang(ctx && ctx.lang);
+    var backendTries = 0;
+    var lastProbe = null;
+
+    function doFallback(reason) {
+      var notice = fallbackNotice(lang);
+      if (ctx && typeof ctx === 'object') {
+        ctx.fallback = true;
+        ctx.fallbackNotice = notice;
+        ctx.fallbackModeWhy = fallbackModeWhy(ctx.route && ctx.route.label);
+      }
+      /* State flips to down ONLY when the probe proved sustained
+         unreachable. When the backend is up but the ask itself keeps
+         failing ('backend-attempt-failed-after-retry'), the fallback
+         covers this one question only — flipping global state would be
+         the exact false-flag bug this piece fixes. */
+      if (reason === 'backend-unreachable' && typeof opts.setUp === 'function') { try { opts.setUp(false, lastProbe); } catch (e) {} }
+      if (typeof opts.runFallback === 'function') {
+        var fb;
+        try { fb = opts.runFallback(ctx); } catch (e) {
+          return Promise.resolve({ path: 'fallback', recovered: false, attempts: backendTries, probe: lastProbe, notice: notice, reason: reason, runError: String(e && e.message || e) });
+        }
+        return Promise.resolve(fb).then(function () {
+          return { path: 'fallback', recovered: false, attempts: backendTries, probe: lastProbe, notice: notice, reason: reason };
+        });
+      }
+      return Promise.resolve({ path: 'fallback', recovered: false, attempts: backendTries, probe: lastProbe, notice: notice, reason: reason, runFallbackMissing: true });
+    }
+
+    function attemptOnce() {
+      backendTries++;
+      var p;
+      try {
+        p = Promise.resolve(opts.attempt(ctx));
+      } catch (e) {
+        p = Promise.reject(e);
+      }
+      return p.then(function (value) {
+        return { path: 'backend', recovered: backendTries > 1, attempts: backendTries, probe: lastProbe, notice: null, value: value };
+      }, function () {
+        /* ONE failure: do NOT fall back and do NOT re-probe when no retry
+           is left. Re-probe only when a retry is still available: the
+           probe verdict decides retry-vs-fallback, and a probe that just
+           said "reachable" is not re-run after the retry fails. */
+        if (backendTries >= maxBackendAttempts) return doFallback('backend-attempt-failed-after-retry');
+        return probeBackend(probeOpts).then(function (probe) {
+          lastProbe = probe;
+          var unknown = (probe.attempts === 0);
+          if (probe.reachable || unknown) {
+            /* Backend is up (or no probe exists to say otherwise): the
+               failure was this one request, not the backend. Retry the
+               backend ask once instead of flipping to fallback. */
+            return attemptOnce();
+          }
+          /* Sustained unreachable across all probe attempts: only now
+             is the fallback honest. */
+          return doFallback('backend-unreachable');
+        });
+      });
+    }
+
+    if (typeof opts.attempt !== 'function') {
+      return Promise.resolve({ path: 'error', reason: 'missing-attempt', recovered: false, attempts: 0, probe: null, notice: null });
+    }
+    return attemptOnce();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* ACCURACY GUARD — the standing rule, enforced in code.               */
+  /* validateFallbackAnswer(answer) returns {ok, failures[]}.            */
+  /* answer: {plain|text|html, sources:[{...}], modeWhy, lang}.          */
+  /*   FAIL if: modeWhy does not say "fallback"; the visible text claims */
+  /*   research / verified sources / a researched count; the answer has  */
+  /*   zero real sources and no fallback notice (an unverified guess);   */
+  /*   citation markers [1] appear with zero sources; the text carries   */
+  /*   an emoji. A fallback answer that passes is one that (a) is        */
+  /*   labelled fallback in modeWhy AND in its visible text, (b) only    */
+  /*   cites sources it actually fetched, and (c) says plainly when     */
+  /*   nothing could be verified.                                        */
+  /* ------------------------------------------------------------------ */
+  var RESEARCH_CLAIM_PATTERNS = [
+    /live research/i,
+    /\bresearched\b/i,
+    /\bresearching\b/i,
+    /verified sources/i,
+    /sources confirm/i,
+    /according to (live )?research/i,
+    /\b100 websites\b/i,
+    /\b\d+\s+(websites|sources)\s+(researched|checked|verified|searched)\b/i
+  ];
+
+  function stripHonestPhrases(text, lang) {
+    var t = String(text || '');
+    var langs = ['en', 'roman', 'urdu'];
+    var i;
+    for (i = 0; i < langs.length; i++) {
+      var n = FALLBACK_NOTICE[langs[i]];
+      if (n && t.indexOf(n) !== -1) t = t.split(n).join(' ');
+    }
+    /* The notice's own forward-looking sentence is honest, not a claim
+       that research already happened. Honest denials ("not live
+       research", "live research nahi") are denials, not claims. */
+    t = t.replace(/real research resumes? automatically[^.]*/gi, ' ');
+    t = t.replace(/not (a )?live research[^.]*/gi, ' ');
+    t = t.replace(/live research nahi[^.]*/gi, ' ');
+    t = t.replace(/لائیو ریسرچ نہیں/gi, ' ');
+    t = t.replace(/no research was run/gi, ' ');
+    t = t.replace(/fallback search only/gi, ' ');
+    t = t.replace(/built-in fallback search/gi, ' ');
+    return t;
+  }
+
+  function findResearchClaim(text) {
+    var i;
+    for (i = 0; i < RESEARCH_CLAIM_PATTERNS.length; i++) {
+      var m = RESEARCH_CLAIM_PATTERNS[i].exec(text);
+      if (m) return m[0];
+    }
+    return null;
+  }
+
+  function hasEmoji(text) {
+    var s = String(text || '');
+    var i, code;
+    for (i = 0; i < s.length; i++) {
+      code = s.charCodeAt(i);
+      if (code >= 0xD800 && code <= 0xDBFF) return true; /* surrogate pair = emoji / pictograph */
+      if (code >= 0x2600 && code <= 0x27BF) return true; /* misc symbols / dingbats */
+      if (code >= 0x2B00 && code <= 0x2BFF) return true;
+      if (code >= 0x1F000 && code <= 0x1FAFF) return true;
+    }
+    return false;
+  }
+
+  function visibleTextOf(answer) {
+    if (!answer || typeof answer !== 'object') return '';
+    var t = answer.plain || answer.text || '';
+    if (!t && answer.html) t = String(answer.html).replace(/<[^>]*>/g, ' ');
+    return String(t || '');
+  }
+
+  function validateFallbackAnswer(answer, opts) {
+    opts = opts || {};
+    var failures = [];
+    var lang = normLang(answer && answer.lang);
+    var text = visibleTextOf(answer);
+    var modeWhy = (answer && answer.modeWhy) || '';
+    var sources = (answer && Array.isArray(answer.sources)) ? answer.sources : [];
+    var usableSources = sources.filter(function (s) {
+      return s && ((s.extract || s.snippet || '').trim().length > 25 || s.final_url || s.url);
+    });
+
+    /* 1. The mode must say fallback — never research. */
+    if (!/fallback/i.test(modeWhy)) {
+      failures.push('modeWhy-must-say-fallback');
+    }
+    if (/live research/i.test(modeWhy) && !/fallback/i.test(modeWhy)) {
+      failures.push('modeWhy-claims-live-research');
+    }
+
+    /* 2. The visible text must label the fallback too, not only modeWhy. */
+    if (!/fallback/i.test(text)) {
+      failures.push('fallback-not-labelled-in-text');
+    }
+
+    /* 3. No research claims in the answer body (notice text excluded). */
+    var body = stripHonestPhrases(text, lang);
+    var claim = findResearchClaim(body);
+    if (claim) {
+      failures.push('fallback-claims-research: ' + claim);
+    }
+
+    /* 4. Zero usable sources + substantive answer body = an unverified
+          guess presented as an answer. Merely whispering the word
+          "fallback" once does not excuse it: after the notice, the
+          fallback label itself, and any honest "could not verify / could
+          not find" line are stripped, nothing claim-like may remain.
+          The honest outcome with zero sources is the notice, or an
+          explicit "could not verify" line — never bare claims. */
+    var notice = FALLBACK_NOTICE[lang];
+    var hasNotice = text.indexOf(notice) !== -1 || /fallback/i.test(text);
+    if (usableSources.length === 0 && text.trim().length > 0 && !hasNotice) {
+      failures.push('unverified-answer-without-label');
+    }
+    var unlabelled = body.replace(/fallback/gi, ' ')
+      .replace(/\b\w+\s+could not (verify|find)\b[^.!?]*[.!?]?/gi, ' ')
+      .replace(/\b\w+\s+couldn.?t (verify|find)\b[^.!?]*[.!?]?/gi, ' ')
+      .replace(/no usable (results|sources|pages)[^.!?]*[.!?]?/gi, ' ')
+      .replace(/not verified[^.!?]*[.!?]?/gi, ' ')
+      .replace(/^[.,;:!?\s]+/, '').replace(/[.,;:!?\s]+$/, '');
+    if (usableSources.length === 0 && unlabelled.length > 0) {
+      failures.push('unverified-claims-without-sources');
+    }
+    if (usableSources.length === 0 && /\[\d+\]/.test(body)) {
+      failures.push('citations-without-sources');
+    }
+
+    /* 5. A claimed researched count must never exceed fetched sources. */
+    var countMatch = /(\d+)\s+(websites|sources)\s+(researched|checked|verified|searched)/i.exec(body);
+    if (countMatch && parseInt(countMatch[1], 10) > usableSources.length) {
+      failures.push('fabricated-count: claims ' + countMatch[1] + ' but fetched ' + usableSources.length);
+    }
+
+    /* 6. No emoji in fallback output. */
+    if (hasEmoji(text) || hasEmoji(modeWhy)) {
+      failures.push('emoji-in-fallback');
+    }
+
+    return { ok: failures.length === 0, failures: failures };
+  }
+
+  function isResearchClaim(text) {
+    return findResearchClaim(stripHonestPhrases(text, 'en'));
+  }
+
+  /* Attach the honest label to a message object about to be delivered
+     from the fallback path. Sets modeWhy to the fallback wording,
+     marks fallback=true / researched=false, and prepends the one-line
+     notice to plain and html when it is not already there. Idempotent:
+     calling it twice does not duplicate the notice. */
+  function applyFallbackLabel(msg, lang) {
+    if (!msg || typeof msg !== 'object') return msg;
+    var l = normLang(lang || msg.lang);
+    var notice = fallbackNotice(l);
+    msg.fallback = true;
+    msg.researched = false;
+    msg.modeWhy = fallbackModeWhy(msg.modeWhy && !/fallback/i.test(msg.modeWhy)
+      ? msg.modeWhy.replace(/\s*[—–-]\s*.*$/, '')
+      : undefined);
+    if (typeof msg.plain === 'string') {
+      if (msg.plain.indexOf(notice) === -1) msg.plain = notice + '\n\n' + msg.plain;
+    }
+    if (typeof msg.html === 'string') {
+      if (msg.html.indexOf(notice) === -1) msg.html = fallbackNoticeHtml(l) + msg.html;
+    }
+    if (typeof msg._fullHtml === 'string') {
+      if (msg._fullHtml.indexOf(notice) === -1) msg._fullHtml = fallbackNoticeHtml(l) + msg._fullHtml;
+    }
+    return msg;
+  }
+
+  function describeProbe(probe) {
+    if (!probe) return 'Backend not checked yet.';
+    if (probe.attempts === 0) return 'Backend check unavailable — no health-check mechanism present; the real ask will be tried once.';
+    if (probe.reachable) return 'Backend reachable (' + probe.attempts + ' attempt' + (probe.attempts > 1 ? 's' : '') + ').';
+    return 'Backend unreachable after ' + probe.attempts + ' attempts' +
+      (probe.lastReason ? ' (' + probe.lastReason + ')' : '') + '.';
+  }
+
+  return {
+    VERSION: VERSION,
+    DEFAULT_ATTEMPTS: DEFAULT_ATTEMPTS,
+    DEFAULT_DELAYS_MS: DEFAULT_DELAYS_MS.slice(),
+    DEFAULT_BG_INTERVAL_MS: DEFAULT_BG_INTERVAL_MS,
+    probeBackend: probeBackend,
+    retryAsk: retryAsk,
+    guardedAsk: guardedAsk,
+    armBackgroundRecovery: armBackgroundRecovery,
+    fallbackNotice: fallbackNotice,
+    fallbackNoticeHtml: fallbackNoticeHtml,
+    fallbackModeWhy: fallbackModeWhy,
+    applyFallbackLabel: applyFallbackLabel,
+    validateFallbackAnswer: validateFallbackAnswer,
+    isResearchClaim: isResearchClaim,
+    describeProbe: describeProbe
+  };
+});
+/* == END PIECE 43 == */
+</script>
+<script>
+/* == ASSEMBLED PIECE 44 — 44-poll-consolidation.js (v62-backend-fix) == */
+/* ==========================================================================
+ * ENAO AI — Piece 44: Poll Consolidation (44-poll-consolidation.js)
+ *
+ * ONE shared poll loop replaces the many overlapping setInterval / setTimeout
+ * pollers in the live v61 artifact. The v61 artifact ran a 450 ms monitor
+ * poll, a 600 ms-first-tick task poll chain, a 700 ms sync, a 1200 ms monitor
+ * sync, a 1000 ms panel-extras poll, a 500 ms state backstop, a 1500 ms
+ * panel tick and a 120 ms mouth-animation timer at the same time. On a slow
+ * device / network that saturates the browser's per-host connection pool
+ * (6 concurrent), ask/health fetches queue until they time out — and one
+ * timeout used to flip the app into "backend unreachable".
+ *
+ * Parent-verified server evidence (22 Nov 2026): the backend has run
+ * continuously since 5:37 PM with NRestarts=0 and every request returning
+ * 200. The "unreachable" state is a FRONTEND fault (pool saturation plus
+ * single-attempt flagging), not the backend stopping. This piece removes
+ * the amplifier; it never decides whether the backend is up or down.
+ *
+ * ACCURACY RULE (Raja, 22 Nov 2026 ~6:57 PM PKT): "ENZO ko accurate
+ * banao — chahe jo bhi ho, kisi bhi tarah se ENZO ghalti na kare."
+ * Applied here:
+ *   1. FRESH DATA ONLY. dedupedFetch() collapses only requests that are
+ *      IN FLIGHT at the same moment. A completed response is NEVER cached
+ *      or replayed: the next call always fetches fresh data. A slow
+ *      response must never overwrite newer state: every run carries a
+ *      sequence token (markRun / isCurrent); wiring code drops any
+ *      resolution whose token is no longer current.
+ *   2. STALE IS NEVER SHOWN AS FRESH. getStatus() reports dataState
+ *      ('fresh' | 'stale' | 'unknown' | 'error') from the age of the last
+ *      successful poll. Wiring code must check dataState before rendering
+ *      progress/status; stale data is shown as "updating..." or hidden,
+ *      never as a current number.
+ *   3. DUPLICATES NEVER DOUBLE-COUNT. Concurrent identical GETs share one
+ *      fetch, so two pollers asking for the same URL cannot inflate a
+ *      count or a progress figure.
+ *   4. WHAT CANNOT BE VERIFIED IS SAID PLAINLY. Poll failures are
+ *      reported only to this loop's own backoff. This module holds NO
+ *      backend up/down state at all — that belongs to piece 42's health
+ *      module. A poller that has never succeeded reports 'unknown', not
+ *      a guessed value.
+ *
+ * UMD/IIFE, ES5 style, no dependencies, no emoji. Loads in a browser as
+ * window.EnzoPollLoop and in Node as module.exports (for the test harness).
+ * Does NOT touch voice/language code. Does NOT change poll payloads or
+ * endpoints. Does NOT change what any poller DOES, only when/how often
+ * it runs.
+ * ========================================================================== */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = api;
+  }
+  if (root) root.EnzoPollLoop = api;
+})(typeof window !== 'undefined' ? window : globalThis, function () {
+  'use strict';
+
+  var VERSION = '44-poll-consolidation-v1';
+
+  /* ---- Floors (milliseconds). A poller may never run faster than these. -- */
+  var TASK_MIN_MS = 2000;   /* task-progress polling while a task runs */
+  var IDLE_MIN_MS = 5000;   /* idle status polling */
+  var PANEL_MIN_MS = 2000;  /* panel extras / panel tick refresh */
+  var OTHER_MIN_MS = 1000;  /* any other registered poller */
+  var TICK_MS = 250;        /* the single shared loop's own cadence */
+  var MAX_BACKOFF_MS = 30000;
+  var BACKOFF_AFTER = 3;    /* consecutive failures before backoff starts */
+  var STALE_AFTER_MULT = 2; /* data older than 2x effective interval = stale */
+  var JITTER = 0.10;        /* +/-10% scheduling jitter */
+
+  /* ---- State ---------------------------------------------------------- */
+  var pollers = {};         /* name -> poller record */
+  var loopTimer = null;     /* the ONE setInterval handle */
+  var inFlightFetch = {};   /* url key -> shared promise (in-flight only) */
+  var lastFetchAt = {};     /* url key -> timestamp the fetch COMPLETED */
+  var context = { hasActiveTask: false, panelVisible: true };
+  var seqCounters = {};     /* name -> latest sequence token issued */
+
+  function now() { return Date.now(); }
+
+  function floorFor(kind, requested) {
+    var min;
+    if (kind === 'task') min = TASK_MIN_MS;
+    else if (kind === 'idle') min = IDLE_MIN_MS;
+    else if (kind === 'panel') min = PANEL_MIN_MS;
+    else min = OTHER_MIN_MS;
+    var ms = Number(requested);
+    if (!isFinite(ms) || ms <= 0) ms = min;
+    return Math.max(ms, min);
+  }
+
+  function jittered(ms, useJitter) {
+    if (!useJitter) return ms;
+    var f = 1 + (Math.random() * 2 - 1) * JITTER;
+    return Math.max(1, Math.round(ms * f));
+  }
+
+  /* ---- Loop control --------------------------------------------------- */
+  /* The loop runs only while something needs polling. When there is no
+   * active task AND the panel is not visible, polling STOPS entirely. */
+  function contextAllowsPolling() {
+    return !!(context.hasActiveTask || context.panelVisible);
+  }
+
+  function maybeStart() {
+    if (loopTimer !== null) return;
+    if (!contextAllowsPolling()) return;
+    if (Object.keys(pollers).length === 0) return;
+    loopTimer = setInterval(tick, TICK_MS);
+  }
+
+  function maybeStop() {
+    if (loopTimer === null) return;
+    if (contextAllowsPolling() && Object.keys(pollers).length > 0) return;
+    clearInterval(loopTimer);
+    loopTimer = null;
+  }
+
+  function tick() {
+    var t = now();
+    var names = Object.keys(pollers);
+    for (var i = 0; i < names.length; i++) {
+      var p = pollers[names[i]];
+      if (!p) continue;
+      if (p.inFlight) continue;              /* never overlap the same poller */
+      if (t < p.nextRunAt) continue;
+      if (p.active && !p.active()) {          /* optional per-poller gate */
+        p.nextRunAt = t + jittered(p.effectiveMs, p.jitter);
+        continue;
+      }
+      runPoller(p, t);
+    }
+  }
+
+  function effectiveMsFor(p) {
+    var ms = p.baseMs * Math.pow(2, p.backoffLevel);
+    return Math.min(ms, MAX_BACKOFF_MS);
+  }
+
+  function runPoller(p, t) {
+    var seq = (seqCounters[p.name] || 0) + 1;
+    seqCounters[p.name] = seq;
+    p.seq = seq;
+    p.inFlight = true;
+    p.lastStartAt = t;
+    var result;
+    try {
+      result = p.fn();
+    } catch (err) {
+      onPollerFailure(p, err);
+      return;
+    }
+    if (result && typeof result.then === 'function') {
+      result.then(function () { onPollerSuccess(p, seq); },
+                  function (err) { onPollerFailure(p, err, seq); });
+    } else {
+      onPollerSuccess(p, seq);
+    }
+  }
+
+  function onPollerSuccess(p, seq) {
+    /* A success only counts if no newer run of this poller has started
+     * since (a newer run supersedes this one). */
+    if (seq !== undefined && seq !== seqCounters[p.name]) {
+      p.inFlight = false;
+      return;
+    }
+    p.inFlight = false;
+    p.consecutiveFailures = 0;
+    p.backoffLevel = 0;
+    p.effectiveMs = p.baseMs;
+    p.lastSuccessAt = now();
+    p.lastErrorAt = null;
+    scheduleNext(p);
+    if (typeof p.onSuccess === 'function') {
+      try { p.onSuccess(p.name); } catch (e) {}
+    }
+  }
+
+  function onPollerFailure(p, err, seq) {
+    if (seq !== undefined && seq !== seqCounters[p.name]) {
+      p.inFlight = false;
+      return;
+    }
+    p.inFlight = false;
+    p.consecutiveFailures += 1;
+    p.lastErrorAt = now();
+    /* 3 failures in a row -> double the interval, up to the 30 s cap.
+     * Each further consecutive failure doubles again. Success resets. */
+    if (p.consecutiveFailures >= BACKOFF_AFTER) {
+      p.backoffLevel += 1;
+      p.effectiveMs = effectiveMsFor(p);
+    }
+    scheduleNext(p);
+    /* Failures are reported ONLY to this loop's own backoff. This module
+     * never flips, sets, or implies any backend up/down state. */
+    if (typeof p.onError === 'function') {
+      try { p.onError(p.name, err, p.consecutiveFailures); } catch (e) {}
+    }
+  }
+
+  function scheduleNext(p) {
+    p.nextRunAt = now() + jittered(p.effectiveMs, p.jitter);
+  }
+
+  /* ---- Public API ----------------------------------------------------- */
+  function registerPoller(name, fn, intervalMs, opts) {
+    if (!name || typeof fn !== 'function') {
+      throw new Error('EnzoPollLoop.registerPoller: name and fn are required');
+    }
+    opts = opts || {};
+    var kind = opts.kind || 'other';
+    var baseMs = floorFor(kind, intervalMs);
+    var useJitter = opts.jitter !== false;
+    var existing = pollers[name];
+    pollers[name] = {
+      name: name,
+      fn: fn,
+      kind: kind,
+      baseMs: baseMs,
+      effectiveMs: baseMs,
+      jitter: useJitter,
+      active: (typeof opts.active === 'function') ? opts.active : null,
+      onError: (typeof opts.onError === 'function') ? opts.onError : null,
+      onSuccess: (typeof opts.onSuccess === 'function') ? opts.onSuccess : null,
+      inFlight: false,
+      consecutiveFailures: 0,
+      backoffLevel: 0,
+      lastStartAt: null,
+      lastSuccessAt: (existing && existing.lastSuccessAt) || null,
+      lastErrorAt: (existing && existing.lastErrorAt) || null,
+      nextRunAt: now() + jittered(baseMs, useJitter),
+      seq: (seqCounters[name] || 0)
+    };
+    maybeStart();
+    return pollers[name].baseMs;
+  }
+
+  function unregisterPoller(name) {
+    if (pollers[name]) {
+      delete pollers[name];
+      maybeStop();
+      return true;
+    }
+    return false;
+  }
+
+  /* Change a poller's interval at run time (e.g. task paused -> 4000 ms).
+   * Floors are still enforced; the kind floor always applies. */
+  function setIntervalMs(name, ms) {
+    var p = pollers[name];
+    if (!p) return false;
+    p.baseMs = floorFor(p.kind, ms);
+    if (p.backoffLevel === 0) p.effectiveMs = p.baseMs;
+    return true;
+  }
+
+  function setContext(ctx) {
+    if (!ctx) return;
+    if (typeof ctx.hasActiveTask === 'boolean') context.hasActiveTask = ctx.hasActiveTask;
+    if (typeof ctx.panelVisible === 'boolean') context.panelVisible = ctx.panelVisible;
+    if (contextAllowsPolling()) maybeStart();
+    else maybeStop();
+  }
+
+  function getContext() {
+    return { hasActiveTask: context.hasActiveTask, panelVisible: context.panelVisible };
+  }
+
+  /* Resume polling on demand (e.g. a task just started, panel just shown). */
+  function wake() {
+    maybeStart();
+    var t = now();
+    var names = Object.keys(pollers);
+    for (var i = 0; i < names.length; i++) {
+      var p = pollers[names[i]];
+      if (p.nextRunAt > t + p.effectiveMs) p.nextRunAt = t;
+    }
+  }
+
+  function start() { maybeStart(); }
+  function stop() {
+    if (loopTimer !== null) { clearInterval(loopTimer); loopTimer = null; }
+  }
+  function isRunning() { return loopTimer !== null; }
+
+  /* ---- Sequence / freshness guards (accuracy) ------------------------- */
+  /* Issue a fresh sequence token for a fetch a caller is about to make
+   * outside a registered run (e.g. the one-off getTask after a task
+   * completes). isCurrent() is false once a newer token exists, so a slow
+   * response can be recognised as stale and dropped, never rendered. */
+  function markRun(name) {
+    var seq = (seqCounters[name] || 0) + 1;
+    seqCounters[name] = seq;
+    if (pollers[name]) pollers[name].seq = seq;
+    return seq;
+  }
+
+  function isCurrent(name, seq) {
+    return seqCounters[name] === seq;
+  }
+
+  /* Freshness of a poller's last good data. 'unknown' = never succeeded
+   * (nothing verified yet — report that plainly, never guess). 'stale' =
+   * last success is older than 2x the effective interval. 'error' = failing
+   * repeatedly (3+ consecutive failures) while the last good data is still
+   * inside the stale window. Otherwise 'fresh'. */
+  function dataStateFor(p, t) {
+    if (p.lastSuccessAt === null) return 'unknown';
+    var age = t - p.lastSuccessAt;
+    if (age > STALE_AFTER_MULT * p.effectiveMs) return 'stale';
+    if (p.consecutiveFailures >= BACKOFF_AFTER) return 'error';
+    return 'fresh';
+  }
+
+  function statusFor(p, t) {
+    return {
+      name: p.name,
+      kind: p.kind,
+      baseIntervalMs: p.baseMs,
+      effectiveIntervalMs: p.effectiveMs,
+      consecutiveFailures: p.consecutiveFailures,
+      backoffLevel: p.backoffLevel,
+      inFlight: p.inFlight,
+      lastStartAt: p.lastStartAt,
+      lastSuccessAt: p.lastSuccessAt,
+      lastErrorAt: p.lastErrorAt,
+      dataState: dataStateFor(p, t),
+      dataAgeMs: (p.lastSuccessAt === null) ? null : (t - p.lastSuccessAt)
+    };
+  }
+
+  function getStatus(name) {
+    var t = now();
+    if (name) {
+      var p = pollers[name];
+      return p ? statusFor(p, t) : null;
+    }
+    var out = { running: isRunning(), context: getContext(), pollers: {} };
+    var names = Object.keys(pollers);
+    for (var i = 0; i < names.length; i++) out.pollers[names[i]] = statusFor(pollers[names[i]], t);
+    return out;
+  }
+
+  /* ---- Deduplicated fetch --------------------------------------------- */
+  /* If a GET for the same URL is already in flight, the new caller awaits
+   * the SAME promise instead of issuing a duplicate fetch — so two pollers
+   * asking for the same URL can never double-count or double-issue.
+   * The shared entry is deleted the moment the request settles, so a later
+   * call ALWAYS fetches fresh data: completed responses are never cached
+   * or replayed. Non-GET requests are never deduped. */
+  function dedupedFetch(url, opts, fetchFn) {
+    opts = opts || {};
+    var method = (opts.method || 'GET').toUpperCase();
+    var fn = fetchFn || (typeof fetch !== 'undefined' ? fetch : null);
+    if (!fn) throw new Error('EnzoPollLoop.dedupedFetch: no fetch available');
+    if (method !== 'GET') return fn(url, opts);
+    var key = method + ' ' + String(url);
+    if (inFlightFetch[key]) return inFlightFetch[key];
+    var promise = fn(url, opts);
+    inFlightFetch[key] = promise;
+    var settle = function (value, isErr) {
+      delete inFlightFetch[key];
+      lastFetchAt[key] = now();
+      if (isErr) throw value;
+      return value;
+    };
+    var shared = promise.then(
+      function (v) { return settle(v, false); },
+      function (e) { return settle(e, true); }
+    );
+    inFlightFetch[key] = shared;
+    return shared;
+  }
+
+  function lastFetchAtFor(url) {
+    var key = 'GET ' + String(url);
+    return (lastFetchAt[key] === undefined) ? null : lastFetchAt[key];
+  }
+
+  function reset() {
+    stop();
+    pollers = {};
+    inFlightFetch = {};
+    lastFetchAt = {};
+    seqCounters = {};
+    context = { hasActiveTask: false, panelVisible: true };
+  }
+
+  return {
+    VERSION: VERSION,
+    TASK_MIN_MS: TASK_MIN_MS,
+    IDLE_MIN_MS: IDLE_MIN_MS,
+    PANEL_MIN_MS: PANEL_MIN_MS,
+    MAX_BACKOFF_MS: MAX_BACKOFF_MS,
+    BACKOFF_AFTER: BACKOFF_AFTER,
+    registerPoller: registerPoller,
+    unregisterPoller: unregisterPoller,
+    setIntervalMs: setIntervalMs,
+    setContext: setContext,
+    getContext: getContext,
+    wake: wake,
+    start: start,
+    stop: stop,
+    isRunning: isRunning,
+    markRun: markRun,
+    isCurrent: isCurrent,
+    getStatus: getStatus,
+    dedupedFetch: dedupedFetch,
+    lastFetchAt: lastFetchAtFor,
+    reset: reset
+  };
+});
+/* == END PIECE 44 == */
+</script>
+<script>
 var state = {
   chats: [], activeId: null, deep: false, pendingMode: 'auto', alwaysDeep: false, voiceReply: true, sourcesOn: true,
   usage: 0, renameId: null, langPref: 'auto', isListening: false, isGenerating: false,
@@ -8497,8 +10023,32 @@ function buildMessageEl(m){
   var rg=wrap.querySelector('[data-act="regen"]');
   if(rg) rg.onclick=function(){ if(state.isGenerating){ toast('Wait for the current answer to finish'); return; } askQuestion(m.question, false, !!m.deep); };
   var rsb=wrap.querySelector('[data-act="retrySearch"]');
-  /* Retry re-runs the question in the SAME mode it was originally asked in */
-  if(rsb) rsb.onclick=function(){ if(state.isGenerating){ toast('Wait for the current answer to finish'); return; } if(m.question) askQuestion(m.question, false, !!m.deep); };
+  /* Piece 43: Retry re-probes the backend FIRST and runs the REAL backend
+     ask when it answers. It never re-runs in a falsely-flagged fallback. */
+  if(rsb) rsb.onclick=function(){ if(state.isGenerating){ toast('Wait for the current answer to finish'); return; } if(m.question) window.EnzoAskRecovery.retryAsk(m.question, {
+    deep: !!m.deep, viaVoice: false, lang: detectLang(m.question),
+    runBackend: function (q, o) {
+      /* Piece 42 already drove v2Up to true from the checkHealth verdict
+         (WIRING-42 §1 subscriber), so no flag is set here — just clear
+         the cached gate and re-enter the normal ask wrapper, which now
+         routes to backendAsk and the P-F runBackendAsk59 route. */
+      if (window.__enzoBackendGate59) window.__enzoBackendGate59.ok = true;
+      askQuestion(q, o.viaVoice, o.deep);
+      return Promise.resolve({ path: 'backend' });
+    },
+    runFallback: function (q, o) {
+      /* Sustained unreachable only: piece 42's checkHealth verdict
+         already set the state down, so askQuestion routes to the legacy
+         pipeline. The honest one-line notice (o.notice) is attached at
+         delivery by W4. */
+      askQuestion(q, o.viaVoice, o.deep);
+      return Promise.resolve({ path: 'fallback', notice: o.notice });
+    },
+    /* setUp is a seam for environments without piece 42. With piece 42
+       present it is a no-op by design: checkHealth already drove v2Up. */
+    setUp: function (up, probe) {},
+    onRecovered: function (probe) { /* flag cleared by piece 42; the next ask uses the backend */ }
+  }); };
   /* Share opens options first — nothing ever leaves the device without the user's tap */
   var shBtn=wrap.querySelector('[data-act="share"]'); var shMenu=wrap.querySelector('[data-sharemenu]');
   if(shBtn && shMenu){
@@ -8625,9 +10175,32 @@ function buildMessageElLegacy(m){
   var rg=wrap.querySelector('[data-act="regen"]');
   if(rg) rg.onclick=function(){ if(state.isGenerating){ toast('Wait for the current answer to finish'); return; } askQuestion(m.question, false, !!m.deep); };
   var rsb=wrap.querySelector('[data-act="retrySearch"]');
-  /* Retry re-runs the question in the SAME mode it was originally asked in —
-     a Deep Research question retries as Deep Research, never as Normal. */
-  if(rsb) rsb.onclick=function(){ if(state.isGenerating){ toast('Wait for the current answer to finish'); return; } if(m.question) askQuestion(m.question, false, !!m.deep); };
+  /* Piece 43: Retry re-probes the backend FIRST and runs the REAL backend
+     ask when it answers. It never re-runs in a falsely-flagged fallback. */
+  if(rsb) rsb.onclick=function(){ if(state.isGenerating){ toast('Wait for the current answer to finish'); return; } if(m.question) window.EnzoAskRecovery.retryAsk(m.question, {
+    deep: !!m.deep, viaVoice: false, lang: detectLang(m.question),
+    runBackend: function (q, o) {
+      /* Piece 42 already drove v2Up to true from the checkHealth verdict
+         (WIRING-42 §1 subscriber), so no flag is set here — just clear
+         the cached gate and re-enter the normal ask wrapper, which now
+         routes to backendAsk and the P-F runBackendAsk59 route. */
+      if (window.__enzoBackendGate59) window.__enzoBackendGate59.ok = true;
+      askQuestion(q, o.viaVoice, o.deep);
+      return Promise.resolve({ path: 'backend' });
+    },
+    runFallback: function (q, o) {
+      /* Sustained unreachable only: piece 42's checkHealth verdict
+         already set the state down, so askQuestion routes to the legacy
+         pipeline. The honest one-line notice (o.notice) is attached at
+         delivery by W4. */
+      askQuestion(q, o.viaVoice, o.deep);
+      return Promise.resolve({ path: 'fallback', notice: o.notice });
+    },
+    /* setUp is a seam for environments without piece 42. With piece 42
+       present it is a no-op by design: checkHealth already drove v2Up. */
+    setUp: function (up, probe) {},
+    onRecovered: function (probe) { /* flag cleared by piece 42; the next ask uses the backend */ }
+  }); };
   wrap.querySelector('[data-act="share"]').onclick=function(){ shareText('ENZO AI answer', m.plain||stripHtml(m.html)); };
   var likeBtn=wrap.querySelector('[data-act="like"]'); var disBtn=wrap.querySelector('[data-act="dislike"]');
   if(m.rating==='like') likeBtn.classList.add('on');
@@ -9884,7 +11457,7 @@ function megaSearchFlow(text, mega, chat, lang, historyText){
     finishTasks(true);
     setCentreEnzo('error');
     var fh=fallbackAnswer(text, [], lang, true);
-    if(!fh) fh='<div class="notice-warn"><p style="margin:0 0 10px">'+esc(searchFailMessage('unavailable'))+'</p><button type="button" class="retrybtn" data-act="retrySearch">Retry Search</button></div>';
+    if(!fh) fh='<div class="notice-warn"><p style="margin:0 0 10px">'+esc(window.EnzoAskRecovery.fallbackNotice(lang))+'</p><button type="button" class="retrybtn" data-act="retrySearch">Retry Search</button></div>';
     var errTl=timeLabelFor(Date.now());
     var megaErr={role:'ai', html:fh, plain:stripHtml(fh), error:true, viaVoice:!!state.currentAskViaVoice, question:text, sources:[], deep:true, mega:true, modeWhy:'Mega Deep Research (quantity request)', followups:makeFollowups(text,lang), lang:lang, ts:Date.now(), daypart:errTl.daypart, daypartRoman:errTl.daypartRoman, timeLabel:errTl.full};
     chat.messages.push(megaErr);
@@ -10166,7 +11739,7 @@ function askQuestion(text, viaVoice, forcedDeep){
       hideTyping(); finishTasks(true); setCentreEnzo('error');
       try{ if(window.__enzoLifecycle) window.__enzoLifecycle.failTask(myRun, 'definition-answer-failed'); }catch(e){}
       var fh2=fallbackAnswer(text, [], lang, false);
-      if(!fh2) fh2='<div class="notice-warn"><p style="margin:0 0 10px">'+esc(searchFailMessage('unavailable'))+'</p><button type="button" class="retrybtn" data-act="retrySearch">Retry Search</button></div>';
+      if(!fh2) fh2='<div class="notice-warn"><p style="margin:0 0 10px">'+esc(window.EnzoAskRecovery.fallbackNotice(lang))+'</p><button type="button" class="retrybtn" data-act="retrySearch">Retry Search</button></div>';
       var eTl2=timeLabelFor(Date.now());
       var eMsg2={role:'ai', html:fh2, plain:stripHtml(fh2), error:true, viaVoice:askViaVoice, question:text, sources:[], deep:false, modeWhy:route.label, auto:route.auto, followups:makeFollowups(text,lang), lang:lang, ts:Date.now(), daypart:eTl2.daypart, daypartRoman:eTl2.daypartRoman, timeLabel:eTl2.full};
       chat.messages.push(eMsg2); renderMessages(); setGenerating(false);
@@ -10301,7 +11874,7 @@ function askQuestion(text, viaVoice, forcedDeep){
     try{ if(window.__enzoLifecycle) window.__enzoLifecycle.failTask(myRun, 'search-pipeline-failed'); }catch(e){}
     setCentreEnzo('error');
     var fh=fallbackAnswer(text, [], lang, deep);
-    if(!fh) fh='<div class="notice-warn"><p style="margin:0 0 10px">'+esc(searchFailMessage('unavailable'))+'</p><button type="button" class="retrybtn" data-act="retrySearch">Retry Search</button></div>';
+    if(!fh) fh='<div class="notice-warn"><p style="margin:0 0 10px">'+esc(window.EnzoAskRecovery.fallbackNotice(lang))+'</p><button type="button" class="retrybtn" data-act="retrySearch">Retry Search</button></div>';
     var errTl=timeLabelFor(Date.now());
     var errMsg={role:'ai', html:fh, plain:stripHtml(fh), error:true, viaVoice:askViaVoice, question:text, sources:[], deep:deep, modeWhy:route.label, auto:route.auto, followups:makeFollowups(text,lang), lang:lang, ts:Date.now(), daypart:errTl.daypart, daypartRoman:errTl.daypartRoman, timeLabel:errTl.full};
     chat.messages.push(errMsg); renderMessages();
@@ -17741,6 +19314,7 @@ if (typeof window !== 'undefined') {
   function currentStatus(){
     var st=appState();
     if(navigator.onLine===false) return 'offline';
+    if(window.__enzoBackendDown===true) return 'error';
     if(ezState()==='error' || st.voiceState==='blocked') return 'error';
     if(st.isSpeaking || st.voiceState==='speaking') return 'speaking';
     if(st.voiceState==='listening' || st.isListening) return 'listening';
@@ -17925,8 +19499,11 @@ if (typeof window !== 'undefined') {
     rmBtn.onclick=function(){ if(typeof window.setEnzoReducedMotion==='function') window.setEnzoReducedMotion(!window.__enzoRM); syncRM(); };
   }
 
-  setInterval(function(){ pollStatus(); pollTask(); },450);
-  pollStatus(); pollTask();
+  /* Piece 44 §10 boot: the shared loop starts with no active task and a
+     visible panel; startPoll/stopPoll update this as tasks run/end. */
+  EnzoPollLoop.setContext({ hasActiveTask: false, panelVisible: true });
+  EnzoPollLoop.registerPoller('status-panel', function(){ pollStatus(); pollTask(); }, 5000, { kind: 'idle', jitter: false });
+  pollStatus(); pollTask();   /* keep the immediate first paint */
 })();
 </script>
 <script>
@@ -18509,12 +20086,20 @@ function setFallbackLine(on){
   el.hidden=!on;
   if(on) el.textContent='Platform backend unreachable — answers are using the built-in fallback search.';
 }
+/* Piece 42: the ONLY writer of the fallback banner is this onChange
+   subscriber. Nothing else in the file may drive the banner or the
+   backend-down flag from a probe failure. */
+window.__enzoBackendDown = false;
+window.EnzoBackendHealth.onChange(function (status) {
+  window.__enzoBackendDown = (status === 'down');
+  v2Up = (status === 'up');
+  setFallbackLine(status === 'down');
+});
 function v2health(){
-  return v2get('/health', 6000).then(function(j){
-    v2Up=!!(j && j.ok);
-    setFallbackLine(!v2Up);
-    return v2Up;
-  }).catch(function(){ v2Up=false; setFallbackLine(true); return false; });
+  return window.EnzoBackendHealth.checkHealth().then(function (r) {
+    v2Up = r.reachable;
+    return r.reachable;
+  });
 }
 
 /* ---------------- panel extras (state line, agent line, pause/resume) ---------------- */
@@ -18543,7 +20128,18 @@ function buildPanelExtras(){
     btnsRow.insertBefore(pb, btnsRow.firstChild);
     btnsRow.insertBefore(rb, btnsRow.firstChild.nextSibling);
   }
-  setInterval(updatePanelExtras, 1000);
+  EnzoPollLoop.registerPoller('panel-extras', function(){
+    /* Accuracy rule: never render progress numbers from stale data. */
+    var st = EnzoPollLoop.getStatus('task-progress');
+    if(st && st.dataState !== 'fresh'){
+      var al = $('v2AgentLine');
+      if(al && st.dataState !== 'unknown'){ al.textContent = 'Updating…'; al.hidden = false; }
+      /* 'unknown' (never succeeded) renders nothing — no guessed numbers. */
+      if(!st || st.dataState === 'unknown') return;
+      if(st.dataState === 'stale' || st.dataState === 'error') return; /* show 'Updating…' only */
+    }
+    updatePanelExtras();
+  }, 2000, { kind: 'panel' });
 }
 function fmtDur(s){
   if(s==null || isNaN(s)) return '';
@@ -18680,7 +20276,7 @@ function uploadChatFiles(chat, bid, files){
 }
 function fetchTaskSources(taskId){
   if(!taskId) return Promise.resolve([]);
-  return (transport59 ? transport59.getTaskSources(taskId) : v2get('/tasks/'+taskId+'/sources', 15000)).then(function(j){
+  return EnzoPollLoop.dedupedFetch('/api/v2/tasks/'+encodeURIComponent(taskId)+'/sources', {}, function(){ return (transport59 ? transport59.getTaskSources(taskId) : v2get('/tasks/'+taskId+'/sources', 15000)); }).then(function(j){
     var out=[], seen={};
     (j.sources||[]).forEach(function(s){
       var u=s.final_url||'';
@@ -18853,7 +20449,8 @@ function fallbackLegacy(ctx){
   /* v53-monitor wiring: the fallback /api/search proxy is now in use
      instead of /api/v2 — note exactly that in the monitor. */
   try{ if(window.EnzoMonitor) EnzoMonitor.noteFrontendStep({title:'Fallback search proxy in use \u2014 live backend events unavailable', detail:'Fallback search proxy in use \u2014 live backend events unavailable'}); }catch(e){}
-  v2Up=false; setFallbackLine(true);
+  /* Piece 43: fallbackLegacy must NOT set v2Up — backend state lives in
+     piece 42 (EnzoBackendHealth). It only runs the fallback and labels it. */
   var chat=ctx.chat, text=ctx.text, lang=ctx.lang, deep=ctx.route.deep, steps=ctx.steps;
   var historyText=chat.messages.slice(-12,-1).map(function(m){ var tl=timeLabelFor(m.ts||Date.now()); return '['+tl.full+'] '+(m.role==='user'?'User: ':'AI: ')+(m.text||stripHtml(m.html||'')).slice(0,450); }).join('\n');
   var fileCtx=(ctx.files||[]).map(function(f){ return f.text?('\n\n--- Attached file: '+f.name+' ---\n'+f.text.slice(0,6000)):'\n\n[Attached file: '+f.name+' ('+f.kind+') — no readable text could be extracted from it]'; }).join('');
@@ -18913,12 +20510,13 @@ function fallbackLegacy(ctx){
       var fk=(result.sources && result.sources.failKind) || 'empty';
       var qt1=analyzeQuestion(text).type;
       if(result.aiFailed)
-        fullHtml='<div class="notice-warn"><p style="margin:0 0 10px">'+esc(searchFailMessage(fk==='none'?'empty':fk))+'</p><button type="button" class="retrybtn" data-act="retrySearch">Retry Search</button></div>';
+        fullHtml='<div class="notice-warn"><p style="margin:0 0 10px">'+esc(window.EnzoAskRecovery.fallbackNotice(lang))+'</p><button type="button" class="retrybtn" data-act="retrySearch">Retry Search</button></div>';
       else if(qt1!=='writing' && qt1!=='solve' && !fbGuftagu)
         fullHtml=searchFailNoticeHtml(fk==='none'?'empty':fk)+fullHtml;
     }
     var msg=aiMsgShell(ctx, result.plain, {sources: state.sourcesOn?useSources:[], _fullHtml:fullHtml,
       modeWhy: ctx.route.label+' — fallback search (platform backend unreachable)'});
+    window.EnzoAskRecovery.applyFallbackLabel(msg, lang);
     chat.messages.push(msg); renderMessages(); saveChats();
     streamMessage(chat, msg);
   }).catch(function(){
@@ -18928,13 +20526,14 @@ function fallbackLegacy(ctx){
 }
 
 /* ---------------- research task polling: real backend progress only ---------------- */
-function stopPoll(){ if(currentPoll){ try{ if(window.EnzoTaskState59) window.EnzoTaskState59.endBackendTask(currentPoll.taskId); }catch(e){} clearTimeout(currentPoll.timer); currentPoll=null; } }
+function stopPoll(){ if(currentPoll){ try{ if(window.EnzoTaskState59) window.EnzoTaskState59.endBackendTask(currentPoll.taskId); }catch(e){} clearTimeout(currentPoll.timer); if(window.EnzoPollLoop){ EnzoPollLoop.unregisterPoller('task-progress'); try{ EnzoPollLoop.setContext({ hasActiveTask: false, panelVisible: (typeof document!=='undefined' && !document.hidden) }); }catch(e){} } currentPoll=null; } }
 function startPoll(chat, taskId, ctx, initialTask){
   try{ if(window.EnzoPollingFix) window.EnzoPollingFix.confirmTask(taskId); }catch(e){}
   try{ if(window.EnzoTaskState59) window.EnzoTaskState59.beginBackendTask(taskId); }catch(e){}
   stopPoll();
   var poll={taskId:taskId, chatId:chat.id, timer:null, strikes:0};
   currentPoll=poll;
+  try{ if(window.EnzoPollLoop){ EnzoPollLoop.setContext({ hasActiveTask: true, panelVisible: true }); EnzoPollLoop.wake(); } }catch(e){}
   window.__v2Task={taskId:taskId, chatId:chat.id, state:'running', done:0, total:(initialTask&&initialTask.plan&&initialTask.plan.subtasks)?initialTask.plan.subtasks.length:0, agents:[], elapsed_s:null, eta_s:null, eta_basis:null};
   /* v53-monitor wiring: the monitor tracks this task from the moment it starts. */
   try{ if(window.EnzoMonitor){ var _mp=EnzoMonitor.openTask(taskId); if(_mp&&_mp.catch) _mp.catch(function(){}); } }catch(e){}
@@ -18947,11 +20546,19 @@ function startPoll(chat, taskId, ctx, initialTask){
     }
   }
   if(initialTask && initialTask.plan) applyPlan(initialTask);
-  else (transport59 ? transport59.getTask(taskId) : v2get('/tasks/'+taskId, 15000)).then(applyPlan).catch(function(){});
-  function tick(){
-    if(currentPoll!==poll) return;
-    (transport59 ? transport59.getTaskProgress(taskId) : v2get('/tasks/'+taskId+'/progress', 15000)).then(function(p){
-      if(currentPoll!==poll) return;
+  else (function(){ var seq0 = EnzoPollLoop.markRun('task-progress'); return EnzoPollLoop.dedupedFetch('/api/v2/tasks/'+encodeURIComponent(taskId), {}, function(){ return (transport59 ? transport59.getTask(taskId) : v2get('/tasks/'+taskId, 15000)); }).then(function(j){ if(!EnzoPollLoop.isCurrent('task-progress', seq0)) return; applyPlan(j); }).catch(function(){}); })();
+  /* Piece 44 §2: the self-chaining tick is now the shared loop's
+     'task-progress' poller (task, 2000ms; paused 4000ms). The first
+     read now happens at 2000ms, not 600ms — the first-tick burst
+     was part of the overload. Progress shares its in-flight request
+     with the Live Screen poller via dedupedFetch (§9). */
+  EnzoPollLoop.registerPoller('task-progress', function(){
+    if(currentPoll!==poll) { EnzoPollLoop.unregisterPoller('task-progress'); return Promise.resolve(); }
+    var seq = EnzoPollLoop.markRun('task-progress');
+    return EnzoPollLoop.dedupedFetch('/api/v2/tasks/'+encodeURIComponent(taskId)+'/progress', {}, function(){ return (transport59 ? transport59.getTaskProgress(taskId) : v2get('/tasks/'+taskId+'/progress', 15000)); })
+      .then(function(p){
+        if(!EnzoPollLoop.isCurrent('task-progress', seq)) return; /* stale: a newer run superseded this one — drop it, never render it */
+        if(currentPoll!==poll) return;
       poll.strikes=0;
       try{ if(window.__enzoLifecycle) window.__enzoLifecycle.syncStatus(ctx.myRun, p.state); }catch(e){}
       window.__v2Task={taskId:taskId, chatId:chat.id, state:p.state, done:p.done||0, total:p.total||0, agents:p.agents||[], elapsed_s:(p.elapsed_s!=null?p.elapsed_s:null), eta_s:(p.eta_s!=null?p.eta_s:null), eta_basis:p.eta_basis||null};
@@ -18959,7 +20566,8 @@ function startPoll(chat, taskId, ctx, initialTask){
       if(p.state==='completed' || p.state==='partially_completed'){
         stopPoll();
         try{ if(window.__enzoLifecycle) window.__enzoLifecycle.completeTask(ctx.myRun); }catch(e){}
-        (transport59 ? transport59.getTask(taskId) : v2get('/tasks/'+taskId, 20000)).then(function(j){
+        EnzoPollLoop.dedupedFetch('/api/v2/tasks/'+encodeURIComponent(taskId), {}, function(){ return (transport59 ? transport59.getTask(taskId) : v2get('/tasks/'+taskId, 20000)); }).then(function(j){
+          if(!EnzoPollLoop.isCurrent('task-progress', seq)) return;
           var t=j.task||{}, r=t.result||{};
           var ans=r.answer||r.report||'';
           return fetchTaskSources(taskId).then(function(srcs){ return deliverAnswer(ctx, ans, srcs, 'research', taskId); });
@@ -18969,7 +20577,8 @@ function startPoll(chat, taskId, ctx, initialTask){
       if(p.state==='failed'){
         stopPoll();
         try{ if(window.__enzoLifecycle) window.__enzoLifecycle.failTask(ctx.myRun, 'backend-task-failed'); }catch(e){}
-        (transport59 ? transport59.getTask(taskId) : v2get('/tasks/'+taskId, 15000)).then(function(j){
+        EnzoPollLoop.dedupedFetch('/api/v2/tasks/'+encodeURIComponent(taskId), {}, function(){ return (transport59 ? transport59.getTask(taskId) : v2get('/tasks/'+taskId, 15000)); }).then(function(j){
+          if(!EnzoPollLoop.isCurrent('task-progress', seq)) return;
           var r=(j.task&&j.task.result)||{};
           if(r.answer || r.report) return fetchTaskSources(taskId).then(function(srcs){ return deliverAnswer(ctx, r.answer||r.report, srcs, 'research', taskId); });
           deliverError(ctx);
@@ -18984,15 +20593,16 @@ function startPoll(chat, taskId, ctx, initialTask){
         return;
       }
       if(p.state==='paused') setTypingStatus('Paused');
-      poll.timer=setTimeout(tick, p.state==='paused'?4000:2500);
+      if(p.state==='paused') EnzoPollLoop.setIntervalMs('task-progress', 4000);
+      else EnzoPollLoop.setIntervalMs('task-progress', 2000);
     }).catch(function(){
       if(currentPoll!==poll) return;
       poll.strikes++;
       if(poll.strikes>=3){ stopPoll(); if(!ctx.delivered && !state.stopRequested) fallbackLegacy(ctx); return; }
-      poll.timer=setTimeout(tick, 3000);
+      /* Do NOT schedule a retry here — the loop re-runs at the floored
+         interval and applies its own backoff after 3 consecutive failures. */
     });
-  }
-  poll.timer=setTimeout(tick, 600);
+  }, 2000, { kind: 'task' });
 }
 
 /* ---------------- ask response handling ---------------- */
@@ -19070,8 +20680,8 @@ function backendAsk(text, viaVoice, forcedDeep){
   }
   /* v59-live-research-fix (Piece 33 [9]): honest-unreachable ask gate. Before ANY backend fetch for this ask, the resolved backend is checked once; a successful check is cached for the session, a failed check is re-run on the next ask (never cached as permanent). When the check blocks, the notice is shown in the chat in the user's language and the ask STOPS: nothing is sent, no normal-mode answer is presented as research, and the search proxy is not used as a silent substitute. This gate is in addition to the existing v2Up fallback line. */
   var backendGate59 = window.__enzoBackendGate59 || (window.__enzoBackendGate59 = { ok: false });
-  function runBackendAsk59(){
-  ensureBackendChat(chat).then(function(bid){
+  function attemptBackendAsk59(){
+  return ensureBackendChat(chat).then(function(bid){
     ctx.bid=bid;
     return uploadChatFiles(chat, bid, files).then(function(uploaded){
       ctx.uploaded=uploaded;
@@ -19090,19 +20700,40 @@ function backendAsk(text, viaVoice, forcedDeep){
         .then(function(resp){ if(ctx.myRun!==searchRunId || state.stopRequested) return null; return handleAskResp(ctx, resp); })
         .then(function(){ return {handled:true}; });
     });
-  }).catch(function(){
-    if(ctx.delivered || state.stopRequested) return;
-    if(myRun!==searchRunId) return;
-    fallbackLegacy(ctx);
   });
+  }
+  function runBackendAsk59(){
+    attemptBackendAsk59().catch(function(){
+      if(ctx.delivered || state.stopRequested) return;
+      if(myRun!==searchRunId) return;
+      /* Piece 43: one failed request never flips the app into fallback.
+         Re-probe first; fallback only after the multi-attempt check fails. */
+      window.EnzoAskRecovery.guardedAsk(ctx, {
+        attempt: function () { return attemptBackendAsk59(); },
+        runFallback: function (c) { fallbackLegacy(c); },
+        /* setUp is a seam for environments without piece 42. With
+           piece 42 present it is a no-op by design: checkHealth already
+           drove v2Up from the probe verdict. */
+        setUp: function (up, probe) {}
+      });
+    });
   }
   if(backendGate59.ok){ runBackendAsk59(); }
   else if(!window.EnzoPagesBackend){ runBackendAsk59(); }
   else {
-    window.EnzoPagesBackend.checkBackendReachable().then(function(check59){
+    /* Piece 43: the gate re-proves "down" with a fresh multi-attempt
+       check before blocking anything. One failed check is not proof. */
+    window.EnzoAskRecovery.probeBackend({ attempts: 3 }).then(function(probe59){
+      /* Piece 42 §2b: the notice is built from the module's lastProbe —
+         the piece-33 shape ({reason, base, httpStatus}) — so the
+         unavailable-notice text is unchanged. probeBackend's lastCheck
+         is the checkHealth summary, which carries no reason/base. */
+      var check59 = window.EnzoBackendHealth.getState().lastProbe;
       if(ctx.delivered || state.stopRequested || myRun!==searchRunId) return;
-      if(window.EnzoPagesBackend.shouldBlockAsk(check59)){
-        v2Up=false; setFallbackLine(true);
+      if(!probe59.reachable && window.EnzoPagesBackend.shouldBlockAsk(check59)){
+        /* Piece 43 + piece 42: state lives in piece 42 — never assign
+           v2Up here. checkHealth already set the state down from its
+           verdict (WIRING-42 §1 subscriber). */
         localizeAnswer(window.EnzoPagesBackend.buildUnavailableNotice(check59), lang).then(function(notice59){
           if(ctx.delivered) return;
           ctx.delivered=true;
@@ -19131,7 +20762,7 @@ function defaultCtx(chat, task){
 function restoreBackendForChat(chat){
   if(!chat || v2Up===false) return;
   ensureBackendChat(chat).then(function(bid){
-    return v2get('/chats/'+bid+'/tasks', 15000);
+    return EnzoPollLoop.dedupedFetch('/api/v2/chats/'+encodeURIComponent(bid)+'/tasks', {}, function(){ return v2get('/chats/'+bid+'/tasks', 15000); });
   }).then(function(j){
     var tasks=(j.tasks||[]).slice().sort(function(a,b){ return (b.created_at||0)-(a.created_at||0); });
     if(!tasks.length) return;
@@ -19634,7 +21265,26 @@ window.askQuestion=function(text, viaVoice, forcedDeep){
   if(text && window.__remindersTry && window.__remindersTry(text, viaVoice)) return;
   if(text && !state.pendingFiles.length && typeof smallTalkReply==='function' && smallTalkReply(text, detectLang(text))) return origAskQuestion(text, viaVoice, forcedDeep);
   if(text && typeof parseMegaRequest==='function' && parseMegaRequest(text)) return origAskQuestion(text, viaVoice, forcedDeep);
-  if(v2Up===false) return origAskQuestion(text, viaVoice, forcedDeep);
+  if(v2Up===false){
+    /* Piece 43: a stale false flag never sends a new ask to legacy
+       without a fresh check — the backend may have recovered, or may
+       never have been down (see EVIDENCE-43.md). The small-talk /
+       reminder / mega guards above have already run, so routing to
+       backendAsk directly here is correct. The user message appears
+       after the ~1s probe instead of instantly. */
+    window.EnzoAskRecovery.probeBackend({ attempts: 2 }).then(function (probe) {
+      if (probe.reachable) {
+        /* Piece 42 already drove v2Up to true from the checkHealth
+           verdict (WIRING-42 §1 subscriber); just clear the cached gate. */
+        if (window.__enzoBackendGate59) window.__enzoBackendGate59.ok = true;
+        backendAsk(text, viaVoice, forcedDeep);
+      } else {
+        /* checkHealth already set the state down; route to legacy. */
+        origAskQuestion(text, viaVoice, forcedDeep);
+      }
+    });
+    return;
+  }
   backendAsk(text, viaVoice, forcedDeep);
 };
 var origStopGeneration=window.stopGeneration;
@@ -19666,8 +21316,8 @@ window.openChatById=function(id){
 buildPanelExtras();
 buildReminderPanel();
 buildSettingsExtras();
-v2health().then(function(){ restoreBackendForChat(activeChat()); });
-setInterval(function(){ if(v2Up===false) v2health(); }, 60000);
+window.EnzoBackendHealth.start(); /* immediate full verdict, then: re-probe every 15s while down, light probe every 60s while up */
+window.EnzoBackendHealth.checkHealth().then(function(){ restoreBackendForChat(activeChat()); });
 reminderEngineStart();
 bgInit();
 window.__v2={up:function(){ return v2Up; }, health:v2health};
@@ -20616,7 +22266,17 @@ queryMic();
 renderPerms();
 buildPanelMenu();
 tickPanel();
-setInterval(tickPanel, 1500);
+EnzoPollLoop.registerPoller('panel-tick', function(){
+  /* Accuracy rule: the run line must not claim work is happening from
+     stale task data. */
+  var st = EnzoPollLoop.getStatus('task-progress');
+  if(st && st.dataState === 'stale'){
+    var line = $('rpRunLine');
+    if(line) line.textContent = 'Updating…';
+    return;
+  }
+  tickPanel();
+}, 2000, { kind: 'panel' });
 wireLibrary();
 })();
 </script>
@@ -22624,12 +24284,13 @@ window.askQuestion=function(text, viaVoice, forcedDeep){
     /* Backstop poll: catches any direct state change and also heals the
        chain if something later replaces window.setEnzoState outright. */
     if (!pollTimer) {
-      pollTimer = setInterval(function () {
+      EnzoPollLoop.registerPoller('state-backstop', function () {
         chainWrapSetEnzoState();
         if (typeof window.getEnzoState === 'function') {
           try { applyAppState(window.getEnzoState()); } catch (e) {}
         }
-      }, 500);
+      }, 5000, { kind: 'idle', jitter: false });
+      pollTimer = true; /* keep the existing "already installed" guard; the loop owns the timer now */
     }
     /* Initial sync — show the robot's current state immediately. */
     if (typeof window.getEnzoState === 'function') {
@@ -22738,7 +24399,7 @@ window.askQuestion=function(text, viaVoice, forcedDeep){
     get element() { return mountEl; },
     get instance() { return avatar; },
     destroy: function () {
-      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      if (pollTimer) { EnzoPollLoop.unregisterPoller('state-backstop'); pollTimer = null; }
       /* Note: the setEnzoState chain-wrap is intentionally NOT unwound —
          unwinding it would risk breaking the app's own wrapper (L11742). */
     }
@@ -26438,7 +28099,7 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
       return; // No chat yet: nothing to poll. start() resumes on setChatId.
     }
     var chatId = state.chatId;
-    var eventsPromise59 = (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getChatEvents(chatId, sinceCursor) : httpJson('/chats/' + encodeURIComponent(chatId) + '/events?since=' + sinceCursor, { timeoutMs: LONG_POLL_TIMEOUT_MS }));
+    var eventsPromise59 = EnzoPollLoop.dedupedFetch('/api/v2/chats/' + encodeURIComponent(chatId) + '/events?since=' + sinceCursor, {}, function(){ return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getChatEvents(chatId, sinceCursor) : httpJson('/chats/' + encodeURIComponent(chatId) + '/events?since=' + sinceCursor, { timeoutMs: LONG_POLL_TIMEOUT_MS })); });
     eventsPromise59.then(function (j) {
       if (!running || state.chatId !== chatId) return;
       backoffStep = 0;
@@ -26968,7 +28629,7 @@ body.enzo-live-fullscreen #enzoMonitorPanel,
 
   function listTasks() {
     if (!state.chatId) return Promise.resolve([]);
-    return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getChatTasks(state.chatId) : httpJson('/chats/' + encodeURIComponent(state.chatId) + '/tasks', { timeoutMs: 15000 })).then(function (j) {
+    return EnzoPollLoop.dedupedFetch('/api/v2/chats/' + encodeURIComponent(state.chatId) + '/tasks', {}, function(){ return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getChatTasks(state.chatId) : httpJson('/chats/' + encodeURIComponent(state.chatId) + '/tasks', { timeoutMs: 15000 })); }).then(function (j) {
       var rows = (j && Array.isArray(j.tasks)) ? j.tasks
         : (Array.isArray(j) ? j : []);
       var out = [];
@@ -48410,7 +50071,7 @@ if (typeof module !== 'undefined' && module.exports) {
     var chain = Promise.resolve();
 
     chain = chain.then(function () {
-      return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTask(taskId) : httpGet(taskUrl(taskId)));
+      return EnzoPollLoop.dedupedFetch('/api/v2/tasks/' + encodeURIComponent(taskId), {}, function(){ return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTask(taskId) : httpGet(taskUrl(taskId))); });
     }).then(function (j) {
       var task = (j && j.task) ? j.task : j;
       applyTaskData(task);
@@ -48425,14 +50086,14 @@ if (typeof module !== 'undefined' && module.exports) {
        then reflects the latest real event, not the progress snapshot
        taken a moment earlier. */
     chain = chain.then(function () {
-      return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTaskProgress(taskId) : httpGet(progressUrl(taskId)));
+      return EnzoPollLoop.dedupedFetch('/api/v2/tasks/' + encodeURIComponent(taskId) + '/progress', {}, function(){ return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTaskProgress(taskId) : httpGet(progressUrl(taskId))); });
     }).then(function (p) {
       applyProgressData(p);
     }, function (err) { if (err && err.status === 404) { S.autoPoll = false; stopPollTimer(); } /* v59: a progress 404 stops the loop; other progress failures are best-effort */ });
 
     if (chatId && !S.eventsOff59) {
       chain = chain.then(function () {
-        return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getChatEvents(chatId, S.sinceCursor) : httpGet(eventsUrl(chatId, S.sinceCursor)));
+        return EnzoPollLoop.dedupedFetch('/api/v2/chats/' + encodeURIComponent(chatId) + '/events?since=' + S.sinceCursor, {}, function(){ return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getChatEvents(chatId, S.sinceCursor) : httpGet(eventsUrl(chatId, S.sinceCursor))); });
       }).then(function (j) {
         applyEventsData(j);
         S.connected = true;
@@ -48445,7 +50106,7 @@ if (typeof module !== 'undefined' && module.exports) {
 
     chain = chain.then(function () {
       if (isTerminalLifecycle(S.lifecycle) && !terminalBefore) {
-        return httpGet(sourcesUrl(taskId)).then(function (j) {
+        return EnzoPollLoop.dedupedFetch('/api/v2/tasks/' + encodeURIComponent(taskId) + '/sources', {}, function(){ return httpGet(sourcesUrl(taskId)); }).then(function (j) {
           applySourcesData(j);
         }, function () { /* sources failure is shown via S.error only if nothing else failed */ });
       }
@@ -50277,8 +51938,8 @@ if (typeof module !== 'undefined' && module.exports) {
       }
     } catch (e) {}
   }
-  setInterval(sync59, 700);
-  sync59();
+  EnzoPollLoop.registerPoller('sync59-watchdog', sync59, 5000, { kind: 'idle', jitter: false });
+  sync59();   /* keep the immediate first sync */
 
   /* ------------------------------------------------------------------ */
   /* Shared chat-delivery helpers (same message shapes the page uses)    */
@@ -50579,7 +52240,7 @@ if (typeof module !== 'undefined' && module.exports) {
   }
   syncMonitorChat();
   try{ if(window.EnzoPollingFix) window.EnzoPollingFix.install(); }catch(e){}
-  setInterval(syncMonitorChat, 1200);
+  EnzoPollLoop.registerPoller('monitor-chat-sync', syncMonitorChat, 5000, { kind: 'idle', jitter: false });
 })();
 </script>
 <script>
