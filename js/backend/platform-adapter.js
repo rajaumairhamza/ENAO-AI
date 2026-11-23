@@ -665,6 +665,7 @@ function backendAsk(text, viaVoice, forcedDeep){
       }
       var qText55=EnaoConversation.resolveFollowUp(text, {history:chat.messages}).resolvedText;
       var askBody45={question:qText55, deep:route.deep, via_voice:!!viaVoice, preferences:(function(){ var p=learnedPrefs(); p.depth='thorough'; p.cross_check=true; p.work='complete ready-to-use deliverable, step by step; state plainly the one final step that needs the user login or tap; never claim anything was posted, published or sent'; p.never_refuse='When the user orders work, never refuse and never give up: try another route when one is blocked; if genuinely impossible right now, state the exact blocker and exactly what is needed from the user, then continue when provided.'; try{ var ur=JSON.parse(localStorage.getItem('enao_userrules_v1')||'[]'); if(ur && ur.length) p.user_rules=ur; }catch(e){} return p; })()};
+      askBody45.history=(typeof buildAskHistory==='function')?buildAskHistory(chat.messages):[];
       if(window.EnzoLang45 && window.EnzoLang45.buildAskBody){ try{ askBody45=window.EnzoLang45.buildAskBody(askBody45, lang); }catch(e){} }
       return v2post('/chats/'+bid+'/ask', askBody45, 90000)
         .then(function(resp){ if(ctx.myRun!==searchRunId || state.stopRequested) return null; return handleAskResp(ctx, resp); })
