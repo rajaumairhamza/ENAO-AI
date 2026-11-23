@@ -345,29 +345,11 @@ function socRegisterBuiltins() {
         return 'https://www.youtube.com/results?search_query=' +
           socEncode(q);
       }),
-    socBuiltin('reddit',
-      ['posts', 'profiles', 'trending', 'hashtags'], 'public-json',
-      'reddit.com', 'works-free', 'partially-implemented',
-      ['public subreddit JSON (.json, no auth, rate-limited)',
-       'public search JSON (search.json, no auth, rate-limited)',
-       'public post and user pages found through the web-search proxy'],
-      [],
-      ['high-volume official API access (needs OAuth app)'],
-      ['private subreddits', 'logged-in-only content',
-       'private messages', 'posting, commenting or voting'],
-      'site:reddit.com web search via /api/search; direct .json ' +
-      'fetch via /api/fetch for a known subreddit or search URL',
-      'The .json suffix on any public Reddit URL returns JSON with no ' +
-      'auth (confirmed by current public guides, Nov 2026); ' +
-      'rate-limited to roughly 10-60 requests per minute per IP, ' +
-      'and datacenter IPs may get a 403 block page.',
-      false,
-      'Rate limits apply; the engine makes at most one search per ' +
-      'platform per query, so it stays well inside them.',
-      function (q) {
-        return 'https://www.reddit.com/search.json?q=' + socEncode(q) +
-          '&sort=relevance&limit=25';
-      }),
+    /* P6 (v68): the 'reddit' builtin registration is DELETED — it pointed
+       the engine at public Reddit JSON (reddit.com/search.json and .json
+       fetches). Public Reddit reading, if any, goes through P4's
+       social-feed (public RSS/Atom documents) only. A 'reddit' question
+       now plans as unknown-platform with the web-search fallback. */
     socBuiltin('telegram',
       ['posts', 'profiles'], 'public-page',
       't.me', 'works-free', 'partially-implemented',

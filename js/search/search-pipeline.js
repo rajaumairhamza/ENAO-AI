@@ -1,11 +1,16 @@
 /* ---------- SEARCH ----------
-   Pipeline: the same-origin /api/search service FIRST (real results — DuckDuckGo
-   Lite + Wikipedia, ads filtered — served by the ENZO search proxy), then the
-   browser-side fallbacks in order: Wikipedia API, DuckDuckGo Lite via the
-   DuckDuckGo Instant Answer. Every provider outcome is
-   classified (ok / empty / network / http / timeout) so the UI can say exactly
-   what happened. Only real pages a provider actually returned ever become
-   sources — nothing is invented, padded or dressed up. */
+   Pipeline (v68 P6): the same-origin /api/search service ONLY. All search
+   goes through the proxy interface (SearXNG -> RSS -> direct HTML fetch,
+   owned by the P2 backend piece) — the browser itself calls NO search
+   provider any more: the Wikipedia API, DuckDuckGo Lite and DuckDuckGo
+   Instant Answer browser fallbacks are deleted (they lived in
+   searchOneQuery below). Every proxy outcome is classified (ok / empty /
+   network / http / timeout) so the UI can say exactly what happened, and
+   an empty proxy answer is reported honestly as "no usable pages" — it is
+   never silently backfilled from another provider, and an empty answer is
+   never treated as proof the search itself worked (see aggregateFailKind).
+   Only real pages the proxy actually returned ever become sources —
+   nothing is invented, padded or dressed up. */
 var searchRunId=0;
 var searchInFlight=null;
 function beginSearchRun(){
@@ -42,22 +47,14 @@ function fetchJSONT(url, ms){
     return r.json();
   }).catch(function(err){ throw classifySearchErr(err); });
 }
-function fetchTextT(url, ms){
-  return fetchT(url, ms).then(function(r){
-    if(!r.ok){ var e=new Error('http '+r.status); e.kind='http'; e.status=r.status; throw e; }
-    return r.text();
-  }).catch(function(err){ throw classifySearchErr(err); });
-}
+/* P6 (v68): fetchTextT deleted with the browser-side provider chain below —
+   it existed only for ddgLiteSearchP, and no other caller in the tree uses
+   it (verified by grep). */
 /* Kept for any other caller: JSON fetch with a hard timeout */
 function fetchJSON(url){ return fetchJSONT(url, 12000); }
-function delayMs(ms){ return new Promise(function(res){ setTimeout(res, ms); }); }
-/* One retry with a short delay — never an unlimited retry loop */
-function withRetry(fn){
-  return fn().catch(function(e1){
-    if(e1 && e1.kind==='aborted') throw e1;
-    return delayMs(600).then(fn);
-  });
-}
+/* P6 (v68): delayMs / withRetry deleted with the browser-side provider chain
+   below — they existed only for the removed providers' retry, and no other
+   caller in the tree uses them (verified by grep). */
 /* Providers resolve to {results, fail} and never reject — except 'aborted',
    which means a newer question has taken over and this run must stop. */
 function provOutcome(p){
@@ -97,11 +94,34 @@ function resolveNewsLinks(results){
     return results.filter(function(r){ return !r.unresolvableNews; });
   });
 }
+/* Map a proxy-reported upstream status string onto the fail kinds the UI
+   already understands (see searchFailMessage). Unknown / ok-ish values
+   fall through to 'empty' — the caller never invents a failure. P2 names
+   the real status field; this accepts any of status / searchStatus /
+   failKind / error / upstreamStatus so the frontend honours it whichever
+   name P2 settles on. */
+function proxyFailKind(st){
+  var s=String(st||'').toLowerCase();
+  if(!s || s==='ok' || s==='success' || s==='empty' || s==='no-results' || s==='no_results') return 'empty';
+  if(/network|connection|offline|dns|econn|enotfound/.test(s)) return 'network';
+  if(/timeout|timed?\s*out|deadline/.test(s)) return 'timeout';
+  if(/http\s*[45]\d\d|status\s*[45]\d\d/.test(s)) return 'http';
+  return 'unavailable';
+}
 /* 1) Same-origin search service — its results are used exactly as returned,
    except Google News redirect links, which are resolved to their direct
    publisher URLs first (see resolveNewsLinks above). */
 function serverSearch(query, limit){
+  /* P6 (v68): the proxy may report its own upstream state explicitly
+     (P2 backend: a status / error field on the JSON). Capture it here so
+     an empty answer that the proxy itself flags as a failure is never
+     reported as a plain "no results" — see the .then below. When the
+     proxy exposes no status field, the fail stays 'empty' (provOutcome)
+     and aggregateFailKind still never claims the search worked. */
+  var proxyStatus='';
   return provOutcome(fetchJSONT(window.EnzoPagesBackend.getSearchUrl('/api/search?q='+encodeURIComponent(query)), 15000).then(function(j){
+    var st=j&&typeof j==='object'?(j.status||j.searchStatus||j.failKind||j.error||j.upstreamStatus||''): '';
+    if(typeof st==='string' && st) proxyStatus=st;
     var arr=Array.isArray(j)?j:((j&&(j.results||j.items))||[]);
     var out=[];
     arr.forEach(function(r){
@@ -119,7 +139,12 @@ function serverSearch(query, limit){
       out.push({title:String(r.title||dom||'Web page'), url:u, snippet:snip.slice(0,1000), extract:snip, source:dom||'Web', domain:dom, favicon:r.favicon?String(r.favicon):'', pubDate:pub?String(pub):'', outlet:outlet, isNews:!!(pub||/news/i.test(kind)), finalUrl:r.finalUrl?String(r.finalUrl):''});
     });
     return resolveNewsLinks(out.slice(0, 12));
-  }));
+  })).then(function(o){
+    /* P6 (v68): an empty answer the proxy itself flagged as a failure is
+       reported with that failure kind, never as plain 'empty'. */
+    if(!o.results.length && proxyStatus) o.fail=proxyFailKind(proxyStatus);
+    return o;
+  });
 }
 /* Grounding: read a result page's main text through the same-origin /api/fetch.
    This only runs when the search service answered (same-origin deployments);
@@ -178,58 +203,10 @@ function enrichMergedPages(results){
   return Promise.all(jobs).then(function(){ return results; });
 }
 
-/* 2) Wikipedia API — browser-side fallback */
-function wikiSearchP(query, langCode, limit){
-  var url='https://'+langCode+'.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch='+encodeURIComponent(query)+'&gsrlimit='+limit+'&prop=extracts|info&exintro=1&explaintext=1&inprop=url&format=json&origin=*';
-  return provOutcome(withRetry(function(){
-    return fetchJSONT(url, 10000).then(function(j){
-      var out=[]; if(j.query && j.query.pages){ Object.keys(j.query.pages).forEach(function(k){ var p=j.query.pages[k]; out.push({title:p.title, url:p.canonicalurl||('https://'+langCode+'.wikipedia.org/wiki/'+encodeURIComponent(p.title)), snippet:(p.extract||'').slice(0,420), extract:p.extract||'', source:'Wikipedia'}); }); }
-      return out;
-    });
-  }));
-}
-/* 3) DuckDuckGo Lite — browser-side fallback, fetched DIRECTLY from
-   DuckDuckGo (no third-party proxy ever sees the query). Where the browser
-   blocks the direct call, this provider simply reports its failure and the
-   chain moves on to the next provider. Only real result links are parsed
-   out; ad redirects and DuckDuckGo's own pages are dropped. */
-function ddgLiteSearchP(query){
-  var url='https://lite.duckduckgo.com/lite/?q='+encodeURIComponent(query);
-  return provOutcome(withRetry(function(){
-    return fetchTextT(url, 10000).then(function(html){
-      var out=[];
-      if(!html || html.length<200 || !window.DOMParser) return out;
-      var doc=new DOMParser().parseFromString(html,'text/html');
-      var links=doc.querySelectorAll('a.result-link');
-      for(var i=0;i<links.length && out.length<8;i++){
-        var a=links[i]; var href=a.getAttribute('href')||'';
-        if(/y\.js|duckduckgo\.com\/y\//i.test(href)) continue;
-        var real=href; var m=href.match(/[?&]uddg=([^&]+)/);
-        if(m){ try{ real=decodeURIComponent(m[1]); }catch(e){} }
-        if(!/^https?:\/\//i.test(real) || /duckduckgo\.com/i.test(real)) continue;
-        var snip=''; var node=a.closest('tr');
-        for(var k=0;k<3 && node;k++){ node=node.nextElementSibling; if(!node) break; var sd=node.querySelector?node.querySelector('.result-snippet'):null; if(sd){ snip=(sd.textContent||'').replace(/\s+/g,' ').trim(); break; } }
-        var title=(a.textContent||'').replace(/\s+/g,' ').trim();
-        if(!title) continue;
-        out.push({title:title.slice(0,140), url:real, snippet:snip.slice(0,420), extract:snip, source:'Web'});
-      }
-      return out;
-    });
-  }));
-}
-/* 4) DuckDuckGo Instant Answer — browser-side fallback */
-function ddgSearchP(query){
-  var url='https://api.duckduckgo.com/?q='+encodeURIComponent(query)+'&format=json&no_html=1&skip_disambig=1';
-  return provOutcome(withRetry(function(){
-    return fetchJSONT(url, 10000).then(function(j){
-      var out=[];
-      /* Only a real page URL may become a source — never a search-engine query page. */
-      if(j.AbstractText && j.AbstractURL && !/duckduckgo\.com/.test(j.AbstractURL)){ out.push({title:j.Heading||query, url:j.AbstractURL, snippet:j.AbstractText.slice(0,420), extract:j.AbstractText, source:j.AbstractSource||'DuckDuckGo'}); }
-      if(j.RelatedTopics){ j.RelatedTopics.slice(0,6).forEach(function(t){ if(t.Text && t.FirstURL) out.push({title:t.Text.slice(0,80), url:t.FirstURL, snippet:t.Text.slice(0,300), extract:t.Text, source:'Web'}); }); }
-      return out;
-    });
-  }));
-}
+/* P6 (v68): the browser-side provider fallbacks are DELETED — Wikipedia API
+   (wikiSearchP), DuckDuckGo Lite (ddgLiteSearchP) and DuckDuckGo Instant
+   Answer (ddgSearchP) used to live here. All search now goes through the
+   same-origin proxy interface (serverSearch above); see searchOneQuery. */
 
 var PLATFORM_QUERY_WORDS={
   youtube:['youtube','yt','یوٹیوب'],
@@ -751,24 +728,29 @@ function groundedFallback(query, sources, lang, deep){
   if(paras) h+=(lang==='urdu'?'<h3>اہم تفصیل</h3>':(lang==='roman'?'<h3>Ahem Tafseel</h3>':'<h3>Key Details</h3>'))+paras;
   return {html:h, plain:stripHtml(h), sources:used};
 }
-/* Turn the recorded provider failures into one honest reason:
-   every failure a network error → connection; any HTTP error or timeout after
-   retries → service unavailable; providers answered but found nothing → empty. */
+/* Turn the recorded provider failures into one honest reason.
+   P6 (v68): the old rule — "a provider that answered, even with zero
+   results, proves the search itself worked" — is DELETED. An empty
+   answer proves nothing about whether the search itself worked (an
+   upstream 202 / empty leg looks exactly like "no results" from here),
+   so it must never override a real error: any network / http / timeout
+   failure in the list decides the kind, and 'empty' is returned only
+   when EVERY recorded leg came back empty with no error at all. */
 function aggregateFailKind(fails){
   var list=fails||[];
-  /* A provider that answered — even with zero results — proves the search itself
-     worked; the honest outcome is then "no usable results", never "unavailable".
-     Only when NO provider answered at all is this a service failure, classified
-     by the errors: all network errors → connection, anything else → unavailable. */
-  if(list.indexOf('empty')>-1) return 'empty';
   var real=list.filter(function(f){ return f && f!=='empty'; });
-  if(!real.length) return 'empty';
-  if(real.every(function(f){ return f==='network'; })) return 'connection';
-  return 'unavailable';
+  if(real.length){
+    if(real.every(function(f){ return f==='network'; })) return 'connection';
+    return 'unavailable';
+  }
+  return 'empty';
 }
-/* One query through the whole pipeline: the search service first; if it fails
-   or finds nothing, the browser fallbacks run in order and their real results
-   are merged. Resolves {results, fails} — rejects only when aborted. */
+/* One query through the whole pipeline: the same-origin search service ONLY
+   (v68 P6 — the browser fallback chain is deleted; see file header).
+   Resolves {results, fails} — rejects only when aborted. When the proxy
+   returns nothing, that empty answer is returned honestly with its fail
+   kind; no other provider is consulted. withUrdu is kept for caller
+   compatibility and ignored — the proxy owns language handling. */
 function searchOneQuery(query, limit, withUrdu){
   var cleanQ=query;
   try{ cleanQ=stripPlaceWordFromQuery(query, detectSource(query).source); }catch(e){}
@@ -777,20 +759,7 @@ function searchOneQuery(query, limit, withUrdu){
     if(so.results.length){
       return enrichFromServer(so.results).then(function(rs){ return {results:rs, fails:[]}; });
     }
-    var fails=[so.fail];
-    var results=[];
-    var providers=[function(){ return wikiSearchP(cleanQ,'en',limit); }];
-    if(withUrdu) providers.push(function(){ return wikiSearchP(cleanQ,'ur',Math.ceil(limit/2)); });
-    providers.push(function(){ return ddgLiteSearchP(cleanQ); });
-    providers.push(function(){ return ddgSearchP(cleanQ); });
-    var chain=Promise.resolve();
-    providers.forEach(function(p){
-      chain=chain.then(function(){
-        if(results.length>=limit) return null;
-        return p().then(function(o){ if(o.fail) fails.push(o.fail); (o.results||[]).forEach(function(r){ results.push(r); }); });
-      });
-    });
-    return chain.then(function(){ return {results:results, fails:fails}; });
+    return {results:[], fails:[so.fail]};
   });
 }
 var searchPromiseCache={};

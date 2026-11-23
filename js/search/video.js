@@ -96,9 +96,9 @@ var SOURCE_STATUS = [
     status: 'documented-unverified-live',
     note: 'Keyless endpoint, documented to return title and author only (no date, no duration). Direct fetch in this session returned a placeholder page instead of JSON. Not used by this piece.' },
   { source: 'ddg-video-html',
-    method: 'GET /api/fetch?url=https://html.duckduckgo.com/html/?q=<query>&iax=videos&ia=videos',
-    status: 'blocked-in-session',
-    note: 'Direct fetch on 22 Nov 2026 returned a bot-challenge page ("confirm this search was made by a human"). The piece still attempts it through the proxy and reports blocked when the challenge text comes back.' },
+    method: 'REMOVED in v68 — DDG is out under the no-API rule; video search uses the P2 search layer (/api/search) only.',
+    status: 'removed',
+    note: 'The DuckDuckGo HTML video leg was deleted from searchVideos; its pure parsers are kept as test exports only and fetch nothing.' },
   { source: 'vimeo-search',
     method: 'none keyless; videos arrive via /api/search',
     status: 'unverified',
@@ -547,8 +547,8 @@ function defaultFetchText(url) {
 /* options: {query, platforms, maxResults, channelIds, fetchJson,
    fetchText}. fetchJson defaults to the same-origin /api/search
    call; fetchText defaults to the same-origin /api/fetch call (used
-   for YouTube RSS and the DuckDuckGo video page). Both are
-   injectable so the function is testable without a network.
+   for YouTube RSS). Both are injectable so the function is testable
+   without a network.
    Resolves (never rejects for a source failure) to
    {query, results, sources, error}. sources records the real outcome
    of every source attempted: ok / empty / failed / blocked /
@@ -648,31 +648,12 @@ function searchVideos(options) {
     });
   }
 
-  /* 3) DuckDuckGo video results, through the proxy's fetch endpoint.
-     Frequently blocked by a bot challenge; that is reported, not
-     hidden. */
-  var ddgP = Promise.resolve().then(function () {
-    var pageUrl = 'https://html.duckduckgo.com/html/?q=' +
-      encodeURIComponent(searchQuery) + '&iax=videos&ia=videos';
-    return fetchText(window.EnzoPagesBackend.getSearchUrl('/api/fetch?url=' + encodeURIComponent(pageUrl)));
-  }).then(function (html) {
-    if (isDdgChallenge(html)) {
-      record('ddg-video-html', 'blocked', 0,
-        'DuckDuckGo returned a bot-challenge page instead of results.');
-      return [];
-    }
-    var found = parseDdgVideoHtml(html);
-    record('ddg-video-html', found.length ? 'ok' : 'empty', found.length,
-      found.length ? '' : 'No video links were parsed from the page.');
-    return found;
-  }).catch(function (e) {
-    record('ddg-video-html', 'failed', 0,
-      'The video results page could not be read: ' +
-      (e && e.message ? String(e.message) : 'network error'));
-    return [];
-  });
-
-  return Promise.all([proxyP, rssP, ddgP]).then(function (lists) {
+  /* v68: the DuckDuckGo video leg ('ddg-video-html', formerly here)
+     is REMOVED — DDG is out under the no-API rule. Video search now
+     uses the P2 search layer only (leg 1, /api/search → SearXNG) plus
+     YouTube channel RSS (leg 2). The DDG HTML parsers below are kept
+     as pure functions (no network) for the existing test exports. */
+  return Promise.all([proxyP, rssP]).then(function (lists) {
     var merged = [];
     var i, j;
     for (i = 0; i < lists.length; i++) {
