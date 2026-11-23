@@ -925,6 +925,45 @@ function renderLearned(){
          piece 43 renders detail as a string, so it gets the wrong part. */
       var lrnAdapter={ getItems:function(){ return lrnStore.getItems().map(function(it){ var d=it.detail; if(d && typeof d==='object'){ var c={}; for(var k in it) c[k]=it[k]; c.detail=d.wrong||''; return c; } return it; }); }, deleteItem:function(id){ return lrnStore.deleteItem(id); }, clearAll:function(){ return lrnStore.clearAll(); } };
       EnzoSettingsLearned.renderLearnedItems(lrnBox, lrnAdapter, { onItemsChanged:function(){ try{ renderLearned(); }catch(e){} } });
+      /* P7: keyword-learn jobs + saved keyword lists. */
+      if (window.EnzoKeywordLearning) {
+        var kwBox = document.createElement('div');
+        kwBox.id = 'keywordLearnBox';
+        box.appendChild(kwBox);
+        fetch('/api/v2/learn').then(function (r) { return r.json(); })
+          .then(function (payload) {
+            var jobs = (payload && payload.jobs) || [];
+            var h = '<div class="lrn-items-head"><h4>Keyword learn jobs</h4>' +
+              '<p class="lrn-note">Each "learn X" order saves its 100 ' +
+              'keywords here. Open a job to see every keyword, what it ' +
+              'returned, and what was read or skipped — and why.</p></div>';
+            jobs.forEach(function (jb) {
+              h += '<div class="kw-job" data-kw-job="' + jb.job_id + '">' +
+                '<span>' + escH(jb.topic || '') + '</span> ' +
+                '<span>' + jb.keywords_done + '/' + jb.keywords_total +
+                ' keywords · ' + jb.sites_read + ' sites read · ' +
+                jb.points_learned + ' points</span> ' +
+                '<button type="button" data-kw-open="' + jb.job_id +
+                '">Keywords</button></div>';
+            });
+            kwBox.innerHTML = h;
+            kwBox.querySelectorAll('[data-kw-open]').forEach(function (b) {
+              b.onclick = function () {
+                fetch('/api/v2/learn/' +
+                  encodeURIComponent(b.getAttribute('data-kw-open')))
+                  .then(function (r) { return r.json(); })
+                  .then(function (p) {
+                    var det = document.createElement('div');
+                    det.innerHTML =
+                      window.EnzoKeywordLearning.renderKeywordList(
+                        p.job, p.keywords);
+                    b.parentNode.appendChild(det);
+                    b.disabled = true;
+                  });
+              };
+            });
+          }).catch(function () { /* jobs list unavailable: show nothing */ });
+      }
     }
   }catch(e){}
 }
