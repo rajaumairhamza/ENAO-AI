@@ -330,7 +330,7 @@ function localizeAnswer(text, lang){
 }
 
 /* ---------------- delivering answers ---------------- */
-function deliverAnswer(ctx, rawText, sources, backendMode, taskId){
+function deliverAnswer(ctx, rawText, sources, backendMode, taskId, opts){
   return localizeAnswer(rawText, ctx.lang).then(function(text2){
     text2 = (window.EnzoIdentityGuard
       ? window.EnzoIdentityGuard.correctIdentity(text2) : text2);
@@ -349,11 +349,22 @@ function deliverAnswer(ctx, rawText, sources, backendMode, taskId){
     }catch(e){}
     ctx.delivered=true;
     var isResearch=backendMode==='research';
+    /* PIECE E (P6): opts.attachRetrySearch — the fallback already failed
+       once and was auto-retried once. Keep the backend's own honest text,
+       but say so in modeWhy and attach the Retry Search button (same
+       markup render.js already wires) so recovery is one tap away. */
+    var fullHtmlE=mdToHtml(text2);
+    var modeWhyE=(isResearch?'Deep Research':'Normal answer')+' — run by the ENZO platform backend'+(ctx.route.auto?' (frontend auto-routing agreed)':'');
+    if(opts && opts.attachRetrySearch){
+      fullHtmlE+=enzoRetrySearchButtonHtml();
+      modeWhyE+=' — answer service unreachable (retried once)';
+    }
     var msg=aiMsgShell(ctx, text2, {
       sources: state.sourcesOn ? (sources||[]) : [],
       deep: isResearch,
-      modeWhy: (isResearch?'Deep Research':'Normal answer')+' — run by the ENZO platform backend'+(ctx.route.auto?' (frontend auto-routing agreed)':''),
-      _fullHtml: mdToHtml(text2)
+      modeWhy: modeWhyE,
+      _fullHtml: fullHtmlE,
+      llmFailed: !!(opts && opts.attachRetrySearch)
     });
     var chat=ctx.chat;
     chat.messages.push(msg);
@@ -570,6 +581,80 @@ function startPoll(chat, taskId, ctx, initialTask){
   }, 2000, { kind: 'task' });
 }
 
+/* == PIECE E (P6 — frontend: detect the answer-service fallback and retry) ==
+   Problem (AUDIT.md §6 F8, §9 P6): the backend returns its service_down
+   fallback inside a normal HTTP 200 answer, and handleAskResp delivered it
+   immediately as a successful "Normal answer" — no content check, no retry,
+   no flag. guardedAsk only fires on /ask POST transport rejection, never on
+   a 200 carrying the fallback.
+   Detection (two signals, in order):
+     1. PRIMARY — the backend task-result flag result["llm_failed"]===true
+        (contract fixed by the coordinator; P1 stores it on the task result,
+        so the ask response carries it at resp.task.result — the normal-mode
+        /ask payload returns {"answer", "task": public_task(task)} and
+        public_task() includes "result", the parsed result_json). Also
+        accepted at resp.result and top-level resp.llm_failed, in case a
+        caller passes the result through directly. A degraded answer
+        (result["degraded"]===true) is NOT a failure: it already carries
+        its honest label, so it is delivered normally and never retried.
+     2. SAFETY NET — the service_down marker strings in the answer text,
+        in case the flag is absent (e.g. old backend). The list below is the
+        ONLY place markers live; the strings are the backend
+        LANG_FALLBACKS["<lang>"]["service_down"] values from deployed
+        /opt/enao-platform/server/server.py:739-797. Short distinctive
+        substrings are matched (not the whole sentence) so the
+        identity/capability correction wrappers in complete_normal_task
+        cannot hide a fallback.
+   Retry: exactly ONE auto-retry, via the existing guardedAsk machinery
+   (ask-retry.js) re-running the existing attemptBackendAsk59 POST — no new
+   ask path. A per-message flag (ctx.llmFallbackRetried) enforces the
+   one-retry cap. If the retry also fails, the fallback is delivered WITH
+   the Retry Search button (same button markup + class as fallbackLegacy,
+   wired by render.js) so manual recovery is one tap away.
+   == (helpers below) == */
+var ENZO_LLM_FAILED_MARKERS=[
+  'could not reach the answer service',              /* en: LANG_FALLBACKS["en"]["service_down"] */
+  'jawab wali service tak nahi pahunch saka',         /* roman */
+  'جواب والی سروس تک نہیں پہنچ سکا',                  /* urdu */
+  'جواب والی سروس تک نہیں پہنچ سکیا',                 /* punjabi */
+  'jawab wali service tak nahi pahunch sakeya'        /* roman-punjabi */
+];
+var ENZO_LLM_RETRY_WAIT_MS=2000; /* ~2 s pause before the one auto-retry */
+function enzoTaskResultOf(resp){
+  if(!resp || typeof resp!=='object') return null;
+  var t=resp.task;
+  if(t && typeof t==='object'){
+    if(t.result && typeof t.result==='object') return t.result;
+    if(t.result_json && typeof t.result_json==='object') return t.result_json;
+  }
+  if(resp.result && typeof resp.result==='object') return resp.result;
+  return null;
+}
+function enzoIsDegradedResp(resp){
+  var r=enzoTaskResultOf(resp);
+  return !!(r && r.degraded===true);
+}
+function enzoIsLlmFailedAnswer(resp, ans){
+  /* A degraded answer is a real (honestly labelled) answer, never a failure. */
+  if(enzoIsDegradedResp(resp)) return false;
+  var r=enzoTaskResultOf(resp);
+  if(r && r.llm_failed===true) return true;
+  if(resp && resp.llm_failed===true) return true;
+  var t=String(ans||'');
+  if(!t) return false;
+  var low=t.toLowerCase();
+  for(var i=0;i<ENZO_LLM_FAILED_MARKERS.length;i++){
+    if(low.indexOf(ENZO_LLM_FAILED_MARKERS[i].toLowerCase())!==-1) return true;
+  }
+  return false;
+}
+function enzoRetrySearchButtonHtml(){
+  /* Byte-identical button markup to fallbackLegacy (platform-adapter.js:478):
+     render.js wires [data-act="retrySearch"] to EnzoAskRecovery.retryAsk. */
+  return '<div style="margin-top:10px"><button type="button" class="retrybtn" data-act="retrySearch">Retry Search</button></div>';
+}
+/* == END PIECE E (P6 detection helpers) == */
+
 /* ---------------- ask response handling ---------------- */
 function handleAskResp(ctx, resp){
   /* v58 F03: Stop pressed during the /ask POST — never start a poll or deliver afterwards. */
@@ -599,6 +684,35 @@ function handleAskResp(ctx, resp){
     return Promise.resolve();
   }
   var ans=resp.answer || (resp.task && resp.task.result && resp.task.result.answer) || '';
+  /* PIECE E (P6): a failed-LLM answer inside a 200 must NOT be delivered
+     as a success. Flagged failures (even with an empty answer) retry;
+     the marker safety net needs answer text. Degraded answers fall
+     through to normal delivery below. */
+  if(enzoIsLlmFailedAnswer(resp, ans)){
+    if(!ctx.llmFallbackRetried && typeof ctx.retryBackendAsk==='function'){
+      /* Exactly ONE auto-retry, after a short wait, through the existing
+         guardedAsk machinery (same attempt seam runBackendAsk59's .catch
+         uses — no new ask path). The retry re-enters handleAskResp; the
+         per-message flag above stops any second auto-retry. */
+      ctx.llmFallbackRetried=true;
+      return new Promise(function(resolve){ setTimeout(resolve, ENZO_LLM_RETRY_WAIT_MS); }).then(function(){
+        if(ctx.myRun!==searchRunId || state.stopRequested || ctx.delivered) return;
+        if(window.EnzoAskRecovery && typeof window.EnzoAskRecovery.guardedAsk==='function'){
+          return window.EnzoAskRecovery.guardedAsk(ctx, {
+            attempt: function(){ return ctx.retryBackendAsk(); },
+            runFallback: function(c){ fallbackLegacy(c); },
+            setUp: function(){}
+          });
+        }
+        return ctx.retryBackendAsk();
+      });
+    }
+    /* Already retried once (or no retry seam exists): deliver the fallback
+       WITH the Retry Search button so manual recovery is one tap away. */
+    return fetchTaskSources(resp.task_id).then(function(srcs){
+      return deliverAnswer(ctx, ans, srcs, resp.mode||'normal', resp.task_id, {attachRetrySearch:true});
+    });
+  }
   if(!ans){
     var hu55=EnaoConversation.honestUncertainty(ctx.text, {history:chat.messages});
     if(hu55) return deliverAnswer(ctx, hu55, [], 'normal', null);
@@ -667,7 +781,13 @@ function backendAsk(text, viaVoice, forcedDeep){
       var askBody45={question:qText55, deep:route.deep, via_voice:!!viaVoice, preferences:(function(){ var p=learnedPrefs(); p.depth='thorough'; p.cross_check=true; p.work='complete ready-to-use deliverable, step by step; state plainly the one final step that needs the user login or tap; never claim anything was posted, published or sent'; p.never_refuse='When the user orders work, never refuse and never give up: try another route when one is blocked; if genuinely impossible right now, state the exact blocker and exactly what is needed from the user, then continue when provided.'; try{ var ur=JSON.parse(localStorage.getItem('enao_userrules_v1')||'[]'); if(ur && ur.length) p.user_rules=ur; }catch(e){} return p; })()};
       askBody45.history=(typeof buildAskHistory==='function')?buildAskHistory(chat.messages):[];
       if(window.EnzoLang45 && window.EnzoLang45.buildAskBody){ try{ askBody45=window.EnzoLang45.buildAskBody(askBody45, lang); }catch(e){} }
-      return v2post('/chats/'+bid+'/ask', askBody45, 90000)
+      /* PIECE E (P6 addendum — timeout budget chain, Piece A) +
+         assembler budget (23 Nov 2026): absolute worst for one normal
+         ask is 100 s (10 s queue + 80 s LLM + 10 s degraded search),
+         so backend 100 s <= nginx 110 s <= frontend 120 s (10 s margin
+         each step). Was 100000 (Piece E); the frontend must never race
+         nginx or abort a recovering ask. */
+      return v2post('/chats/'+bid+'/ask', askBody45, 120000)
         .then(function(resp){ if(ctx.myRun!==searchRunId || state.stopRequested) return null; return handleAskResp(ctx, resp); })
         .then(function(){ return {handled:true}; });
     });
@@ -689,6 +809,12 @@ function backendAsk(text, viaVoice, forcedDeep){
       });
     });
   }
+  /* PIECE E (P6): retry seam — handleAskResp re-runs this exact ask
+     (attemptBackendAsk59) for its one auto-retry when the 200 carries a
+     failed-LLM answer. attemptBackendAsk59 is safe to re-run: see
+     guardedAsk's doc in ask-retry.js (ensureBackendChat is cached,
+     uploadChatFiles skips already-uploaded files). */
+  ctx.retryBackendAsk=attemptBackendAsk59;
   if(backendGate59.ok){ runBackendAsk59(); }
   else if(!window.EnzoPagesBackend){ runBackendAsk59(); }
   else {
