@@ -95,7 +95,18 @@ setupWsHead();
 
 // Init — restore permanent memory first; purani chats aur un ka context wapas aa jata hai
 var restored = loadChats();
-if(!restored){ createChat('New Chat'); }
+if(!restored){
+  /* v66-memory (Piece E): local storage is empty, so try the backend
+     restore (async — boot never waits for it). The placeholder chat is
+     created only if the restore brings nothing back, so a cleared
+     browser / new device does not end up with a stray empty chat above
+     the restored ones. */
+  if(typeof window.EnzoRestoreFromBackend==='function'){
+    window.EnzoRestoreFromBackend(function(restoredCount){
+      if(!restoredCount && !state.chats.length){ createChat('New Chat'); renderChatList(); renderMessages(); }
+    });
+  } else { createChat('New Chat'); }
+}
 if(state.usage){ $('usageText').textContent=state.usage; }
 syncDeepUI();
 renderChatList();
