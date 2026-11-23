@@ -1437,7 +1437,10 @@ if (typeof window !== 'undefined') {
   window.requestEnzoResize=window.EnzoRoom.requestEnzoResize;
 
   if(window.EnzoRoom.heroMount){ var a=makeScene(window.EnzoRoom.heroMount); if(a) window.EnzoRoom.instances.push(a); }
-  if(window.EnzoRoom.panelMount){ var b=makeScene(window.EnzoRoom.panelMount); if(b) window.EnzoRoom.instances.push(b); }
+  /* v67 Job 1: right-panel 3D deleted — panel instance line removed. The panel
+     mount (#enzoPanelMount) keeps its .enzo-fallback orb as the permanent 2D
+     face; it never gets the 'live' class now, so the fallback stays visible.
+     Hero instance above is untouched. */
   if(!window.EnzoRoom.instances.length){ return; }
   window.setEnzoQuality(window.EnzoRoom.enzoQuality); /* apply the saved quality (pixel ratio) */
   window.addEventListener('resize',window.EnzoRoom.requestEnzoResize);
@@ -1462,7 +1465,8 @@ if (typeof window !== 'undefined') {
   function teaseLine(kind){ var g=TEASE_LINES[kind]; var l=teaseLang(); return (g&&(g[l]||g.en))||''; }
   function teaseLater(fn, ms){ tease.timers.push(setTimeout(fn, ms)); }
   function showTeaseBubble(text, ms){
-    ['enzoPanelMount','enzoHeroMount'].forEach(function(id){
+    /* v67 Job 1: hero only — the panel mount is a static 2D face now, no tease bubble there. */
+    ['enzoHeroMount'].forEach(function(id){
       var mount=document.getElementById(id); if(!mount) return;
       var b=mount.querySelector('.enzo-bubble');
       if(!b){
@@ -1544,7 +1548,8 @@ if (typeof window !== 'undefined') {
     teaseLater(function(){ if(!tease.escaped){ teaseTarget.z=0; teaseTarget.x=0; } }, 1500);
     teaseRestore(2100);
   }
-  ['enzoPanelMount','enzoHeroMount'].forEach(function(id){
+  /* v67 Job 1: hero only — panel mount is a static 2D face now, no poke listener there. */
+  ['enzoHeroMount'].forEach(function(id){
     var mount=document.getElementById(id);
     if(mount){ mount.style.cursor='pointer'; mount.addEventListener('pointerdown', function(e){ pokeEnzo(e, mount); }); }
   });
