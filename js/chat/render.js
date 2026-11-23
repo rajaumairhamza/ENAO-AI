@@ -77,6 +77,19 @@ function modeChipHtml(m){
   if(m.deep) return '<span class="modechip deep"'+why+'>Deep Research'+(m.auto?' &middot; Auto':'')+'</span>';
   return '<span class="modechip"'+why+'>Normal'+(m.auto?' &middot; Auto':'')+'</span>';
 }
+/* P6 (v68): source-chip favicon with NO external fetch. A favicon supplied
+   by the proxy is used only when it is a plain http(s) URL that is NOT
+   Google's s2 favicon service — the proxy still emits s2 URLs today, so
+   this guard also neutralises them until P2 stops emitting the field.
+   Otherwise the chip shows the local globe icon from this page's own SVG
+   sprite (#i-globe in index.html): no network request at all, and the chip
+   keeps its icon instead of a broken / hidden <img>. */
+function isGoogleFavicon(u){ return /^https?:\/\/www\.google\.com\/s2\/favicons/i.test(u||''); }
+function srcFaviconHtml(s, dom){
+  var f=s && s.favicon ? String(s.favicon) : '';
+  if(f && /^https?:\/\//i.test(f) && !isGoogleFavicon(f)) return '<img class="favicon" alt="" loading="lazy" decoding="async" src="'+esc(f)+'" onerror="this.style.display=\'none\'">';
+  return '<svg class="ic favicon-fallback" style="width:16px;height:16px;flex:0 0 16px" aria-hidden="true"><use href="#i-globe"/></svg>';
+}
 function buildMessageEl(m){
   var wrap=document.createElement('div');
   if(m.role==='user'){
@@ -157,7 +170,7 @@ function buildMessageEl(m){
       var dom=s.domain||''; if(!dom){ try{ dom=new URL(s.url).hostname.replace(/^www\./,''); }catch(e){} }
       var dead = !((s.snippet||'').trim()) && !((s.extract||'').trim());
       var stitle = (s.title||'').trim() || dom || 'Web page';
-      resHtml+='<a class="srcchip'+(i>=3?' src-extra':'')+(dead?' dead':'')+'" href="'+esc(safeHttpUrl(s.url))+'" target="_blank" rel="noopener" title="'+esc(stitle)+' — '+esc(s.url)+(dead?' (this page did not return readable content when ENZO checked it)':'')+'"><span class="srcchip-num">'+(i+1)+'</span><img class="favicon" alt="" loading="lazy" decoding="async" src="'+esc(s.favicon||('https://www.google.com/s2/favicons?domain='+dom+'&sz=32'))+'" onerror="this.style.display=\'none\'"><span class="srcchip-name">'+esc(dom||s.source||'Web')+'</span>'+srcDateHtml(s)+'</a>';
+      resHtml+='<a class="srcchip'+(i>=3?' src-extra':'')+(dead?' dead':'')+'" href="'+esc(safeHttpUrl(s.url))+'" target="_blank" rel="noopener" title="'+esc(stitle)+' — '+esc(s.url)+(dead?' (this page did not return readable content when ENZO checked it)':'')+'"><span class="srcchip-num">'+(i+1)+'</span>'+srcFaviconHtml(s, dom)+'<span class="srcchip-name">'+esc(dom||s.source||'Web')+'</span>'+srcDateHtml(s)+'</a>';
     });
     if(uniqSrc.length>3) resHtml+='<button class="srcchip srcmore" data-act="srcMore" title="Show all '+uniqSrc.length+' sources">+ '+(uniqSrc.length-3)+' more</button>';
     resHtml+='</div></div>';
@@ -322,7 +335,7 @@ function buildMessageElLegacy(m){
       var dom=s.domain||''; if(!dom){ try{ dom=new URL(s.url).hostname.replace(/^www\./,''); }catch(e){} }
       var dead = !((s.snippet||'').trim()) && !((s.extract||'').trim());
       var stitle = (s.title||'').trim() || dom || 'Web page';
-      resHtml+='<a class="srcchip'+(i>=3?' src-extra':'')+(dead?' dead':'')+'" href="'+esc(safeHttpUrl(s.url))+'" target="_blank" rel="noopener" title="'+esc(stitle)+' — '+esc(s.url)+(dead?' (this page did not return readable content when ENZO checked it)':'')+'"><span class="srcchip-num">'+(i+1)+'</span><img class="favicon" alt="" loading="lazy" decoding="async" src="'+esc(s.favicon||('https://www.google.com/s2/favicons?domain='+dom+'&sz=32'))+'" onerror="this.style.display=\'none\'"><span class="srcchip-name">'+esc(dom||s.source||'Web')+'</span>'+srcDateHtml(s)+'</a>';
+      resHtml+='<a class="srcchip'+(i>=3?' src-extra':'')+(dead?' dead':'')+'" href="'+esc(safeHttpUrl(s.url))+'" target="_blank" rel="noopener" title="'+esc(stitle)+' — '+esc(s.url)+(dead?' (this page did not return readable content when ENZO checked it)':'')+'"><span class="srcchip-num">'+(i+1)+'</span>'+srcFaviconHtml(s, dom)+'<span class="srcchip-name">'+esc(dom||s.source||'Web')+'</span>'+srcDateHtml(s)+'</a>';
     });
     if(uniqSrc.length>3) resHtml+='<button class="srcchip srcmore" data-act="srcMore" title="Show all '+uniqSrc.length+' sources">+ '+(uniqSrc.length-3)+' more</button>';
     resHtml+='</div></div>';
