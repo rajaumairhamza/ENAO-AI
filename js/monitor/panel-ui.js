@@ -241,10 +241,15 @@
     return [];
   }
 
+  /* v67 FIX (poll storm): render() must NEVER fetch. Sources are fetched
+     only by the poll loop / explicit refresh paths in the data layer
+     (openTask, terminal progress/event); render reads the cached copy
+     already present in `state`. The old code called getSources() here as
+     a render side effect and discarded the returned Promise — that call
+     fetched -> save()+notify() -> re-render -> refetch, ~5 req/s forever,
+     including for terminal tasks. */
   function sourcesOf(state, task) {
     if (!task) return [];
-    var fromLayer = safeCall('getSources', task.task_id);
-    if (fromLayer && fromLayer.length !== undefined) return fromLayer;
     var entry = taskEntry(state, task.task_id);
     if (entry && entry.sources) return entry.sources;
     if (task.sources) return task.sources;
