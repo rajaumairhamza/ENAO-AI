@@ -247,6 +247,10 @@ var VERB_W = { kar: 1, karo: 1, kr: 1, kro: 1, karna: 1, krna: 1, kardo: 1,
   explore: 1, browse: 1, discover: 1, analyze: 1, analyse: 1,
   investigation: 1, comparison: 1, seekho: 1, sikho: 1, labho: 1, vekho: 1,
   learn: 1, study: 1, gather: 1, faida: 1, uthao: 1, nazarandaz: 1,
+  collect: 1, collects: 1, collected: 1, collecting: 1,
+  assemble: 1, assembles: 1, assembled: 1, assembling: 1,
+  compile: 1, compiles: 1, compiled: 1, compiling: 1,
+  akathi: 1, ikathi: 1, akatha: 1, ikatha: 1, jama: 1, jamma: 1,
   search: 1, google: 1, find: 1, check: 1, verify: 1, compare: 1,
   tehqeeq: 1, tahqeeq: 1, shodh: 1, jaanch: 1, taftish: 1,
   chahiye: 1, milega: 1, milegi: 1, milenge: 1, milta: 1, milti: 1,
@@ -257,6 +261,7 @@ var VERB_W = { kar: 1, karo: 1, kr: 1, kro: 1, karna: 1, krna: 1, kardo: 1,
   'تحقیق': 1, 'گوگل': 1, 'چاہیے': 1, 'تیار': 1, 'کرو': 1, 'کر': 1,
   'کے': 1, 'کرکے': 1, 'سرچ': 1, 'سیکھو': 1, 'جانچ': 1, 'دریافت': 1,
   'موازنہ': 1, 'فائدہ': 1, 'اٹھاؤ': 1, 'لبھو': 1, 'ویکھو': 1,
+  'اکٹھی': 1, 'اکٹھا': 1, 'اکٹھے': 1, 'جمع': 1,
   'سکھو': 1, 'چکو': 1, 'چھڈو': 1,
   'करो': 1, 'कर': 1, 'दो': 1, 'ढूंढ': 1, 'खोज': 1, 'शोध': 1 };
 var FILLER_W = { please: 1, plz: 1, zara: 1, bhai: 1, yaar: 1, ab: 1, let: 1, lets: 1,
@@ -564,11 +569,11 @@ function extractTopic(text) {
      best...") and the object verdict rejects a leftover verb. Source
      words ARE stripped: the source is captured separately by
      detectSource, so the topic keeps only the subject. */
-  t = t.replace(/\b(dhoond\w*|dhund\w*|talaash|talash|khoj|research|researching|investigat\w*|explore\w*|brows\w*|discover\w*|analy[sz]\w*|learn\w*|study\w*|gather\w*|seekho|sikho|labho|vekho|check|compare|verify|dikhao|dikha|dekho|dekh|nikaal\w*|nikal\w*|tehqeeq|tahqeeq|shodh|jaanch|taftish|chahiye|karo|kar|karke|do|ke|de|dena|batao|investigation|comparison|websites?|sources?|resources?|find|thoroughly|deeply|continuously|everything|every|all|possible|possibilities|possibility|options?|solutions?|information|knowledge|worldwide|related|available|different|various|entire|whole|complete|faida|uthao|nazarandaz|mat|angles?|aspect|about|for|on|social\s+media|around|search\s+(karo|kar|karke|do|ke\s+do)|google\s+(karo|kar|karke|do)|find\s+(karo|kar|karke|do|ke\s+do)|youtube|yt|google|instagram|facebook|fb|tiktok|twitter|reddit|linkedin|pinterest|snapchat|telegram|threads|vimeo|dailymotion|wikipedia|wiki|internet|online|x)\b/gi, ' ');
-  t = t.replace(/(سرچ|سیکھو|جانچ|دریافت|موازنہ|فائدہ|اٹھاؤ|نظر|انداز|لبھو|ویکھو|سکھو|چکو|چھڈو|مکمل|تمام|ہر|ممکن\S*|معلومات|دنیا|بھر|موجود|متعلق|پہلو|پاسے|مختلف|وکھ|سارے|امکانات|امکان|ویب\s*سائٹس?|ڈھونڈ\S*|تلاش|تحقیق|ریسرچ|چاہیے|دیکھو|دکھاؤ|کرو|کر|دو|دے|دینا|بتاؤ|یوٹیوب|گوگل|انٹرنیٹ|انسٹاگرام|فیسبک|فیس\s+بک|ٹک\s+ٹاک|ٹکٹاک|ٹویٹر|ایکس|ریڈٹ|لنکڈ\s+ان|پنٹرسٹ|سنیپ\s+چیٹ|ٹیلی\s+گرام|تھریڈز|ویمیو|ڈیلی\s+موشن|وکیپیڈیا|سوشل\s+میڈیا|آن\s+لائن)/g, ' ');
+  t = t.replace(/\b(dhoond\w*|dhund\w*|talaash|talash|khoj|research|researching|investigat\w*|explore\w*|brows\w*|discover\w*|analy[sz]\w*|learn\w*|study\w*|gather\w*|collect\w*|assembl\w*|compil\w*|akathi|ikathi|akatha|ikatha|jama|jamma|bary|baare|bare|seekho|sikho|labho|vekho|check|compare|verify|dikhao|dikha|dekho|dekh|nikaal\w*|nikal\w*|tehqeeq|tahqeeq|shodh|jaanch|taftish|chahiye|karo|kar|karke|do|k|ke|de|dena|batao|investigation|comparison|websites?|sources?|resources?|find|thoroughly|deeply|continuously|everything|every|all|possible|possibilities|possibility|options?|solutions?|information|knowledge|worldwide|related|available|different|various|entire|whole|complete|faida|uthao|nazarandaz|mat|angles?|aspect|about|for|on|maloomat|social\s+media|around|search\s+(karo|kar|karke|do|ke\s+do)|google\s+(karo|kar|karke|do)|find\s+(karo|kar|karke|do|ke\s+do)|youtube|yt|google|instagram|facebook|fb|tiktok|twitter|reddit|linkedin|pinterest|snapchat|telegram|threads|vimeo|dailymotion|wikipedia|wiki|internet|online|x)\b/gi, ' ');
+  t = t.replace(/(سرچ|سیکھو|جانچ|دریافت|موازنہ|فائدہ|اٹھاؤ|نظر|انداز|لبھو|ویکھو|سکھو|چکو|چھڈو|مکمل|تمام|ہر|ممکن\S*|معلومات|جانکاری|اکٹھ\w*|جمع|دنیا|بھر|موجود|متعلق|پہلو|پاسے|مختلف|وکھ|سارے|امکانات|امکان|ویب\s*سائٹس?|ڈھونڈ\S*|تلاش|تحقیق|ریسرچ|چاہیے|دیکھو|دکھاؤ|کرو|کر|دو|دے|دینا|بتاؤ|یوٹیوب|گوگل|انٹرنیٹ|انسٹاگرام|فیسبک|فیس\s+بک|ٹک\s+ٹاک|ٹکٹاک|ٹویٹر|ایکس|ریڈٹ|لنکڈ\s+ان|پنٹرسٹ|سنیپ\s+چیٹ|ٹیلی\s+گرام|تھریڈز|ویمیو|ڈیلی\s+موشن|وکیپیڈیا|سوشل\s+میڈیا|آن\s+لائن)/g, ' ');
   t = t.replace(/^\s*(?:(the|a|an|for|from|in|about|on|par|per|pe|se)\s+)+/gi, ' ');
   t = t.replace(/^\s*(?:(سے|پر|پے|کا|کی|کے|کو|میں|بارے|توں|تے|وچ|دے|نال|دی|دا)\s+)+/g, ' ');
-  t = t.replace(/(\s+(se|par|pe|per|ka|ki|ke|ko|mein|main|about|on|from|for|of))+\s*$/gi, ' ');
+  t = t.replace(/(\s+(se|sy|par|pe|per|ka|ki|ke|ko|mein|main|ma|about|on|from|for|of))+\s*$/gi, ' ');
   t = t.replace(/(\s+(سے|پر|پے|کا|کی|کے|کو|میں|بارے|توں|تے|وچ|دے|نال|دی|دا))+\s*$/g, ' ');
   t = trim(t.replace(/[?!.,;:'"()\[\]{}]+/g, ' ').replace(/\s+/g, ' '));
   if (!t) return null;
@@ -733,8 +738,8 @@ function isResearchOrder(text, context) {
      "dhoond") names nothing to investigate: NOT research. The gate may
      ask which topic. This guard must run before the verb families, or
      the bare-imperative rule below would claim the lone word. */
-  if (/^(research|search|tehqeeq|tahqeeq|shodh|khoj|dhoond|dhund|talaash|talash|google|find|check|verify|compare|explore|browse|discover|analy[sz]e|learn|study|gather|seekho|sikho|labho|vekho)\.?$/.test(trim(n)) ||
-      /^(ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|سرچ|سیکھو|جانچ|دریافت|موازنہ|لبھو|ویکھو|سکھو|शोध|खोज|ढूंढ)$/.test(trim(raw))) {
+  if (/^(research|search|tehqeeq|tahqeeq|shodh|khoj|dhoond|dhund|talaash|talash|google|find|check|verify|compare|explore|browse|discover|analy[sz]e|learn|study|gather|collect|assemble|compile|akathi|ikathi|jama|seekho|sikho|labho|vekho)\.?$/.test(trim(n)) ||
+      /^(ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|سرچ|سیکھو|جانچ|دریافت|موازنہ|لبھو|ویکھو|سکھو|اکٹھی|جمع|शोध|खोज|ढूंढ)$/.test(trim(raw))) {
     return { research: false, reason: 'research-word-no-topic', topic: null, lang: lang, needsTopic: false, matched: null, source: src.source, sources: src.sources };
   }
   /* R1. Source count on its own ("100 websites", "50 authentic
@@ -825,6 +830,46 @@ function isResearchOrder(text, context) {
       /\blabho\b/.test(n) ||
       /\bvekho\b/.test(n))) {
     v = deepOrderVerdict(n, ctxTopic, 'explicit-deep-research', 'deep-research-roman');
+    return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
+  }
+
+  /* R17. Collection orders (Job 4, 23 Nov 2026, Raja): "information
+     akathi karo / collect information (from the internet)" and
+     equivalents are research orders BY MEANING — a collection order
+     is a research order. Four languages. The info noun is required
+     for the verb+object forms: a bare "collect the parcel" (no
+     information noun) is an errand, not research. The bare
+     collection verbs (akathi / اکٹھی) are unambiguous, so they fire
+     on their own; the ambiguous ones (jama / جمع — also "add up")
+     need the info noun. Uses orderVerdict, so a pronoun-only object
+     ("collect it") with no topic in context still does NOT research;
+     a collection order with no topic researches with needsTopic (the
+     flow asks for the topic itself). Mirror of R17 in
+     intent/research_triggers.py — keep the two in sync. */
+  if (!bestQ && (
+      /* R17a. English: collect|assemble|compile + information|
+         data|details|facts|knowledge|sources, either order.
+         (gather + information is already R13 deep; R13 runs first.) */
+      /\b(collect|assemble|compile)\b.{0,30}\b(information|data|details|facts|knowledge|sources?)\b/.test(n) ||
+      /\b(information|data|details|facts|knowledge)\b.{0,20}\b(collect|gather|assemble|compile)\b/.test(n) ||
+      /* R17b. Roman Urdu / Roman Punjabi: maloomat|information +
+         akathi|ikathi|jama, either order; bare akathi|ikathi + karo. */
+      /\b(maloomat|information)\b.{0,24}\b(akathi|ikathi|akatha|ikatha|jama|jamma)\b/.test(n) ||
+      /\b(akathi|ikathi|akatha|ikatha|jama|jamma)\b.{0,24}\b(maloomat|information)\b/.test(n) ||
+      /\b(akathi|ikathi)\b.{0,12}\b(karo|kar|karke|kar\s+ke\s+do)\b/.test(n) ||
+      /* R17c. Urdu script / Punjabi Shahmukhi: معلومات|جانکاری +
+         اکٹھی|جمع, either order; bare اکٹھی + کرو. */
+      /(معلومات|جانکاری)\s*(اکٹھ\w*|جمع)/.test(raw) ||
+      /(اکٹھ\w*|جمع)\s*(کرو|کر|کریں|کر\s*کے)?\s*(معلومات|جانکاری)/.test(raw) ||
+      /اکٹھ\w*\s*(کرو|کر|کریں|کر\s*کے)/.test(raw))) {
+    v = orderVerdict(n, ctxTopic, 'explicit-collect-order', 'collect-order');
+    if (v.research && extractTopic(raw) === null && !ctxTopic) {
+      /* The only content was the info noun itself ("information
+         akathi karo" with no topic): research, but the flow must ask
+         which topic — an empty _content makes finish set needsTopic. */
+      v = { research: v.research, reason: v.reason, topic: v.topic,
+            needsTopic: v.needsTopic, matched: v.matched, _content: [] };
+    }
     return finish(v.research, v.reason, raw, lang, ctxTopic, v.matched, v);
   }
 
@@ -1084,8 +1129,8 @@ var COMMON_VERBS = { is: 1, are: 1, was: 1, were: 1, do: 1, does: 1,
 function ambiguousReason(text, normed, ctxTopic) {
   var t = trim(text), n = normed;
   if (!t) return 'empty-message';
-  if (/^(research|search|tehqeeq|tahqeeq|shodh|khoj|dhoond|dhund|talaash|talash|google|find|check|verify|compare|explore|browse|discover|analy[sz]e|learn|study|gather|seekho|sikho|labho|vekho)\.?$/.test(trim(n))) return 'research-word-no-topic';
-  if (/^(ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|سرچ|سیکھو|جانچ|دریافت|موازنہ|لبھو|ویکھو|سکھو|शोध|खोज|ढूंढ)$/.test(t)) return 'research-word-no-topic';
+  if (/^(research|search|tehqeeq|tahqeeq|shodh|khoj|dhoond|dhund|talaash|talash|google|find|check|verify|compare|explore|browse|discover|analy[sz]e|learn|study|gather|collect|assemble|compile|akathi|ikathi|jama|seekho|sikho|labho|vekho)\.?$/.test(trim(n))) return 'research-word-no-topic';
+  if (/^(ریسرچ|تحقیق|ڈھونڈ|تلاش|گوگل|سرچ|سیکھو|جانچ|دریافت|موازنہ|لبھو|ویکھو|سکھو|اکٹھی|جمع|शोध|खोज|ढूंढ)$/.test(t)) return 'research-word-no-topic';
   if (!ctxTopic) {
     if (/\b(research|search|find|look\s+up|google|verify|check)\s+(it|that|this|them)\s*[?!.]*$/.test(n)) return 'pronoun-only-no-topic';
     if (/^\s*tell\s+me\s+(more\s+)?about\s+(it|that|this|them)\s*[?!.]*$/.test(n)) return 'pronoun-only-no-topic';
