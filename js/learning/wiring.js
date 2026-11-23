@@ -131,26 +131,24 @@ function enzoLearningResolveVideo(input){
     m=/youtube\.com\/(?:shorts|embed|live)\/([A-Za-z0-9_-]{6,})/.exec(u); if(m) return 'https://www.youtube.com/watch?v='+m[1];
     return null;
   }
+  /* resolveWatch: real video metadata via ENZO's own endpoint
+     (GET /api/v2/video/metadata?url=) — own page parsing, no oEmbed,
+     no second page fetch. v68 P4. Fields the page did not carry come
+     back null and are left empty, never invented. */
   function resolveWatch(watchUrl){
-    var oeUrl='https://www.youtube.com/oembed?url='+encodeURIComponent(watchUrl)+'&format=json';
-    var oeFetch=window.EnzoPagesBackend.getSearchUrl('/api/fetch?url='+encodeURIComponent(oeUrl));
-    return fetchJSONT(oeFetch, 15000).then(function(j){
-      var oe=j;
-      if(oe && typeof oe.text==='string'){ try{ oe=JSON.parse(oe.text); }catch(e){ oe=null; } }
-      if(!oe || !oe.title) return null;
-      var meta={title:String(oe.title||''), channel:String(oe.author_name||''), url:watchUrl, published:'', description:''};
-      var pageFetch=window.EnzoPagesBackend.getSearchUrl('/api/fetch?url='+encodeURIComponent(watchUrl));
-      return fetchJSONT(pageFetch, 15000).then(function(pj){
-        var html=(pj && typeof pj.text==='string') ? pj.text : '';
-        if(html){
-          var dm=/<meta[^>]+(?:property="og:description"|name="description")[^>]+content="([^"]*)"/i.exec(html)
-            || /<meta[^>]+content="([^"]*)"[^>]+(?:property="og:description"|name="description")/i.exec(html);
-          if(dm) meta.description=enzoLearningHtmlUnesc(dm[1]).slice(0,2000);
-          var pub=/"(?:datePublished|uploadDate)"\s*:\s*"([^"]+)"/.exec(html);
-          if(pub) meta.published=pub[1];
-        }
-        return meta;
-      }, function(){ return meta; });
+    var metaUrl=window.EnzoPagesBackend.getSearchUrl('/api/v2/video/metadata?url='+encodeURIComponent(watchUrl));
+    return fetchJSONT(metaUrl, 20000).then(function(j){
+      if(!j || j.status!=='ok' || !j.title) return null;
+      return {
+        title:String(j.title||''),
+        channel:String(j.channel||''),
+        url:watchUrl,
+        published:String(j.published_at||''),
+        description:String(j.description||''),
+        duration:String(j.duration||''),
+        thumbnail:String(j.thumbnail||''),
+        views:(typeof j.views==='number') ? j.views : null
+      };
     }, function(){ return null; });
   }
   var direct=watchUrlOf(raw);
@@ -165,7 +163,16 @@ function enzoLearningResolveVideo(input){
   }, function(){ return null; });
 }
 function enzoLearningDeps(){
-  var deps={search:enzoLearningSearchDep, resolveVideo:enzoLearningResolveVideo};
+  var deps={search:enzoLearningSearchDep, resolveVideo:enzoLearningResolveVideo,
+    keywordLearn:window.EnzoKeywordLearning,
+    onKeywordProgress:function(job, report){
+      try{
+        setTypingStatus('Learning… keyword ' +
+          (report.keywords_searched || 0) + ' of ' +
+          (job.keywords_total || 100) + ' · ' +
+          (report.sites_read || 0) + ' sites read');
+      }catch(e){}
+    }};
   try{
     var baseStore=enzoLearningStore();
     if(baseStore){

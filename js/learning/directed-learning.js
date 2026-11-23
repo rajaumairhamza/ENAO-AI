@@ -81,7 +81,13 @@
  *      detect -> run the right learner -> save each learned point as
  *      a store item with its source attached -> return everything.
  * extractVideoUrl(text) -> string|null (first YouTube URL in text).
- * VERSION: '42-directed-1.0.0'
+ * P7 KEYWORD-FIRST EXTENSION (v68, pieces/07-keyword-learning):
+ *   For source 'internet', applyDirectedLearning now tries the keyword
+ *   job first (EnzoKeywordLearning.startKeywordLearn — 100 keywords,
+ *   every site read, honest four-count report). When the keyword API is
+ *   unavailable it falls back to the old learnFromInternet path, so a
+ *   plain learn order still works the old way. Nothing else changes.
+ * VERSION: '42-directed-1.0.0-p7'
  *
  * DEP CONTRACT (for the app wiring — see 42-directed.EVIDENCE.md)
  * -----------------------------------------------------------------
@@ -98,7 +104,7 @@
 (function (global) {
 'use strict';
 
-var VERSION = '42-directed-1.0.0';
+var VERSION = '42-directed-1.0.0-p7';
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -477,22 +483,30 @@ var SUMMARY_TEXT = {
   en: {
     learned: 'What I learned:',
     notLearned: 'What I could not learn:',
-    next: 'What I will do differently: I will remember these points and use them when you ask about this topic again, citing the same sources.'
+    next: 'What I will do differently: I will remember these points and use them when you ask about this topic again, citing the same sources.',
+    nextNone: 'I learned nothing because no sources were found, so there is nothing to remember for next time.',
+    nextNoneVideo: 'I learned nothing from this video, so there is nothing to remember for next time.'
   },
   urdu: {
     learned: 'میں نے کیا سیکھا:',
     notLearned: 'میں کیا نہیں سیکھ سکا:',
-    next: 'آگے میں کیا مختلف کروں گا: میں ان باتوں کو یاد رکھوں گا اور جب آپ اس موضوع پر دوبارہ پوچھیں گے تو انہی ذرائع کے حوالے سے استعمال کروں گا۔'
+    next: 'آگے میں کیا مختلف کروں گا: میں ان باتوں کو یاد رکھوں گا اور جب آپ اس موضوع پر دوبارہ پوچھیں گے تو انہی ذرائع کے حوالے سے استعمال کروں گا۔',
+    nextNone: 'میں نے کچھ نہیں سیکھا کیونکہ کوئی ذریعہ نہیں ملا، اس لیے اگلی بار کے لیے یاد رکھنے کو کچھ نہیں ہے۔',
+    nextNoneVideo: 'میں نے اس ویڈیو سے کچھ نہیں سیکھا، اس لیے اگلی بار کے لیے یاد رکھنے کو کچھ نہیں ہے۔'
   },
   roman: {
     learned: 'Maine kya seekha:',
     notLearned: 'Main kya nahi seekh saka:',
-    next: 'Aage main kya mukhtalif karoon ga: main in baton ko yaad rakhon ga aur jab aap is topic par dobara poochein ge to inhi sources ke hawale se istemal karoon ga.'
+    next: 'Aage main kya mukhtalif karoon ga: main in baton ko yaad rakhon ga aur jab aap is topic par dobara poochein ge to inhi sources ke hawale se istemal karoon ga.',
+    nextNone: 'Maine kuch nahi seekha kyun ke koi source nahi mila, is liye agli baar ke liye yaad rakhne ko kuch nahi hai.',
+    nextNoneVideo: 'Maine is video se kuch nahi seekha, is liye agli baar ke liye yaad rakhne ko kuch nahi hai.'
   },
   punjabi: {
     learned: 'میں کی سکھیا:',
     notLearned: 'میں کی نہیں سکھ سکیا:',
-    next: 'اگے میں کی وکھرا کراں گا: میں ایناں گلاں نوں یاد رکھاں گا تے جدوں تسیں ایس موضوع تے دوبارہ پچھو گے تاں اوہناں ای ذرائع دے حوالے نال ورتاؤں گا۔'
+    next: 'اگے میں کی وکھرا کراں گا: میں ایناں گلاں نوں یاد رکھاں گا تے جدوں تسیں ایس موضوع تے دوبارہ پچھو گے تاں اوہناں ای ذرائع دے حوالے نال ورتاؤں گا۔',
+    nextNone: 'میں کجھ نہیں سکھیا کیونکہ کوئی ذریعہ نہیں ملیا، ایس لئی اگلی واری لئی یاد رکھن نوں کجھ نہیں ہے۔',
+    nextNoneVideo: 'میں ایس ویڈیو توں کجھ نہیں سکھیا، ایس لئی اگلی واری لئی یاد رکھن نوں کجھ نہیں ہے۔'
   }
 };
 
@@ -503,11 +517,27 @@ function learnedPointsOf(result) {
   return [];
 }
 
+/* Count the learned points that actually cite a real source URL. A point
+   without an http(s) source URL is not a sourced point — the "will use
+   these sources" closing may only ever be printed when this count is ≥ 1
+   (Case C, v68 P6). */
+function sourcedPointsOf(result) {
+  var points = learnedPointsOf(result);
+  var n = 0, i, src;
+  for (i = 0; i < points.length; i++) {
+    src = (points[i] && points[i].source) || {};
+    if (typeof src.url === 'string' && /^https?:\/\//i.test(src.url)) n++;
+  }
+  return n;
+}
+
 /* summariseLearning(result, lang)
    Short summary in the user's language: what was learned (bullets,
    each with its real source), what could NOT be learned/accessed,
    and what ENZO will now do differently. Honest about gaps; no
-   invented counts. */
+   invented counts. The "will do differently" closing claims sources
+   only when ≥ 1 sourced point was actually retrieved; a zero-source
+   run closes with a plain nothing-learned line instead (Case C, v68 P6). */
 function summariseLearning(result, lang) {
   var l = SUMMARY_TEXT[lang] ? lang : 'en';
   var t = SUMMARY_TEXT[l];
@@ -542,7 +572,21 @@ function summariseLearning(result, lang) {
     lines.push(t.notLearned);
     lines.push('- ' + gap);
   }
-  lines.push(t.next);
+  /* Case C (v68 P6): the "will remember / use these sources" closing is
+     printed ONLY when the run actually retrieved ≥ 1 sourced point. With
+     zero sourced points it would claim sources that do not exist — so the
+     closing instead says plainly, in the user's language, that nothing
+     was learned, and nothing else. A video that was retrieved but yielded
+     no learnable text gets the video variant (the video exists, but there
+     are no points to remember); every other zero-source run gets the
+     no-sources variant. */
+  if (sourcedPointsOf(result) > 0) {
+    lines.push(t.next);
+  } else if (result && result.video && (result.video.url || result.video.title)) {
+    lines.push(t.nextNoneVideo);
+  } else {
+    lines.push(t.nextNone);
+  }
   return lines.join('\n');
 }
 
@@ -563,6 +607,55 @@ function resolveStore(deps) {
    detect -> run the right learner -> save each learned point as a
    store item with its source attached -> return { result, summary,
    savedIds }. Non-directed text returns directed:false and no work. */
+/* learnFromInternetThenSave(detected, deps): the OLD internet path
+   (one search for the topic) with the piece-42 store save. Used as the
+   fallback when the keyword job API is unavailable (P7). */
+function learnFromInternetThenSave(detected, deps) {
+  return toPromise(learnFromInternet(detected.topic, deps))
+    .then(function (result) { return saveLearnedPoints(detected, result, deps); });
+}
+
+/* saveLearnedPoints(detected, result, deps): the piece-42 store save,
+   shared by the old path and the YouTube path. The keyword path saves
+   its own points (EnzoKeywordLearning.savePointsToStore) and never
+   calls this — no double-save. */
+function saveLearnedPoints(detected, result, deps) {
+  var points = learnedPointsOf(result);
+  var savedIds = [];
+  var store = resolveStore(deps);
+  if (store && points.length) {
+    var i, p, item, id;
+    for (i = 0; i < points.length; i++) {
+      p = points[i];
+      item = {
+        kind: detected.source === 'internet' ? 'fact' : 'skill',
+        text: asString(p.point || ''),
+        detail: (p.source && p.source.title) ? asString(p.source.title) : '',
+        lang: detected.lang,
+        source: {
+          type: detected.source,
+          url: (p.source && p.source.url) || '',
+          title: (p.source && p.source.title) || '',
+          date: (p.source && p.source.date) || ''
+        },
+        ts: Date.now(),
+        topic: detected.topic || ''
+      };
+      try {
+        id = store.addItem(item);
+        savedIds.push((id === undefined || id === null) ? i : id);
+      } catch (e) { /* one failed save must not lose the rest */ }
+    }
+  }
+  return {
+    directed: true,
+    detected: detected,
+    result: result,
+    summary: summariseLearning(result, detected.lang),
+    savedIds: savedIds
+  };
+}
+
 function applyDirectedLearning(text, deps) {
   deps = (deps && typeof deps === 'object') ? deps : {};
   var detected = detectDirectedLearning(text);
@@ -571,6 +664,65 @@ function applyDirectedLearning(text, deps) {
       directed: false, detected: null, result: null, summary: null, savedIds: []
     });
   }
+  /* P7: internet orders go through the keyword job FIRST (100 keywords,
+     every returned site read, honest four-count report). The keyword
+     module saves the points itself; this branch returns them mapped
+     into the piece-42 result shape. Any unavailability falls back to
+     the old one-search path below — a learn order never fails just
+     because the keyword system is down. */
+  if (detected.source === 'internet') {
+    var kwLearn = (deps && deps.keywordLearn) ||
+      getGlobal('EnzoKeywordLearning');
+    if (kwLearn && typeof kwLearn.startKeywordLearn === 'function') {
+      var kwJob;
+      try {
+        kwJob = kwLearn.startKeywordLearn(detected.topic, {
+          lang: detected.lang,
+          store: resolveStore(deps),
+          onProgress: deps.onKeywordProgress
+        });
+      } catch (e) {
+        kwJob = null;
+      }
+      if (kwJob) {
+        return toPromise(kwJob).then(function (kwRes) {
+          if (kwRes && kwRes.available) {
+            var learned = (kwRes.points || []).map(function (pt) {
+              return {
+                point: pt.text || '',
+                source: {
+                  title: pt.source_title || pt.source_url || '',
+                  url: pt.source_url || '',
+                  date: pt.source_date || ''
+                }
+              };
+            });
+            var result = {
+              learned: learned,
+              sourcesVerified: learned.length,
+              status: learned.length ? 'ok' : 'partial',
+              message: 'Learned ' + learned.length + ' point' +
+                (learned.length === 1 ? '' : 's') + ' about "' +
+                (detected.topic || '') + '" from the keyword job.',
+              topic: detected.topic,
+              keywordReport: kwRes.report || null,
+              jobId: kwRes.jobId || null
+            };
+            return {
+              directed: true,
+              detected: detected,
+              result: result,
+              summary: kwRes.summary || summariseLearning(result, detected.lang),
+              savedIds: kwRes.savedIds || []
+            };
+          }
+          return learnFromInternetThenSave(detected, deps);
+        }, function () {
+          return learnFromInternetThenSave(detected, deps);
+        });
+      }
+    }
+  }
   var job;
   if (detected.source === 'internet') {
     job = learnFromInternet(detected.topic, deps);
@@ -578,40 +730,7 @@ function applyDirectedLearning(text, deps) {
     job = learnFromYouTube(detected.videoUrl || detected.topic || '', deps);
   }
   return toPromise(job).then(function (result) {
-    var points = learnedPointsOf(result);
-    var savedIds = [];
-    var store = resolveStore(deps);
-    if (store && points.length) {
-      var i, p, item, id;
-      for (i = 0; i < points.length; i++) {
-        p = points[i];
-        item = {
-          kind: detected.source === 'internet' ? 'fact' : 'skill',
-          text: asString(p.point || ''),
-          detail: (p.source && p.source.title) ? asString(p.source.title) : '',
-          lang: detected.lang,
-          source: {
-            type: detected.source,
-            url: (p.source && p.source.url) || '',
-            title: (p.source && p.source.title) || '',
-            date: (p.source && p.source.date) || ''
-          },
-          ts: Date.now(),
-          topic: detected.topic || ''
-        };
-        try {
-          id = store.addItem(item);
-          savedIds.push((id === undefined || id === null) ? i : id);
-        } catch (e) { /* one failed save must not lose the rest */ }
-      }
-    }
-    return {
-      directed: true,
-      detected: detected,
-      result: result,
-      summary: summariseLearning(result, detected.lang),
-      savedIds: savedIds
-    };
+    return saveLearnedPoints(detected, result, deps);
   });
 }
 
