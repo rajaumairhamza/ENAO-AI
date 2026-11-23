@@ -229,6 +229,13 @@
   var progressTimer = null;
   var backoffStep = 0;
   var progressInFlight = {}; // taskId -> true while a progress fetch runs
+  /* v67 FIX (poll storm) — /sources fetch guards for fetchSourcesInternal.
+     SOURCES_MIN_INTERVAL_MS matches the v62 task-poll floor (2000 ms):
+     the same running task is never re-fetched faster than that. */
+  var SOURCES_MIN_INTERVAL_MS = 2000;
+  var sourcesInFlight = {}; // taskId -> shared in-flight Promise
+  var sourcesLastFetchAt = {}; // taskId -> Date.now() of last SUCCESSFUL fetch
+  var sourcesFetchedTerminal = {}; // taskId -> true once a TERMINAL task's sources were fetched
 
   /* ------------------------------------------------------------------ */
   /* Persistence (localStorage key "enao_monitor_v1")                    */
@@ -279,6 +286,18 @@
       seenEventOrder.forEach(function (id) { seenEventIds[id] = true; });
     }
     if (isPlainObject(data.tasks)) state.tasks = data.tasks;
+    /* v67 FIX: a restored TERMINAL task that already has cached sources
+       must never be re-fetched — it was fetched once in its lifetime.
+       (A terminal task with NO cached sources still gets exactly one
+       fetch, via fetchSourcesInternal, then stops.) */
+    Object.keys(state.tasks).forEach(function (taskId) {
+      var restored = state.tasks[taskId];
+      if (restored && restored.task &&
+          TERMINAL_TASK_STATES[restored.task.state] &&
+          Array.isArray(restored.sources) && restored.sources.length > 0) {
+        sourcesFetchedTerminal[taskId] = true;
+      }
+    });
     if (isPlainObject(data.sourcesMeta)) sourcesMeta = data.sourcesMeta;
     if (Array.isArray(data.pendingClientSteps)) {
       pendingClientSteps = data.pendingClientSteps;
@@ -1186,9 +1205,73 @@
     };
   }
 
+  /* Signature of a sources payload, for change detection: source ids +
+     final URLs + excluded count. Only a real change may save()+notify(). */
+  function sourcesSignature(rows, meta) {
+    var parts = [];
+    (rows || []).forEach(function (s) {
+      if (s) parts.push((s.source_id || '') + '|' + (s.final_url || s.url || ''));
+    });
+    return parts.join(';') + ' #excluded=' +
+      ((meta && typeof meta.excluded === 'number') ? meta.excluded : '');
+  }
+
+  /* v67 FIX (poll storm) — fetchSourcesInternal is the ONLY /sources fetch
+     path in this module, and every caller funnels through it, so the
+     guards live here once instead of per caller:
+       1. TERMINAL tasks: fetch at most ONCE per task lifetime. After that
+          serve the cached sources with zero fetches — this is what stops
+          the 256-268/min storm on task_2114219fc9f5018b (finished in 1 s,
+          state partially_completed, yet polled for 5+ min).
+       2. SINGLE-FLIGHT: concurrent callers share one in-flight request.
+       3. MINIMUM INTERVAL: the same task is never re-fetched faster than
+          SOURCES_MIN_INTERVAL_MS (2000 ms, the v62 task-poll floor),
+          even while genuinely running — a too-early call gets the cache.
+       4. DEDUPED FETCH: routed through EnzoPollLoop.dedupedFetch (as
+          platform-adapter.js and live-screen.js already do), so this
+          request also shares with any concurrent identical GET elsewhere.
+          Falls back to the direct transport/httpJson path when the poll
+          loop is not loaded (e.g. Node test harness).
+       5. NOISY NOTIFY: save()+notify() only when the sources actually
+          changed — an unchanged re-fetch must not re-render (the old
+          unconditional save()+notify() was the re-render half of the
+          notify -> render -> fetch -> notify cycle).
+     Legitimate live updates are unchanged: while a task runs, sources
+     still refresh at up to 1 req / 2 s (the documented task-poll rate). */
   function fetchSourcesInternal(taskId) {
-    return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTaskSources(taskId) : httpJson('/tasks/' + encodeURIComponent(taskId) + '/sources', { timeoutMs: 20000 })).then(function (j) {
-      var entry = ensureTaskEntry(taskId);
+    if (!taskId) return Promise.reject(new Error('taskId is required'));
+    var entry = ensureTaskEntry(taskId);
+    /* 1. Terminal task already fetched once: serve cache, zero fetches. */
+    if (TERMINAL_TASK_STATES[entry.task.state] && sourcesFetchedTerminal[taskId]) {
+      return Promise.resolve(clone(entry.sources || []));
+    }
+    /* 2. Already in flight: share it. */
+    if (sourcesInFlight[taskId]) return sourcesInFlight[taskId];
+    /* 3. Minimum interval between fetches for the same task. */
+    var lastAt = sourcesLastFetchAt[taskId];
+    if (lastAt && (Date.now() - lastAt) < SOURCES_MIN_INTERVAL_MS) {
+      return Promise.resolve(clone(entry.sources || []));
+    }
+    var beforeSig = sourcesSignature(entry.sources, sourcesMeta[taskId]);
+    var doFetch = function () {
+      return (window.__enzoGetTransport59 ? window.__enzoGetTransport59().getTaskSources(taskId) : httpJson('/tasks/' + encodeURIComponent(taskId) + '/sources', { timeoutMs: 20000 }));
+    };
+    var fetchPromise;
+    if (typeof EnzoPollLoop !== 'undefined' && EnzoPollLoop &&
+        typeof EnzoPollLoop.dedupedFetch === 'function') {
+      /* 4. Route through the v62 deduped fetch (in-flight sharing). */
+      fetchPromise = EnzoPollLoop.dedupedFetch(
+        '/api/v2/tasks/' + encodeURIComponent(taskId) + '/sources',
+        {}, function () { return doFetch(); });
+    } else {
+      fetchPromise = doFetch();
+    }
+    var shared = fetchPromise.then(function (j) {
+      delete sourcesInFlight[taskId];
+      sourcesLastFetchAt[taskId] = Date.now();
+      if (TERMINAL_TASK_STATES[entry.task.state]) {
+        sourcesFetchedTerminal[taskId] = true;
+      }
       var rows = (j && Array.isArray(j.sources)) ? j.sources : [];
       entry.sources = rows.map(normaliseSource).filter(function (s) {
         return s !== null;
@@ -1199,10 +1282,21 @@
         excluded: (typeof j.excluded === 'number') ? j.excluded : null,
         excludedNote: asNonEmptyString(j.excluded_note)
       };
-      save();
-      notify();
+      /* 5. Only persist + notify when something actually changed. */
+      if (sourcesSignature(entry.sources, sourcesMeta[taskId]) !== beforeSig) {
+        save();
+        notify();
+      }
       return clone(entry.sources);
+    }, function (err) {
+      delete sourcesInFlight[taskId];
+      /* A failed fetch is NOT the terminal once-fetch (a later legitimate
+         caller may retry); lastFetchAt is left unset so the interval
+         guard does not block that retry. */
+      throw err;
     });
+    sourcesInFlight[taskId] = shared;
+    return shared;
   }
 
   function taskControl(taskId, action) {
