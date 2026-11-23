@@ -616,7 +616,7 @@ function hasIndependentOrder(normed, raw) {
    clarify. All patterns are 2nd-person / self-directed, so third-party
    questions ("Lahore kahan hai", "match kab start hoga") stay out. */
 var CONVERSATION_RES = [
-  [/\b(assalamualaikum|assalamu alaikum|aoa|salam|hello|hi|hey|namaste|namaskar)\b/, 'greeting'],
+  [/\b(assalamualaikum|assalamu alaikum|aoa|salam|namaste|namaskar)\b/, 'greeting'],
   [/\bgood\s+(morning|afternoon|evening)\b/, 'greeting'],
   [/\b(thank you|thanks|shukriya)\b/, 'greeting'],
   [/\b(bye|allah hafiz|khuda hafiz)\b/, 'greeting'],
@@ -675,6 +675,30 @@ var CONVERSATION_SCRIPT_RES = [
   [/नमस्ते|नमस्कार|धन्यवाद/, 'greeting']
 ];
 
+/* ---------- standalone greetings (v68 P5, Case A — backend mirror) ----------
+   "hi" / "hello" / "hey" greet ONLY when the message is essentially just
+   the greeting: at most 4 tokens, at least one greeting word, every token
+   a greeting word or a filler. The old anywhere-pattern matched the
+   Roman-Urdu emphatic particle "hi" inside any sentence ("ma raja hi kha
+   rha hin do"). "there" is a filler (hi-there fix, 23 Nov 2026): "Hi
+   there!" is a greeting. Mirrors intent/classifier.py
+   _is_standalone_greeting + _GREETING_FILLERS exactly. */
+var STANDALONE_GREETING_WORDS = { hi: 1, hello: 1, hey: 1, aoa: 1, salam: 1, namaste: 1, namaskar: 1 };
+var GREETING_FILLERS = { enzo: 1, bhai: 1, yaar: 1, please: 1, plz: 1, ji: 1, sir: 1, dear: 1, good: 1, morning: 1, afternoon: 1, evening: 1, there: 1 };
+function isStandaloneGreeting(text, normed) {
+  var words = String(normed || text || '').toLowerCase().replace(/[^a-z0-9']+/g, ' ').trim().split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 4) return null;
+  var hasGreet = false, i;
+  for (i = 0; i < words.length; i++) {
+    if (words[i] === 'hi' || words[i] === 'hello' || words[i] === 'hey') hasGreet = true;
+  }
+  if (!hasGreet) return null;
+  for (i = 0; i < words.length; i++) {
+    if (!STANDALONE_GREETING_WORDS[words[i]] && !GREETING_FILLERS[words[i]]) return null;
+  }
+  return words[0];
+}
+
 function conversationKind(text, normed) {
   var i;
   for (i = 0; i < CONVERSATION_RES.length; i++) {
@@ -683,6 +707,7 @@ function conversationKind(text, normed) {
   for (i = 0; i < CONVERSATION_SCRIPT_RES.length; i++) {
     if (CONVERSATION_SCRIPT_RES[i][0].test(text)) return CONVERSATION_SCRIPT_RES[i][1];
   }
+  if (isStandaloneGreeting(text, normed)) return 'greeting';
   return null;
 }
 
@@ -1199,6 +1224,7 @@ var api = {
   detectSource: detectSource,
   normRoman: normRoman,
   conversationKind: conversationKind,
+  isStandaloneGreeting: isStandaloneGreeting,
   isDefinition: isDefinition
 };
 global.EnzoResearchTriggers = api;
